@@ -1188,6 +1188,8 @@ class ScyllaCluster:
         # Starting servers that were already asked to stop. They remain in self.starting until the stop path or add_server()
         # finishes the state transition, but add_server() must treat them as cancelled immediately.
         self.stopping_starting: Dict[ServerNum, ScyllaServer] = {}
+        # Incremented on cluster stop so add_server() paths still waiting before self.starting can cancel themselves.
+        self._stop_generation = 0
         # add_server() paths still using a server object after a stop request removed it from self.starting.
         self.starting_done: Dict[ServerNum, asyncio.Event] = {}
         # The first IP assigned to a server added to the cluster.
@@ -1290,6 +1292,7 @@ class ScyllaCluster:
         # FIXME: the lock is necessary because test.py calls `stop()` and `uninstall()` concurrently
         # (from exit artifacts), which leads to issues (#15755). A more elegant solution would be
         # to prevent that instead of using a lock here.
+        self._stop_generation += 1
         async with self.stop_lock:
             if self.is_running or self.running or self.starting:
                 self.is_running = False
@@ -1299,6 +1302,7 @@ class ScyllaCluster:
 
     async def stop_gracefully(self) -> None:
         """Stop all running or starting servers in a clean way"""
+        self._stop_generation += 1
         if self.is_running or self.running or self.starting:
             self.is_running = False
             self.logger.info("Cluster %s stopping gracefully", self)
@@ -1323,6 +1327,11 @@ class ScyllaCluster:
                          expected_server_up_state: ServerUpState = ServerUpState.CQL_ALTERNATOR_QUERIED) -> ServerInfo:
         """Add a new server to the cluster"""
         self.is_dirty = True
+        stop_generation = self._stop_generation
+
+        def check_not_stopped_while_adding() -> None:
+            if self._stop_generation != stop_generation:
+                raise RuntimeError("Cluster was stopped while a server was being added")
 
         assert start or not expected_error, \
             f"add_server: cannot add a stopped server and expect an error"
@@ -1347,6 +1356,8 @@ class ScyllaCluster:
             assert expected_error or replaced_id in self.stopped, \
                 f"add_server: cannot replace running server {replaced_srv}"
 
+        check_not_stopped_while_adding()
+
         if replace_cfg and replace_cfg.reuse_ip_addr:
             ip_addr = replaced_srv.ip_addr
         else:
@@ -1354,6 +1365,12 @@ class ScyllaCluster:
             ip_addr = IPAddress(await self.host_registry.lease_host())
             self.logger.info("Cluster %s obtained new IP: %s", self.name, ip_addr)
             self.leased_ips.add(ip_addr)
+            try:
+                check_not_stopped_while_adding()
+            except BaseException:
+                self.leased_ips.remove(ip_addr)
+                await self.host_registry.release_host(Host(ip_addr))
+                raise
 
         if not self.initial_seed and not expected_error and start:
             self.initial_seed = ip_addr

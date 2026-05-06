@@ -28,6 +28,18 @@ class FakeHostRegistry:
         self.released_hosts.append(host)
 
 
+class BlockingHostRegistry(FakeHostRegistry):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lease_started = asyncio.Event()
+        self.finish_lease = asyncio.Event()
+
+    async def lease_host(self) -> Host:
+        self.lease_started.set()
+        await self.finish_lease.wait()
+        return await super().lease_host()
+
+
 class SlowInstallingServer:
     def __init__(self, server_id: ServerNum, ip_addr: IPAddress) -> None:
         self.server_id = server_id
@@ -98,8 +110,9 @@ class SlowInstallingServer:
         return ServerInfo(self.server_id, self.ip_addr, self.rpc_address, self.datacenter, self.rack, 0)
 
 
-def make_cluster() -> tuple[ScyllaCluster, FakeHostRegistry, dict[str, SlowInstallingServer]]:
-    host_registry = FakeHostRegistry()
+def make_cluster(host_registry: FakeHostRegistry | None = None) -> tuple[ScyllaCluster, FakeHostRegistry, dict[str, SlowInstallingServer]]:
+    if host_registry is None:
+        host_registry = FakeHostRegistry()
     created_servers: dict[str, SlowInstallingServer] = {}
 
     def create_server(params: ScyllaCluster.CreateServerParams) -> SlowInstallingServer:
@@ -120,6 +133,41 @@ async def start_adding_server(cluster: ScyllaCluster, created_servers: dict[str,
     await server.install_started.wait()
     assert cluster.starting[server.server_id] is server
     return add_task, server
+
+
+async def wait_for_add_task_done_or_server_created(add_task: asyncio.Task, created_servers: dict[str, SlowInstallingServer]) -> None:
+    while not add_task.done() and "server" not in created_servers:
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_running", [False, True])
+async def test_cluster_stop_cancels_add_server_waiting_for_ip(is_running: bool) -> None:
+    """Regression test for stopping a cluster while add_server() is still waiting for an IP lease."""
+    host_registry = BlockingHostRegistry()
+    cluster, _, created_servers = make_cluster(host_registry)
+    cluster.is_running = is_running
+
+    add_task = asyncio.create_task(cluster.add_server())
+    await host_registry.lease_started.wait()
+
+    await cluster.stop()
+    assert "server" not in created_servers
+
+    host_registry.finish_lease.set()
+    await wait_for_add_task_done_or_server_created(add_task, created_servers)
+    if "server" in created_servers:
+        created_servers["server"].finish_install.set()
+
+    with pytest.raises(RuntimeError, match="stopped while .* being added"):
+        await add_task
+
+    assert "server" not in created_servers
+    assert not cluster.running
+    assert not cluster.stopped
+    assert not cluster.starting
+    assert not cluster.leased_ips
+    assert host_registry.released_hosts == [Host("127.0.0.1")]
 
 
 @pytest.mark.asyncio
