@@ -41,10 +41,11 @@ class BlockingHostRegistry(FakeHostRegistry):
 
 
 class SlowInstallingServer:
-    def __init__(self, server_id: ServerNum, ip_addr: IPAddress) -> None:
+    def __init__(self, server_id: ServerNum, ip_addr: IPAddress, seeds: list[IPAddress]) -> None:
         self.server_id = server_id
         self.ip_addr = ip_addr
         self.rpc_address = ip_addr
+        self.seeds = seeds
         self.datacenter = "dc1"
         self.rack = "rack1"
         self.workdir = pathlib.Path(f"server-{server_id}")
@@ -114,10 +115,14 @@ def make_cluster(host_registry: FakeHostRegistry | None = None) -> tuple[ScyllaC
     if host_registry is None:
         host_registry = FakeHostRegistry()
     created_servers: dict[str, SlowInstallingServer] = {}
+    next_server_id = 0
 
     def create_server(params: ScyllaCluster.CreateServerParams) -> SlowInstallingServer:
-        server = SlowInstallingServer(ServerNum(1), params.ip_addr)
+        nonlocal next_server_id
+        next_server_id += 1
+        server = SlowInstallingServer(ServerNum(next_server_id), params.ip_addr, list(params.seeds))
         created_servers["server"] = server
+        created_servers[f"server{next_server_id}"] = server
         return server
 
     cluster = ScyllaCluster(logging.getLogger("test_scylla_cluster"), host_registry, replicas=0, create_server=create_server)
@@ -283,6 +288,29 @@ async def test_server_stop_cancels_server_still_installing() -> None:
     assert cluster.stopped[server.server_id] is server
     assert not cluster.leased_ips
     assert host_registry.released_hosts == [Host(server.ip_addr)]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_initial_add_does_not_seed_next_server_with_released_ip() -> None:
+    """Regression test for a cancelled first add leaving initial_seed set to its released IP."""
+    cluster, host_registry, created_servers = make_cluster()
+    add_task, first_server = await start_adding_server(cluster, created_servers)
+
+    await cluster.server_stop(first_server.server_id, gracefully=False)
+    first_server.finish_install.set()
+    with pytest.raises(RuntimeError, match="stopped while it was being added"):
+        await add_task
+
+    second_add_task = asyncio.create_task(cluster.add_server())
+    while "server2" not in created_servers:
+        await asyncio.sleep(0)
+    second_server = created_servers["server2"]
+    second_server.finish_install.set()
+    await second_add_task
+
+    assert second_server.seeds == [second_server.ip_addr]
+    assert cluster.initial_seed == second_server.ip_addr
+    assert host_registry.released_hosts == [Host(first_server.ip_addr)]
 
 
 @pytest.mark.asyncio

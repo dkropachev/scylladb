@@ -1372,7 +1372,8 @@ class ScyllaCluster:
                 await self.host_registry.release_host(Host(ip_addr))
                 raise
 
-        if not self.initial_seed and not expected_error and start:
+        assigned_initial_seed = not self.initial_seed and not expected_error and start
+        if assigned_initial_seed:
             self.initial_seed = ip_addr
 
         if not seeds:
@@ -1396,6 +1397,8 @@ class ScyllaCluster:
         starting_done: asyncio.Event | None = None
 
         async def handle_join_failure():
+            if assigned_initial_seed and self.initial_seed == ip_addr:
+                self.initial_seed = None
             if not replace_cfg or not replace_cfg.reuse_ip_addr:
                 if ip_addr in self.leased_ips:
                     self.leased_ips.remove(ip_addr)
