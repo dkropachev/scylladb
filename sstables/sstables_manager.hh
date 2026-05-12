@@ -116,6 +116,7 @@ public:
         utils::updateable_value<sstring> format = utils::updateable_value<sstring>(fmt::to_string(sstable_version_types::me));
         utils::updateable_value<uint32_t> large_data_records_per_sstable = utils::updateable_value<uint32_t>(10);
         bool ignore_component_digest_mismatch = false;
+        db::simd_optimization_mode bti_key_mismatch_simd_mode{};
     };
 
 private:

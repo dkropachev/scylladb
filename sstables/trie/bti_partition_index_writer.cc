@@ -42,7 +42,7 @@ namespace sstables::trie {
 class bti_partition_index_writer_impl {
     void write_last_key(size_t needed_prefix);
 public:
-    bti_partition_index_writer_impl(bti_node_sink&);
+    bti_partition_index_writer_impl(bti_node_sink&, db::simd_optimization_mode);
     bti_partition_index_writer_impl(bti_partition_index_writer_impl&&) = delete;
     // If the partition has a intra-partition index in Rows.db,
     // `file_pos` is the bit-negated position of the relevant entry in Rows.db.
@@ -55,6 +55,7 @@ public:
 private:
     // The lower trie-writing layer, oblivious to the semantics of the partition index.
     trie_writer<bti_node_sink> _wr;
+    db::simd_optimization_mode _bti_key_mismatch_simd_mode;
     // Counter of added keys.
     size_t _added_keys = 0;
 
@@ -91,8 +92,9 @@ private:
     uint8_t _last_hash_bits;
 };
 
-bti_partition_index_writer_impl::bti_partition_index_writer_impl(bti_node_sink& out)
-    : _wr(out) {
+bti_partition_index_writer_impl::bti_partition_index_writer_impl(bti_node_sink& out, db::simd_optimization_mode bti_key_mismatch_simd_mode)
+    : _wr(out)
+    , _bti_key_mismatch_simd_mode(bti_key_mismatch_simd_mode) {
 }
 
 void bti_partition_index_writer_impl::write_last_key(size_t needed_prefix) {
@@ -164,7 +166,7 @@ void bti_partition_index_writer_impl::add(const schema& s, dht::decorated_key dk
     (*_tmp_key).emplace(s, dk);
     if (_added_keys > 0) {
         // First position where the new key differs from the last key.
-        size_t mismatch = lcb_mismatch((**_tmp_key).begin(), (**_last_key).begin()).first;
+        size_t mismatch = lcb_mismatch((**_tmp_key).begin(), (**_last_key).begin(), _bti_key_mismatch_simd_mode).first;
         expensive_log("partition_index_writer_impl::add: mismatch={}", mismatch);
         // From `_last_key_mismatch` (mismatch position between `_last_key` and its predecessor)
         // and `mismatch` (mismatch position between `_last_key` and its successor),
@@ -213,9 +215,9 @@ struct bti_partition_index_writer::impl
     : bti_node_sink
     , bti_partition_index_writer_impl
 {
-    impl(sstables::file_writer& fw)
+    impl(sstables::file_writer& fw, db::simd_optimization_mode bti_key_mismatch_simd_mode)
         : bti_node_sink(fw, BTI_PAGE_SIZE)
-        , bti_partition_index_writer_impl(static_cast<bti_node_sink&>(*this))
+        , bti_partition_index_writer_impl(static_cast<bti_node_sink&>(*this), bti_key_mismatch_simd_mode)
     {}
     impl(impl&&) = delete;
 };
@@ -224,8 +226,8 @@ bti_partition_index_writer::bti_partition_index_writer() noexcept = default;
 
 bti_partition_index_writer::~bti_partition_index_writer() noexcept = default;
 
-bti_partition_index_writer::bti_partition_index_writer(sstables::file_writer& fw)
-    : _impl(std::make_unique<impl>(fw))
+bti_partition_index_writer::bti_partition_index_writer(sstables::file_writer& fw, db::simd_optimization_mode bti_key_mismatch_simd_mode)
+    : _impl(std::make_unique<impl>(fw, bti_key_mismatch_simd_mode))
 {}
 void bti_partition_index_writer::add(const schema& s, dht::decorated_key dk, const utils::hashed_key& murmur_hash, int64_t data_or_rowsdb_file_pos) {
     _impl->add(s, std::move(dk), murmur_hash, data_or_rowsdb_file_pos);

@@ -10,11 +10,14 @@
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/util/defer.hh>
+#include "db/config.hh"
 #include "schema/schema_builder.hh"
 #include "sstables/trie/bti_key_translation.hh"
 #include "test/lib/key_utils.hh"
 #include "test/lib/log.hh"
 #include "test/lib/nondeterministic_choice_stack.hh"
+#include <algorithm>
+#include <array>
 #include <generator>
  
 static std::vector<std::byte> linearize(comparable_bytes_iterator auto&& it) {
@@ -259,6 +262,128 @@ struct fmt::formatter<fmt_fragmented_buffer> : fmt::formatter<fmt_hex> {
     }
 };
 
+static std::vector<std::byte> make_lcb_mismatch_input(size_t size) {
+    auto bytes = std::vector<std::byte>();
+    bytes.reserve(size);
+    for (size_t i = 0; i < size; ++i) {
+        bytes.push_back(std::byte((i * 131 + 17) & 0xff));
+    }
+    return bytes;
+}
+
+static std::span<const std::byte> lcb_bytes_view(const std::vector<std::byte>& bytes) {
+    return std::span<const std::byte>(bytes.data(), bytes.size());
+}
+
+static std::generator<sstables::trie::const_bytes> gen_fixed_fragments(
+        const std::vector<std::byte>& bytes, std::span<const size_t> fragment_sizes) {
+    auto sp = lcb_bytes_view(bytes);
+    size_t offset = 0;
+    for (size_t fragment_size : fragment_sizes) {
+        const auto remaining_size = sp.size() - offset;
+        const auto current_fragment_size = std::min(fragment_size, remaining_size);
+        co_yield sp.subspan(offset, current_fragment_size);
+        offset += current_fragment_size;
+        if (offset == sp.size()) {
+            co_return;
+        }
+    }
+    if (offset < sp.size()) {
+        co_yield sp.subspan(offset);
+    }
+}
+
+static void check_fragmented_lcb_mismatch(
+        const std::vector<std::byte>& a,
+        const std::vector<std::byte>& b,
+        std::span<const size_t> a_fragment_sizes,
+        std::span<const size_t> b_fragment_sizes,
+        db::simd_optimization_mode mode) {
+    auto b_view = lcb_bytes_view(b);
+    auto expected_mismatch = std::ranges::mismatch(lcb_bytes_view(a), b_view);
+    auto expected_mismatch_offset = static_cast<size_t>(expected_mismatch.in2 - b_view.begin());
+    const std::byte* expected_mismatch_ptr = b.data() + expected_mismatch_offset;
+
+    auto [mismatch_offset, mismatch_ptr] = sstables::trie::lcb_mismatch(
+        gen_fixed_fragments(a, a_fragment_sizes).begin(),
+        gen_fixed_fragments(b, b_fragment_sizes).begin(),
+        mode
+    );
+
+    BOOST_REQUIRE_EQUAL(mismatch_offset, expected_mismatch_offset);
+    BOOST_REQUIRE(mismatch_ptr == expected_mismatch_ptr);
+}
+
+static void check_lcb_mismatch_position(
+        size_t common_size,
+        size_t mismatch_pos,
+        std::span<const size_t> a_fragment_sizes,
+        std::span<const size_t> b_fragment_sizes,
+        db::simd_optimization_mode mode) {
+    auto a = make_lcb_mismatch_input(common_size);
+    auto b = a;
+    if (mismatch_pos < common_size) {
+        b[mismatch_pos] = ~b[mismatch_pos];
+    } else {
+        SCYLLA_ASSERT(mismatch_pos == common_size);
+        b.push_back(std::byte(0x7b));
+    }
+    check_fragmented_lcb_mismatch(a, b, a_fragment_sizes, b_fragment_sizes, mode);
+}
+
+BOOST_AUTO_TEST_CASE(test_first_mismatch_offset_lane_boundaries) {
+    constexpr std::array modes = {
+        db::simd_optimization_mode::automatic,
+        db::simd_optimization_mode::off,
+        db::simd_optimization_mode::sse,
+        db::simd_optimization_mode::avx2,
+        db::simd_optimization_mode::avx512,
+        db::simd_optimization_mode::neon,
+        db::simd_optimization_mode::sve,
+    };
+
+    auto a = make_lcb_mismatch_input(160);
+    for (auto mode : modes) {
+        BOOST_REQUIRE_EQUAL(sstables::trie::first_mismatch_offset(lcb_bytes_view(a), lcb_bytes_view(a), mode), a.size());
+    }
+
+    for (size_t mismatch_pos : {
+            size_t(0), size_t(1), size_t(15), size_t(16), size_t(17), size_t(31),
+            size_t(32), size_t(33), size_t(63), size_t(64), size_t(65), size_t(159)}) {
+        auto b = a;
+        b[mismatch_pos] = ~b[mismatch_pos];
+        for (auto mode : modes) {
+            BOOST_REQUIRE_EQUAL(sstables::trie::first_mismatch_offset(lcb_bytes_view(a), lcb_bytes_view(b), mode), mismatch_pos);
+        }
+    }
+
+    auto short_a = make_lcb_mismatch_input(7);
+    auto short_b = short_a;
+    short_b[6] = ~short_b[6];
+    for (auto mode : modes) {
+        BOOST_REQUIRE_EQUAL(sstables::trie::first_mismatch_offset(lcb_bytes_view(short_a), lcb_bytes_view(short_b), mode), 6);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_lcb_mismatch_lane_boundary_positions) {
+    const std::array<size_t, 0> contiguous = {};
+    const std::array<size_t, 14> fragmented = {0, 1, 0, 15, 1, 0, 16, 31, 1, 0, 32, 47, 1, 0};
+    const std::array<size_t, 12> other_fragmented = {7, 0, 8, 0, 17, 0, 16, 9, 0, 55, 0, 1};
+
+    for (auto mode : {db::simd_optimization_mode::automatic, db::simd_optimization_mode::off}) {
+        for (size_t mismatch_pos : {
+                size_t(0), size_t(1), size_t(15), size_t(16), size_t(17), size_t(31),
+                size_t(32), size_t(33), size_t(63), size_t(64), size_t(65), size_t(127),
+                size_t(128), size_t(129)}) {
+            check_lcb_mismatch_position(160, mismatch_pos, contiguous, contiguous, mode);
+            check_lcb_mismatch_position(160, mismatch_pos, fragmented, other_fragmented, mode);
+        }
+
+        check_lcb_mismatch_position(7, 6, fragmented, other_fragmented, mode);
+        check_lcb_mismatch_position(96, 96, fragmented, other_fragmented, mode);
+    }
+}
+
 // Tests the lcb_mismatch function.
 // It generates all possible pairs of strings up to some complexity
 // (alphabet size, max length), splits them into fragments in all possible ways
@@ -312,12 +437,14 @@ BOOST_AUTO_TEST_CASE(test_lcb_mismatch) {
                 };
                 return sstables::trie::lcb_mismatch(
                     generator_from_range(fragments_a).begin(),
-                    generator_from_range(fragments_b).begin()
+                    generator_from_range(fragments_b).begin(),
+                    db::simd_optimization_mode::automatic
                 );
             } else {
                 return sstables::trie::lcb_mismatch(
                     gen_fragments(a).begin(),
-                    gen_fragments(b).begin()
+                    gen_fragments(b).begin(),
+                    db::simd_optimization_mode::automatic
                 );
             }
         });

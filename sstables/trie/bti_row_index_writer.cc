@@ -19,7 +19,7 @@ namespace sstables::trie {
 
 class row_index_writer_impl {
 public:
-    row_index_writer_impl(bti_node_sink&);
+    row_index_writer_impl(bti_node_sink&, db::simd_optimization_mode);
     ~row_index_writer_impl();
     row_index_writer_impl(row_index_writer_impl&&) = delete;
 private:
@@ -46,6 +46,7 @@ public:
 
 private:
     trie_writer<bti_node_sink> _wr;
+    db::simd_optimization_mode _bti_key_mismatch_simd_mode;
     size_t _added_blocks = 0;
     // Storage for _last_key, _last_separator and _tmp_key.
     // 
@@ -70,8 +71,9 @@ private:
     std::remove_reference_t<decltype(_keys[0])>* _tmp_key = &_keys[2];
 };
 
-row_index_writer_impl::row_index_writer_impl(bti_node_sink& out)
+row_index_writer_impl::row_index_writer_impl(bti_node_sink& out, db::simd_optimization_mode bti_key_mismatch_simd_mode)
     : _wr(out)
+    , _bti_key_mismatch_simd_mode(bti_key_mismatch_simd_mode)
 {}
 row_index_writer_impl::~row_index_writer_impl() {
 }
@@ -162,7 +164,7 @@ void row_index_writer_impl::add(
         // If you wish to change this, adjust the `_added_blocks == 1` branch in `finish()` accordingly.
         _wr.add(0, {}, payload);
     } else {
-        auto [separator_mismatch_idx, separator_mismatch_ptr] = lcb_mismatch(first_ck.begin(), (**_last_key).begin());
+        auto [separator_mismatch_idx, separator_mismatch_ptr] = lcb_mismatch(first_ck.begin(), (**_last_key).begin(), _bti_key_mismatch_simd_mode);
         // We assume a prefix-free encoding here.
         // expensive_assert(separator_mismatch_idx < _last_key_size);
         //
@@ -196,7 +198,7 @@ void row_index_writer_impl::add(
         *separator_mismatch_ptr = std::byte(uint8_t(*separator_mismatch_ptr) + 1);
         (**_last_key).trim(separator_mismatch_idx + 1);
 
-        size_t mismatch = _added_blocks > 1 ? lcb_mismatch((**_last_key).begin(), (**_last_separator).begin()).first : 0;
+        size_t mismatch = _added_blocks > 1 ? lcb_mismatch((**_last_key).begin(), (**_last_separator).begin(), _bti_key_mismatch_simd_mode).first : 0;
         flush_last_key(mismatch, separator_mismatch_idx + 1, payload);
     }
 
@@ -313,7 +315,7 @@ int64_t row_index_writer_impl::finish(
         // bti_index_reader::last_block_offset() assumes that this final separator exists.
         size_t mismatch_idx = 0;
         if (_added_blocks > 1) [[likely]] {
-            auto [idx, ptr] = lcb_mismatch((**_last_separator).begin(), (**_last_key).begin());
+            auto [idx, ptr] = lcb_mismatch((**_last_separator).begin(), (**_last_key).begin(), _bti_key_mismatch_simd_mode);
             mismatch_idx = idx;
         }
         auto nudge_idx = nudge(**_last_key, mismatch_idx);
@@ -352,9 +354,9 @@ struct bti_row_index_writer::impl
     : bti_node_sink
     , row_index_writer_impl
 {
-    impl(sstables::file_writer& fw)
+    impl(sstables::file_writer& fw, db::simd_optimization_mode bti_key_mismatch_simd_mode)
         : bti_node_sink(fw, BTI_PAGE_SIZE)
-        , row_index_writer_impl(static_cast<bti_node_sink&>(*this))
+        , row_index_writer_impl(static_cast<bti_node_sink&>(*this), bti_key_mismatch_simd_mode)
     {}
     impl(impl&&) = delete;
 };
@@ -363,8 +365,8 @@ bti_row_index_writer::bti_row_index_writer() noexcept = default;
 
 bti_row_index_writer::~bti_row_index_writer() noexcept = default;
 
-bti_row_index_writer::bti_row_index_writer(sstables::file_writer& fw)
-    : _impl(std::make_unique<impl>(fw))
+bti_row_index_writer::bti_row_index_writer(sstables::file_writer& fw, db::simd_optimization_mode bti_key_mismatch_simd_mode)
+    : _impl(std::make_unique<impl>(fw, bti_key_mismatch_simd_mode))
 {}
 bti_row_index_writer::bti_row_index_writer(bti_row_index_writer&&) noexcept = default;
 bti_row_index_writer& bti_row_index_writer::operator=(bti_row_index_writer&&) noexcept = default;
