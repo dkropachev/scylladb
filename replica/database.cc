@@ -42,6 +42,7 @@
 #include <seastar/core/metrics.hh>
 #include "sstables/sstables.hh"
 #include "sstables/sstables_manager.hh"
+#include "sstables/trie/bti_node_reader.hh"
 #include "types/comparable_bytes.hh"
 #include <boost/container/static_vector.hpp>
 #include "mutation/frozen_mutation.hh"
@@ -484,6 +485,7 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
     SCYLLA_ASSERT(dbcfg.available_memory != 0); // Detect misconfigured unit tests, see #7544
 
     set_comparable_bytes_simd_optimization_mode(_cfg.get_simd_optimization_mode(db::simd_optimization_feature::comparable_bytes));
+    sstables::trie::set_bti_dense_node_simd_optimization_mode(_cfg.get_simd_optimization_mode(db::simd_optimization_feature::bti_dense_node));
 
     local_schema_registry().init(*this); // TODO: we're never unbound.
     setup_metrics();
