@@ -8,8 +8,14 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "utils/cached_file.hh"
 #include "node_reader.hh"
+
+namespace db {
+    enum class simd_optimization_mode : uint8_t;
+}
 
 namespace sstables {
     [[noreturn, gnu::noinline]] void on_bti_parse_error(uint64_t pos);
@@ -18,11 +24,17 @@ namespace sstables {
 namespace sstables::trie {
 
 // Implementation of concept `node_reader`.
+void set_bti_sparse_node_simd_optimization_mode(db::simd_optimization_mode mode) noexcept;
+db::simd_optimization_mode get_bti_sparse_node_simd_optimization_mode() noexcept;
+
 get_child_result bti_get_child(uint64_t pos, const_bytes sp, int child_idx, bool forward);
 std::byte bti_get_child_transition(uint64_t pos, const_bytes raw, int idx);
 load_final_node_result bti_read_node(int64_t pos, const_bytes sp);
 const_bytes bti_get_payload(int64_t pos, const_bytes sp);
 node_traverse_result bti_walk_down_along_key(int64_t pos, const_bytes sp, const_bytes key);
+// Each byte in key_bytes is the first unconsumed key byte for one lookup.
+// key_bytes and results must have the same size.
+void bti_walk_down_along_key_batch(int64_t pos, const_bytes sp, const_bytes key_bytes, std::span<node_traverse_result> results);
 node_traverse_sidemost_result bti_walk_down_leftmost_path(int64_t pos, const_bytes sp);
 node_traverse_sidemost_result bti_walk_down_rightmost_path(int64_t pos, const_bytes sp);
 
@@ -57,6 +69,7 @@ struct bti_node_reader {
     future<> load(int64_t pos, const reader_permit&, const tracing::trace_state_ptr&);
     trie::load_final_node_result read_node(int64_t pos);
     trie::node_traverse_result walk_down_along_key(int64_t pos, const_bytes key);
+    void walk_down_along_key_batch(int64_t pos, const_bytes key_bytes, std::span<node_traverse_result> results);
     trie::node_traverse_sidemost_result walk_down_leftmost_path(int64_t pos);
     trie::node_traverse_sidemost_result walk_down_rightmost_path(int64_t pos);
     trie::get_child_result get_child(int64_t pos, int child_idx, bool forward) const;

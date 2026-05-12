@@ -7,9 +7,12 @@
  */
 
 #include <seastar/testing/thread_test_case.hh>
+#include <seastar/util/defer.hh>
 
+#include <array>
 #include <fmt/ranges.h>
 #include <ranges>
+#include "db/config.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
 #include "utils/memory_data_sink.hh"
@@ -446,6 +449,110 @@ SEASTAR_THREAD_TEST_CASE(test_body) {
     for (bool payload : {true, false}) {
         auto payload_opt = payload ? std::optional<trie_payload>(custom_payload) : std::optional<trie_payload>();
         test_one_body(child_transitions, offsets, whatever, payload_opt, pos);
+    }
+}
+
+static std::vector<uint8_t> make_evenly_spaced_transitions(int n_children) {
+    std::vector<uint8_t> transitions;
+    transitions.reserve(n_children);
+    for (int i = 0; i < n_children; ++i) {
+        transitions.push_back(i * 256 / n_children);
+    }
+    return transitions;
+}
+
+// Covers the sparse transition lookup thresholds and SIMD lane boundaries from
+// https://github.com/dkropachev/scylladb/issues/14.
+SEASTAR_THREAD_TEST_CASE(test_sparse_walk_down_along_key_boundaries) {
+    const auto previous_mode = get_bti_sparse_node_simd_optimization_mode();
+    auto restore_mode = defer([previous_mode] {
+        set_bti_sparse_node_simd_optimization_mode(previous_mode);
+    });
+
+    constexpr std::array sparse_types = {SPARSE_8, SPARSE_12, SPARSE_16, SPARSE_24, SPARSE_40};
+    constexpr std::array child_counts = {1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255};
+
+    const auto pos = sink_pos((uint64_t(1) << 40) + 255);
+    const auto incoming_transition = string_as_bytes("issue-14");
+
+    for (auto mode : {
+            db::simd_optimization_mode::automatic,
+            db::simd_optimization_mode::off,
+            db::simd_optimization_mode::sse,
+            db::simd_optimization_mode::avx2,
+            db::simd_optimization_mode::avx512,
+            db::simd_optimization_mode::neon,
+            db::simd_optimization_mode::sve})
+    for (const auto type : sparse_types)
+    for (const auto n_children : child_counts) {
+        set_bti_sparse_node_simd_optimization_mode(mode);
+        auto child_transitions = make_evenly_spaced_transitions(n_children);
+        std::vector<int64_t> offsets;
+        offsets.reserve(n_children);
+        for (int i = 0; i < n_children; ++i) {
+            offsets.push_back(i + 1);
+        }
+
+        bump_allocator alctr(128 * 1024);
+        auto node = make_node(pos, incoming_transition, child_transitions, offsets, std::nullopt, alctr);
+        auto serialized = serialize_body(*node, pos, type);
+
+        std::array<std::byte, 256> batch_keys;
+        std::array<node_traverse_result, 256> batch_results;
+        for (int i = 0; i < 256; ++i) {
+            batch_keys[i] = std::byte((i * 73) & 0xff);
+        }
+        bti_walk_down_along_key_batch(pos.value, serialized, const_bytes(batch_keys.data(), batch_keys.size()), batch_results);
+        for (int i = 0; i < 256; ++i) {
+            auto key = batch_keys[i];
+            auto result = batch_results[i];
+
+            auto target_child = std::ranges::lower_bound(child_transitions, uint8_t(key)) - child_transitions.begin();
+            auto target_byte = target_child < n_children ? child_transitions[target_child] : -1;
+            auto target_offset = target_child < n_children ? offsets[target_child] : -1;
+
+            REQUIRE_EQUAL(result.found_idx, target_child);
+            REQUIRE_EQUAL(result.found_byte, target_byte);
+            REQUIRE_EQUAL(result.child_offset, target_offset);
+            REQUIRE_EQUAL(result.traversed_key_bytes, 0);
+            REQUIRE_EQUAL(result.n_children, n_children);
+            REQUIRE_EQUAL(result.body_pos, pos.value);
+            REQUIRE_EQUAL(result.payload_bits, 0);
+        }
+
+        std::array small_batch_keys = {std::byte(0x00), std::byte(0x01), std::byte(0x7f), std::byte(0x80), std::byte(0xfe), std::byte(0xff)};
+        std::array<node_traverse_result, 6> small_batch_results;
+        bti_walk_down_along_key_batch(pos.value, serialized, const_bytes(small_batch_keys.data(), small_batch_keys.size()), small_batch_results);
+        for (size_t i = 0; i < small_batch_keys.size(); ++i) {
+            auto key = small_batch_keys[i];
+            auto result = small_batch_results[i];
+            auto expected = bti_walk_down_along_key(pos.value, serialized, std::span<const std::byte>(&key, 1));
+
+            REQUIRE_EQUAL(result.found_idx, expected.found_idx);
+            REQUIRE_EQUAL(result.found_byte, expected.found_byte);
+            REQUIRE_EQUAL(result.child_offset, expected.child_offset);
+            REQUIRE_EQUAL(result.traversed_key_bytes, expected.traversed_key_bytes);
+            REQUIRE_EQUAL(result.n_children, expected.n_children);
+            REQUIRE_EQUAL(result.body_pos, expected.body_pos);
+            REQUIRE_EQUAL(result.payload_bits, expected.payload_bits);
+        }
+
+        for (int key_byte = 0; key_byte < 256; ++key_byte) {
+            auto key = std::byte(key_byte);
+            auto result = bti_walk_down_along_key(pos.value, serialized, std::span<const std::byte>(&key, 1));
+
+            auto target_child = std::ranges::lower_bound(child_transitions, uint8_t(key)) - child_transitions.begin();
+            auto target_byte = target_child < n_children ? child_transitions[target_child] : -1;
+            auto target_offset = target_child < n_children ? offsets[target_child] : -1;
+
+            REQUIRE_EQUAL(result.found_idx, target_child);
+            REQUIRE_EQUAL(result.found_byte, target_byte);
+            REQUIRE_EQUAL(result.child_offset, target_offset);
+            REQUIRE_EQUAL(result.traversed_key_bytes, 0);
+            REQUIRE_EQUAL(result.n_children, n_children);
+            REQUIRE_EQUAL(result.body_pos, pos.value);
+            REQUIRE_EQUAL(result.payload_bits, 0);
+        }
     }
 }
 
