@@ -42,6 +42,7 @@
 #include <seastar/core/metrics.hh>
 #include "sstables/sstables.hh"
 #include "sstables/sstables_manager.hh"
+#include "types/comparable_bytes.hh"
 #include <boost/container/static_vector.hpp>
 #include "mutation/frozen_mutation.hh"
 #include "mutation/async_utils.hh"
@@ -481,6 +482,8 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
     , _memtable_flush_static_shares_observer(cfg.memtable_flush_static_shares.observe(_update_memtable_flush_static_shares_action.make_observer()))
 {
     SCYLLA_ASSERT(dbcfg.available_memory != 0); // Detect misconfigured unit tests, see #7544
+
+    set_comparable_bytes_simd_optimization_mode(_cfg.get_simd_optimization_mode(db::simd_optimization_feature::comparable_bytes));
 
     local_schema_registry().init(*this); // TODO: we're never unbound.
     setup_metrics();

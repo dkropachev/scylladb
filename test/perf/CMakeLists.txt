@@ -106,3 +106,6 @@ add_perf_test(perf_bti_key_translation
   LIBRARIES
     dht
     sstables)
+add_perf_test(perf_comparable_bytes
+  LIBRARIES
+    types)

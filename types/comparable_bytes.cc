@@ -13,10 +13,12 @@
 
 #include "bytes_ostream.hh"
 #include "concrete_types.hh"
+#include "db/config.hh"
 #include "types/collection.hh"
 #include "types/listlike_partial_deserializing_iterator.hh"
 #include "types/types.hh"
 #include "types/vector.hh"
+#include "utils/array-search.hh"
 #include "utils/managed_bytes.hh"
 #include "utils/multiprecision_int.hh"
 #include "vint-serialization.hh"
@@ -47,6 +49,30 @@ static constexpr uint8_t NEXT_COMPONENT = 0x40;
 static constexpr uint8_t NEXT_COMPONENT_NULL = 0x3E;
 // Terminator byte in sequences.
 static constexpr uint8_t TERMINATOR = 0x38;
+
+static thread_local db::simd_optimization_mode comparable_bytes_simd_optimization_mode = db::simd_optimization_mode::automatic;
+
+void set_comparable_bytes_simd_optimization_mode(db::simd_optimization_mode mode) noexcept {
+    comparable_bytes_simd_optimization_mode = mode;
+}
+
+db::simd_optimization_mode get_comparable_bytes_simd_optimization_mode() noexcept {
+    return comparable_bytes_simd_optimization_mode;
+}
+
+static size_t find_first_byte(bytes_view fragment, uint8_t value, size_t offset = 0) {
+    if (offset >= fragment.size()) {
+        return fragment.size();
+    }
+    return offset + utils::byte_search_eq(value, fragment.data() + offset, fragment.size() - offset, comparable_bytes_simd_optimization_mode);
+}
+
+static size_t find_first_byte_not(bytes_view fragment, uint8_t value, size_t offset = 0) {
+    if (offset >= fragment.size()) {
+        return fragment.size();
+    }
+    return offset + utils::byte_search_ne(value, fragment.data() + offset, fragment.size() - offset, comparable_bytes_simd_optimization_mode);
+}
 
 static void read_fragmented_checked(managed_bytes_view& view, size_t bytes_to_read, bytes::value_type* out) {
     if (view.size_bytes() < bytes_to_read) {
@@ -736,7 +762,7 @@ static void escape_zeros(managed_bytes_view& serialized_bytes_view, bytes_ostrea
     // Process the input in multiple fixed-size chunks to allow the use of a fixed-size
     // intermediate buffer for writing the encoded output. The buffer helps reduce the
     // number of writes to the output stream.
-    constexpr size_t max_chunk_size = 1024;
+    constexpr size_t max_chunk_size = 4096;
     // The encoded bytes will have one extra byte for every zero sequence in the source.
     // So, worst case, it can only be 1.5 times the size of the chunk.
     constexpr size_t buffer_size = (max_chunk_size / 2) * 3;
@@ -746,8 +772,8 @@ static void escape_zeros(managed_bytes_view& serialized_bytes_view, bytes_ostrea
         const size_t curr_chunk_size = std::min(max_chunk_size, serialized_bytes_view.current_fragment().size());
         const auto& curr_chunk = serialized_bytes_view.prefix(curr_chunk_size).current_fragment();
         serialized_bytes_view.remove_prefix(curr_chunk_size);
-        auto curr_zero_start = curr_chunk.find(ESCAPE);
-        if (curr_zero_start == managed_bytes_view::fragment_type::npos) {
+        auto curr_zero_start = find_first_byte(curr_chunk, ESCAPE);
+        if (curr_zero_start == curr_chunk_size) {
             // There are no zeros in current chunk
             if (escaped) {
                 // but the previous chunk ended with a zero, so end the escape sequence
@@ -760,10 +786,15 @@ static void escape_zeros(managed_bytes_view& serialized_bytes_view, bytes_ostrea
             // There are zeros that need to be escaped;
             size_t buffer_pos = 0;
             size_t curr_chunk_pos = 0;
+            if (!escaped && curr_zero_start != 0) {
+                std::memcpy(reinterpret_cast<void*>(buffer.data()), reinterpret_cast<const void*>(curr_chunk.data()), curr_zero_start);
+                buffer_pos = curr_zero_start;
+                curr_chunk_pos = curr_zero_start;
+            }
             while (curr_chunk_pos != curr_chunk_size) {
                 if (escaped) {
                     // Fill one ESCAPED_0_CONT byte for each zero in the input
-                    const auto next_non_zero_byte = std::min(curr_chunk.find_first_not_of(ESCAPE, curr_chunk_pos), curr_chunk_size);
+                    const auto next_non_zero_byte = find_first_byte_not(curr_chunk, ESCAPE, curr_chunk_pos);
                     const auto curr_seq_length = next_non_zero_byte - curr_chunk_pos;
                     if (curr_seq_length > 0) {
                         std::fill_n(buffer.data() + buffer_pos, curr_seq_length, ESCAPED_0_CONT);
@@ -785,7 +816,7 @@ static void escape_zeros(managed_bytes_view& serialized_bytes_view, bytes_ostrea
 
                 } else {
                     // Write the non zero byte sequence as it is
-                    const auto next_zero_byte = std::min(curr_chunk.find_first_of(ESCAPE, curr_chunk_pos), curr_chunk_size);
+                    const auto next_zero_byte = find_first_byte(curr_chunk, ESCAPE, curr_chunk_pos);
                     const auto curr_seq_length = next_zero_byte - curr_chunk_pos;
                     std::memcpy(reinterpret_cast<void*>(buffer.data() + buffer_pos), reinterpret_cast<const void*>(curr_chunk.data() + curr_chunk_pos), curr_seq_length);
                     buffer_pos += curr_seq_length;
@@ -808,7 +839,7 @@ static void unescape_zeros(managed_bytes_view& comparable_bytes_view, bytes_ostr
     // Process the input in multiple fixed-size chunks to allow the use of a fixed-size
     // intermediate buffer for writing the decoded output. The buffer helps reduce the
     // number of writes to the output stream.
-    constexpr size_t max_chunk_size = 1024;
+    constexpr size_t max_chunk_size = 4096;
     // One byte is removed for every escape sequence present in the chunk, so the decoded
     // output for a chunk will never exceed chunk_size.
     std::array<signed char, max_chunk_size> buffer;
@@ -824,7 +855,7 @@ static void unescape_zeros(managed_bytes_view& comparable_bytes_view, bytes_ostr
                 switch (uint8_t(curr_chunk[curr_chunk_pos])) {
                 case ESCAPED_0_CONT: {
                     // Fill in as many ZEROs as there are ESCAPED_0_CONTs
-                    const auto end_of_escape_cont = std::min(curr_chunk.find_first_not_of(ESCAPED_0_CONT, curr_chunk_pos), curr_chunk_size);
+                    const auto end_of_escape_cont = find_first_byte_not(curr_chunk, ESCAPED_0_CONT, curr_chunk_pos);
                     const auto curr_seq_length = end_of_escape_cont - curr_chunk_pos;
                     if (curr_seq_length > 0) {
                         std::fill_n(buffer.data() + buffer_pos, curr_seq_length, ESCAPE);
@@ -855,7 +886,7 @@ static void unescape_zeros(managed_bytes_view& comparable_bytes_view, bytes_ostr
                 escaped = true;
             } else {
                 // Find the next zero sequence.
-                const auto next_zero_byte = std::min(curr_chunk.find(ESCAPE, curr_chunk_pos), curr_chunk_size);
+                const auto next_zero_byte = find_first_byte(curr_chunk, ESCAPE, curr_chunk_pos);
                 const auto curr_seq_length = next_zero_byte - curr_chunk_pos;
                 std::memcpy(reinterpret_cast<void*>(buffer.data() + buffer_pos), reinterpret_cast<const void*>(curr_chunk.data() + curr_chunk_pos), curr_seq_length);
                 buffer_pos += curr_seq_length;

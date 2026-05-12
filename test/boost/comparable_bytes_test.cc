@@ -7,12 +7,16 @@
  */
 #include "test/lib/scylla_test_case.hh"
 
+#include <algorithm>
+#include <initializer_list>
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/ipv4_address.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/lazy.hh>
 #include <vector>
 
 #include "bytes_ostream.hh"
+#include "db/config.hh"
 #include "db/marshal/type_parser.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
@@ -451,6 +455,114 @@ BOOST_AUTO_TEST_CASE(test_blob) {
     }
 
     byte_comparable_test(std::move(test_data));
+}
+
+static bytes make_blob_bytes(std::initializer_list<uint8_t> values) {
+    bytes data(bytes::initialized_later(), values.size());
+    std::ranges::transform(values, data.begin(), [] (uint8_t value) {
+        return static_cast<int8_t>(value);
+    });
+    return data;
+}
+
+static bytes make_blob_bytes(size_t size, uint8_t value) {
+    bytes data(bytes::initialized_later(), size);
+    std::ranges::fill(data, static_cast<int8_t>(value));
+    return data;
+}
+
+static bytes make_blob_with_zero_run(size_t prefix_size, size_t zero_count, size_t suffix_size) {
+    bytes data(bytes::initialized_later(), prefix_size + zero_count + suffix_size);
+    for (size_t i = 0; i < prefix_size; ++i) {
+        data[i] = static_cast<int8_t>('A' + (i % 23));
+    }
+    std::ranges::fill(data.begin() + prefix_size, data.begin() + prefix_size + zero_count, 0);
+    for (size_t i = 0; i < suffix_size; ++i) {
+        data[prefix_size + zero_count + i] = static_cast<int8_t>('a' + (i % 23));
+    }
+    return data;
+}
+
+static bytes reference_zero_escaped_blob(bytes_view source) {
+    std::vector<int8_t> encoded;
+    encoded.reserve(source.size() + 1);
+    bool escaped = false;
+    for (int8_t byte : source) {
+        if (escaped) {
+            if (byte == 0) {
+                encoded.push_back(static_cast<int8_t>(0xFE));
+                continue;
+            }
+            encoded.push_back(static_cast<int8_t>(0xFF));
+            escaped = false;
+        }
+        if (byte == 0) {
+            encoded.push_back(0);
+            escaped = true;
+        } else {
+            encoded.push_back(byte);
+        }
+    }
+    encoded.push_back(static_cast<int8_t>(escaped ? 0xFE : 0));
+    return bytes(encoded.data(), encoded.size());
+}
+
+static void check_blob_zero_escape(bytes source) {
+    const auto expected_bytes = reference_zero_escaped_blob(source);
+    const auto source_mb = managed_bytes(source);
+    const auto expected_mb = managed_bytes(expected_bytes);
+    const auto encoded = comparable_bytes(*bytes_type, managed_bytes_view(source_mb));
+    BOOST_REQUIRE(encoded.as_managed_bytes_view() == managed_bytes_view(expected_mb));
+
+    const auto decoded = encoded.to_serialized_bytes(*bytes_type).value();
+    BOOST_REQUIRE(managed_bytes_view(decoded) == managed_bytes_view(source_mb));
+
+    const auto decoded_from_expected = comparable_bytes(managed_bytes(expected_bytes)).to_serialized_bytes(*bytes_type).value();
+    BOOST_REQUIRE(managed_bytes_view(decoded_from_expected) == managed_bytes_view(source_mb));
+}
+
+BOOST_AUTO_TEST_CASE(test_blob_zero_escape_edge_cases) {
+    // Covers GitHub issue #6: comparable-bytes zero escaping scans, including SIMD lane and chunk boundaries.
+    check_blob_zero_escape(bytes());
+    check_blob_zero_escape(bytes("AB"));
+    check_blob_zero_escape(make_blob_bytes({0}));
+    check_blob_zero_escape(make_blob_bytes({0, 0, 0, 0}));
+    check_blob_zero_escape(make_blob_bytes({0xFE, 0xFF, 'A', 0xFE, 0xFF}));
+    check_blob_zero_escape(make_blob_bytes(4096, 'x'));
+
+    for (size_t zero_pos : {size_t(0), size_t(1), size_t(15), size_t(16), size_t(17), size_t(31), size_t(32),
+            size_t(33), size_t(63), size_t(64), size_t(1023), size_t(1024), size_t(1025)}) {
+        check_blob_zero_escape(make_blob_with_zero_run(zero_pos, 1, 5));
+    }
+
+    for (size_t zero_count : {size_t(1), size_t(2), size_t(16), size_t(32), size_t(127), size_t(128), size_t(1024), size_t(2048)}) {
+        check_blob_zero_escape(make_blob_with_zero_run(0, zero_count, 0));
+        check_blob_zero_escape(make_blob_with_zero_run(7, zero_count, 11));
+    }
+
+    check_blob_zero_escape(make_blob_with_zero_run(1022, 1, 3));
+    check_blob_zero_escape(make_blob_with_zero_run(1023, 1, 3));
+    check_blob_zero_escape(make_blob_with_zero_run(1023, 2, 3));
+}
+
+BOOST_AUTO_TEST_CASE(test_blob_zero_escape_simd_modes) {
+    const auto previous_mode = get_comparable_bytes_simd_optimization_mode();
+    auto restore_mode = defer([previous_mode] {
+        set_comparable_bytes_simd_optimization_mode(previous_mode);
+    });
+
+    for (auto mode : {
+            db::simd_optimization_mode::automatic,
+            db::simd_optimization_mode::off,
+            db::simd_optimization_mode::sse,
+            db::simd_optimization_mode::avx2,
+            db::simd_optimization_mode::avx512,
+            db::simd_optimization_mode::neon,
+            db::simd_optimization_mode::sve}) {
+        set_comparable_bytes_simd_optimization_mode(mode);
+        check_blob_zero_escape(make_blob_with_zero_run(15, 34, 17));
+        check_blob_zero_escape(make_blob_with_zero_run(4095, 2, 4));
+    }
 }
 
 static std::vector<data_value> generate_string_test_data(
