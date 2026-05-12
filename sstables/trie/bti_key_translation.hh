@@ -17,6 +17,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
+#include <span>
+
 #include "mutation/position_in_partition.hh"
 #include "types/comparable_bytes.hh"
 #include "common.hh"
@@ -26,6 +30,10 @@
 namespace sstables {
     struct clustering_info;
 } // namespace sstables
+
+namespace db {
+    enum class simd_optimization_mode : uint8_t;
+} // namespace db
 
 namespace sstables::trie {
 
@@ -186,6 +194,9 @@ static_assert(comparable_bytes_iterator<lazy_comparable_bytes_from_clustering_po
 
 template <comparable_bytes_iterator T>
 using cbi_span_type = std::remove_cvref_t<decltype(*std::declval<T>())>;
+
+size_t first_mismatch_offset(std::span<const std::byte> a, std::span<const std::byte> b, db::simd_optimization_mode mode) noexcept;
+
 // Finds the first byte in `b` which differentiates it from `a`,
 // (Might be one-past the end of `b` if `b` is a prefix of `a`).
 // and returns its index and a pointer to it.
@@ -197,7 +208,7 @@ using cbi_span_type = std::remove_cvref_t<decltype(*std::declval<T>())>;
 // return {it_b - b.begin(), it_b};
 // ```
 template <comparable_bytes_iterator T>
-std::pair<size_t, typename cbi_span_type<T>::pointer> lcb_mismatch(T&& a_it, T&& b_it) {
+std::pair<size_t, typename cbi_span_type<T>::pointer> lcb_mismatch(T&& a_it, T&& b_it, db::simd_optimization_mode mode) {
     using span_type = cbi_span_type<T>;
     // a_sp is a suffix of the span pointed to by a_it,
     // b_sp is a suffix of the span pointed to by b_it.
@@ -232,7 +243,13 @@ std::pair<size_t, typename cbi_span_type<T>::pointer> lcb_mismatch(T&& a_it, T&&
             b_sp = *b_it;
             expensive_log("lcb_mismatch: b_sp={}", fmt_hex(b_sp));
         }
-        size_t mismatch_idx = std::ranges::mismatch(a_sp, b_sp).in2 - b_sp.begin();
+        auto common_size = std::min(a_sp.size(), b_sp.size());
+        size_t mismatch_idx;
+        if (common_size < 16) {
+            mismatch_idx = std::ranges::mismatch(a_sp.first(common_size), b_sp.first(common_size)).in2 - b_sp.begin();
+        } else {
+            mismatch_idx = first_mismatch_offset(a_sp.first(common_size), b_sp.first(common_size), mode);
+        }
         expensive_log("lcb_mismatch: mismatch_idx={}, a[0]={}, b[0]={}", mismatch_idx, *a_sp.begin(), *b_sp.begin());
         i += mismatch_idx;
         if (mismatch_idx < a_sp.size() && mismatch_idx < b_sp.size()) {

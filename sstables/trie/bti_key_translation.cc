@@ -7,9 +7,164 @@
  */
 
 #include "bti_key_translation.hh"
+
+#include <algorithm>
+#include <bit>
+#include <cstdint>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+#include "db/config.hh"
 #include "sstables/mx/types.hh"
 
 namespace sstables::trie {
+
+namespace {
+
+static size_t first_mismatch_scalar(std::span<const std::byte> a, std::span<const std::byte> b, size_t first, size_t last) noexcept {
+    for (size_t i = first; i < last; ++i) {
+        if (a[i] != b[i]) {
+            return i;
+        }
+    }
+    return last;
+}
+
+static size_t first_mismatch_scalar(std::span<const std::byte> a, std::span<const std::byte> b) noexcept {
+    return first_mismatch_scalar(a, b, 0, a.size());
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+[[gnu::target("sse2")]]
+static size_t first_mismatch_sse2(std::span<const std::byte> a, std::span<const std::byte> b) noexcept {
+    constexpr size_t lane_size = 16;
+    constexpr uint32_t all_equal = (uint32_t(1) << lane_size) - 1;
+
+    size_t i = 0;
+    const size_t size = a.size();
+    for (; i + lane_size <= size; i += lane_size) {
+        const auto av = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a.data() + i));
+        const auto bv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b.data() + i));
+        const auto eq = _mm_cmpeq_epi8(av, bv);
+        const uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(eq));
+        if (mask != all_equal) {
+            return i + std::countr_zero((~mask) & all_equal);
+        }
+    }
+    return first_mismatch_scalar(a, b, i, size);
+}
+
+[[gnu::target("avx2")]]
+static size_t first_mismatch_avx2(std::span<const std::byte> a, std::span<const std::byte> b) noexcept {
+    constexpr size_t lane_size = 32;
+    constexpr uint32_t all_equal = ~uint32_t(0);
+
+    size_t i = 0;
+    const size_t size = a.size();
+    for (; i + lane_size <= size; i += lane_size) {
+        const auto av = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a.data() + i));
+        const auto bv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b.data() + i));
+        const auto eq = _mm256_cmpeq_epi8(av, bv);
+        const uint32_t mask = static_cast<uint32_t>(_mm256_movemask_epi8(eq));
+        if (mask != all_equal) {
+            return i + std::countr_zero(~mask);
+        }
+    }
+    return first_mismatch_scalar(a, b, i, size);
+}
+
+[[gnu::target("avx512f,avx512bw")]]
+static size_t first_mismatch_avx512(std::span<const std::byte> a, std::span<const std::byte> b) noexcept {
+    constexpr size_t lane_size = 64;
+    constexpr uint64_t all_equal = ~uint64_t(0);
+
+    size_t i = 0;
+    const size_t size = a.size();
+    for (; i + lane_size <= size; i += lane_size) {
+        const auto av = _mm512_loadu_si512(reinterpret_cast<const void*>(a.data() + i));
+        const auto bv = _mm512_loadu_si512(reinterpret_cast<const void*>(b.data() + i));
+        const uint64_t mask = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(av, bv));
+        if (mask != all_equal) {
+            return i + std::countr_zero(~mask);
+        }
+    }
+    return first_mismatch_scalar(a, b, i, size);
+}
+
+static bool cpu_supports_avx512() noexcept {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
+}
+
+static bool cpu_supports_avx2() noexcept {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2");
+}
+
+static bool cpu_supports_sse2() noexcept {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("sse2");
+}
+#endif
+
+#if defined(__aarch64__)
+static size_t first_mismatch_neon(std::span<const std::byte> a, std::span<const std::byte> b) noexcept {
+    constexpr size_t lane_size = 16;
+
+    size_t i = 0;
+    const size_t size = a.size();
+    for (; i + lane_size <= size; i += lane_size) {
+        const auto av = vld1q_u8(reinterpret_cast<const uint8_t*>(a.data() + i));
+        const auto bv = vld1q_u8(reinterpret_cast<const uint8_t*>(b.data() + i));
+        const auto eq = vceqq_u8(av, bv);
+        if (vminvq_u8(eq) != 0xff) {
+            return first_mismatch_scalar(a, b, i, i + lane_size);
+        }
+    }
+    return first_mismatch_scalar(a, b, i, size);
+}
+#endif
+
+} // anonymous namespace
+
+size_t first_mismatch_offset(std::span<const std::byte> a, std::span<const std::byte> b, db::simd_optimization_mode mode) noexcept {
+    const size_t size = std::min(a.size(), b.size());
+    a = a.first(size);
+    b = b.first(size);
+
+#if defined(__x86_64__) || defined(__i386__)
+    if (mode == db::simd_optimization_mode::off) {
+        return first_mismatch_scalar(a, b);
+    }
+
+    static const bool has_avx512 = cpu_supports_avx512();
+    if (mode == db::simd_optimization_mode::avx512 && has_avx512) {
+        return first_mismatch_avx512(a, b);
+    }
+    static const bool has_avx2 = cpu_supports_avx2();
+    if ((mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::avx2) && has_avx2) {
+        return first_mismatch_avx2(a, b);
+    }
+    static const bool has_sse2 = cpu_supports_sse2();
+    if ((mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::sse) && has_sse2) {
+        return first_mismatch_sse2(a, b);
+    }
+    return first_mismatch_scalar(a, b);
+#elif defined(__aarch64__)
+    if (mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::neon) {
+        return first_mismatch_neon(a, b);
+    }
+    return first_mismatch_scalar(a, b);
+#else
+    return first_mismatch_scalar(a, b);
+#endif
+}
 
 lazy_comparable_bytes_from_ring_position::lazy_comparable_bytes_from_ring_position(const schema& s, dht::ring_position_view rpv)
     : _s(s)

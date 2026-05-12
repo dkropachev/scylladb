@@ -20,6 +20,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/util/closeable.hh>
 #include <seastar/util/defer.hh>
+#include "db/config.hh"
 #include "sstables/mx/types.hh"
 #include "sstables/trie/bti_index.hh"
 #include "sstables/trie/bti_index_internal.hh"
@@ -954,8 +955,8 @@ SEASTAR_THREAD_TEST_CASE(test_exhaustive) {
         auto close_partitions_db = defer([&] { partitions_db_writer.close(); });
         auto close_rows_db = defer([&] { rows_db_writer.close(); });
 
-        auto partition_index_writer = sstables::trie::bti_partition_index_writer(partitions_db_writer);
-        auto row_index_writer = sstables::trie::bti_row_index_writer(rows_db_writer);
+        auto partition_index_writer = sstables::trie::bti_partition_index_writer(partitions_db_writer, db::simd_optimization_mode::automatic);
+        auto row_index_writer = sstables::trie::bti_row_index_writer(rows_db_writer, db::simd_optimization_mode::automatic);
 
         std::optional<partition_index_entry> last_partition_entry;
         std::optional<partition_end_entry> last_partition_end_entry;

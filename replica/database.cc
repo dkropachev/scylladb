@@ -384,6 +384,7 @@ static auto configure_sstables_manager(const db::config& cfg, const database_con
         .format = cfg.sstable_format,
         .large_data_records_per_sstable = cfg.compaction_large_data_records_per_sstable,
         .ignore_component_digest_mismatch = cfg.ignore_component_digest_mismatch(),
+        .bti_key_mismatch_simd_mode = cfg.get_simd_optimization_mode(db::simd_optimization_feature::bti_key_mismatch),
     };
 }
 
