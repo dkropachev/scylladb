@@ -486,6 +486,7 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
 
     set_comparable_bytes_simd_optimization_mode(_cfg.get_simd_optimization_mode(db::simd_optimization_feature::comparable_bytes));
     sstables::trie::set_bti_dense_node_simd_optimization_mode(_cfg.get_simd_optimization_mode(db::simd_optimization_feature::bti_dense_node));
+    sstables::trie::set_bti_sparse_node_simd_optimization_mode(_cfg.get_simd_optimization_mode(db::simd_optimization_feature::bti_sparse_node));
 
     local_schema_registry().init(*this); // TODO: we're never unbound.
     setup_metrics();
