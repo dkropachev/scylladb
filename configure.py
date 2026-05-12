@@ -706,6 +706,7 @@ perf_tests = set([
     'test/perf/perf_mutation_fragment',
     'test/perf/perf_idl',
     'test/perf/perf_vint',
+    'test/perf/perf_vector_similarity',
     'test/perf/perf_big_decimal',
     'test/perf/perf_bti_key_translation',
     'test/perf/perf_sort_by_proximity',
