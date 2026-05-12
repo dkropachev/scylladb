@@ -8,14 +8,23 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "keys/compound.hh"
 #include "mutation/position_in_partition.hh"
 #include "utils/managed_bytes.hh"
+
+namespace db {
+    enum class simd_optimization_mode : uint8_t;
+}
 
 class data_value;
 class abstract_type;
 class comparable_bytes;
 using comparable_bytes_opt = std::optional<comparable_bytes>;
+
+void set_comparable_bytes_simd_optimization_mode(db::simd_optimization_mode mode) noexcept;
+db::simd_optimization_mode get_comparable_bytes_simd_optimization_mode() noexcept;
 
 class comparable_bytes {
     // encoded data in byte comparable format

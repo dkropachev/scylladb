@@ -8,8 +8,13 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+
+namespace db {
+    enum class simd_optimization_mode : uint8_t;
+}
 
 namespace utils {
 
@@ -56,5 +61,8 @@ inline unsigned array_search_8_eq(uint8_t val, const uint8_t* array) {
 unsigned array_search_16_eq(uint8_t val, const uint8_t* array);
 unsigned array_search_32_eq(uint8_t val, const uint8_t* array);
 unsigned array_search_x32_eq(uint8_t val, const uint8_t* array, int nr);
+
+size_t byte_search_eq(uint8_t val, const int8_t* array, size_t size, db::simd_optimization_mode mode);
+size_t byte_search_ne(uint8_t val, const int8_t* array, size_t size, db::simd_optimization_mode mode);
 
 }
