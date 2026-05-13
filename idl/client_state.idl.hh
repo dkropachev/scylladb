@@ -8,6 +8,7 @@
 
 #include "db/timeout_clock.hh"
 #include "gms/inet_address_serializer.hh"
+#include "idl/uuid.idl.hh"
 
 struct timeout_config {
     db::timeout_clock::duration read_timeout;
@@ -28,6 +29,8 @@ struct forwarded_client_state {
     uint64_t protocol_extensions_mask;
     gms::inet_address remote_address;
     uint16_t remote_port;
+    std::optional<locator::host_id> tablet_routing_source_host [[version 2026.3]] = std::nullopt;
+    std::optional<unsigned> tablet_routing_source_shard [[version 2026.3]] = std::nullopt;
 };
 
 }

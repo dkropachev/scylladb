@@ -1857,6 +1857,11 @@ cql_server::process(uint16_t stream, request_reader in, service::client_state& c
 
     co_await utils::get_local_injector().inject("transport_cql_request_pause", utils::wait_for_message(60s));
 
+    if (!client_state.get_tablet_routing_source_host() || !client_state.get_tablet_routing_source_shard()) {
+        auto my_host_id = _query_processor.local().proxy().get_token_metadata_ptr()->get_topology().my_host_id();
+        client_state.set_tablet_routing_source(my_host_id, this_shard_id());
+    }
+
     bool init_trace = (bool)!bounced; // If the request was bounced, we already started the trace in the handler
     auto msg = co_await coroutine::try_future(process_fn(client_state, _query_processor, in, stream,
         version, permit, trace_state, init_trace, {}, dialect));
