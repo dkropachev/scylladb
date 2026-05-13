@@ -374,13 +374,17 @@ service::forwarded_client_state::forwarded_client_state(
     ::timeout_config timeout_config,
     uint64_t protocol_extensions_mask,
     gms::inet_address remote_address,
-    uint16_t remote_port)
+    uint16_t remote_port,
+    std::optional<locator::host_id> tablet_routing_source_host,
+    std::optional<unsigned> tablet_routing_source_shard)
     : keyspace(std::move(keyspace))
     , username(std::move(username))
     , timeout_config(std::move(timeout_config))
     , protocol_extensions_mask(protocol_extensions_mask)
     , remote_address(std::move(remote_address))
     , remote_port(remote_port)
+    , tablet_routing_source_host(tablet_routing_source_host)
+    , tablet_routing_source_shard(tablet_routing_source_shard)
 { }
 
 service::forwarded_client_state::forwarded_client_state(const client_state& cs)
@@ -390,4 +394,6 @@ service::forwarded_client_state::forwarded_client_state(const client_state& cs)
     , protocol_extensions_mask(static_cast<uint64_t>(cs.get_protocol_extensions().mask()))
     , remote_address(cs.get_client_address())
     , remote_port(cs.get_client_port())
+    , tablet_routing_source_host(cs.get_tablet_routing_source_host())
+    , tablet_routing_source_shard(cs.get_tablet_routing_source_shard())
 { }

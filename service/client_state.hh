@@ -19,6 +19,7 @@
 #include "auth/authenticator.hh"
 #include "auth/permission.hh"
 #include "client_data.hh"
+#include "locator/host_id.hh"
 
 #include "transport/cql_protocol_extension.hh"
 #include "service/qos/service_level_controller.hh"
@@ -41,13 +42,17 @@ struct forwarded_client_state {
     uint64_t protocol_extensions_mask;
     gms::inet_address remote_address;
     uint16_t remote_port;
+    std::optional<locator::host_id> tablet_routing_source_host;
+    std::optional<unsigned> tablet_routing_source_shard;
 
     forwarded_client_state(sstring keyspace,
                            std::optional<sstring> username,
                            ::timeout_config timeout_config,
                            uint64_t protocol_extensions_mask,
                            gms::inet_address remote_address,
-                           uint16_t remote_port);
+                           uint16_t remote_port,
+                           std::optional<locator::host_id> tablet_routing_source_host = std::nullopt,
+                           std::optional<unsigned> tablet_routing_source_shard = std::nullopt);
     forwarded_client_state(const client_state& cs);
 };
 
@@ -97,6 +102,8 @@ private:
             , _timeout_config(cs->_timeout_config)
             , _as(as)
             , _enabled_protocol_extensions(cs->_enabled_protocol_extensions)
+            , _tablet_routing_source_host(cs->_tablet_routing_source_host)
+            , _tablet_routing_source_shard(cs->_tablet_routing_source_shard)
     {}
     friend client_state_for_another_shard;
 private:
@@ -292,6 +299,8 @@ public:
             , _as(as)
             , _enabled_protocol_extensions(cql_transport::cql_protocol_extension_enum_set::from_mask(
                     forwarded_state.protocol_extensions_mask))
+            , _tablet_routing_source_host(forwarded_state.tablet_routing_source_host)
+            , _tablet_routing_source_shard(forwarded_state.tablet_routing_source_shard)
     {}
 
     client_state(const client_state&) = delete;
@@ -505,6 +514,12 @@ public:
 private:
 
     cql_transport::cql_protocol_extension_enum_set _enabled_protocol_extensions;
+    // Host and shard where the current CQL request entered the coordinator.
+    // They are copied across internal shard and node bounces so tablet routing
+    // feedback is based on the client's routing decision, not on the post-bounce
+    // execution shard.
+    std::optional<locator::host_id> _tablet_routing_source_host;
+    std::optional<unsigned> _tablet_routing_source_shard;
 
 public:
 
@@ -519,7 +534,24 @@ public:
     void set_protocol_extensions(cql_transport::cql_protocol_extension_enum_set exts) {
         _enabled_protocol_extensions = std::move(exts);
     }
+
+    void set_tablet_routing_source(locator::host_id host, unsigned shard) noexcept {
+        _tablet_routing_source_host = host;
+        _tablet_routing_source_shard = shard;
+    }
+
+    void set_tablet_routing_source_shard(unsigned shard) noexcept {
+        _tablet_routing_source_host = std::nullopt;
+        _tablet_routing_source_shard = shard;
+    }
+
+    std::optional<locator::host_id> get_tablet_routing_source_host() const noexcept {
+        return _tablet_routing_source_host;
+    }
+
+    std::optional<unsigned> get_tablet_routing_source_shard() const noexcept {
+        return _tablet_routing_source_shard;
+    }
 };
 
 }
-
