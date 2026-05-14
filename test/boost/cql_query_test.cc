@@ -6202,6 +6202,34 @@ SEASTAR_TEST_CASE(test_sending_tablet_info_for_forwarded_serial_and_lwt) {
             return result.has_tablet_info;
         };
 
+        auto execute_conditional_batch_once_on_shard = [&] (unsigned shard, unsigned source_shard, std::vector<sstring> queries) {
+            return smp::submit_to(shard, [&e, queries = std::move(queries), source_shard] () mutable {
+                return seastar::async([&e, queries = std::move(queries), source_shard] () mutable {
+                    std::vector<std::string_view> query_views;
+                    query_views.reserve(queries.size());
+                    for (const auto& query : queries) {
+                        query_views.push_back(query);
+                    }
+
+                    e.local_client_state().set_tablet_routing_source_shard(source_shard);
+                    auto result = e.execute_batch(query_views, cql3::statements::batch_statement::type::LOGGED,
+                            std::make_unique<cql3::query_options>(cql3::query_options::DEFAULT)).get();
+                    if (auto bounce = result->as_bounce()) {
+                        return tablet_query_result{false, bounce->target_shard()};
+                    }
+                    return tablet_query_result{has_tablet_routing(result), std::nullopt};
+                });
+            }).get();
+        };
+
+        auto execute_conditional_batch_from_source_shard = [&] (unsigned source_shard, auto make_queries, int32_t pk) {
+            auto result = execute_conditional_batch_once_on_shard(source_shard, source_shard, make_queries(pk));
+            if (result.bounce_shard) {
+                result = execute_conditional_batch_once_on_shard(*result.bounce_shard, source_shard, make_queries(pk));
+            }
+            return result.has_tablet_info;
+        };
+
         auto require_token_aware_prepared = [&] (std::string_view name,
                 const cql3::prepared_cache_key_type& id, auto make_values, int32_t local_pk,
                 int32_t foreign_pk, db::consistency_level cl) {
@@ -6214,6 +6242,16 @@ SEASTAR_TEST_CASE(test_sending_tablet_info_for_forwarded_serial_and_lwt) {
                     format("{} did not get tablet info from foreign shard {}", name, foreign_shard));
         };
 
+        auto require_token_aware_conditional_batch = [&] (std::string_view name, auto make_queries, int32_t local_pk, int32_t foreign_pk) {
+            auto local_shard = shard_for_pk(local_pk);
+            BOOST_REQUIRE_MESSAGE(!execute_conditional_batch_from_source_shard(local_shard, make_queries, local_pk),
+                    format("{} got tablet info on owning shard {}", name, local_shard));
+
+            auto foreign_shard = (shard_for_pk(foreign_pk) + 1) % smp::count;
+            BOOST_REQUIRE_MESSAGE(execute_conditional_batch_from_source_shard(foreign_shard, make_queries, foreign_pk),
+                    format("{} did not get tablet info from foreign shard {}", name, foreign_shard));
+        };
+
         auto select_prepared = e.prepare("select pk, ck, v from ks.test_tablet where pk = ? and ck = ?;").get();
         auto update_lwt_if_v = e.prepare("update ks.test_tablet set v = ? where pk = ? and ck = ? if v = ?;").get();
 
@@ -6221,6 +6259,12 @@ SEASTAR_TEST_CASE(test_sending_tablet_info_for_forwarded_serial_and_lwt) {
                 [&] (int32_t pk) { return raw_values({pk, 1}); }, 1, 2, db::consistency_level::SERIAL);
         require_token_aware_prepared("UPDATE_LWT_IF_VAL", update_lwt_if_v,
                 [&] (int32_t pk) { return raw_values({4, pk, 1, 2}); }, 3, 4, db::consistency_level::ONE);
+        require_token_aware_conditional_batch("CONDITIONAL_BATCH",
+                [] (int32_t pk) {
+                    return std::vector<sstring>{
+                        format("update ks.test_tablet set v = 4 where pk = {} and ck = 1 if v = 2", pk),
+                    };
+                }, 5, 6);
     }, std::move(cfg));
 }
 

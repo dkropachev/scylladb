@@ -16,12 +16,31 @@
 #include <seastar/core/execution_stage.hh>
 #include "cas_request.hh"
 #include "cql3/query_processor.hh"
+#include "locator/abstract_replication_strategy.hh"
+#include "replica/database.hh"
 #include "service/storage_proxy.hh"
+#include "transport/cql_protocol_extension.hh"
+#include "transport/messages/result_message.hh"
 #include "tracing/trace_state.hh"
 #include "utils/unique_view.hh"
 
 template<typename T = void>
 using coordinator_result = exceptions::coordinator_result<T>;
+
+namespace {
+
+std::optional<locator::tablet_replica> tablet_routing_source_replica(const service::client_state& client_state, const locator::effective_replication_map& erm) {
+    auto source_shard = client_state.get_tablet_routing_source_shard();
+    if (!source_shard) {
+        return std::nullopt;
+    }
+    return locator::tablet_replica{
+        client_state.get_tablet_routing_source_host().value_or(erm.get_token_metadata().get_my_id()),
+        *source_shard,
+    };
+}
+
+}
 
 namespace cql3 {
 
@@ -393,18 +412,30 @@ future<shared_ptr<cql_transport::messages::result_message>> batch_statement::exe
         throw exceptions::invalid_request_exception(format("Unrestricted partition key in a conditional BATCH"));
     }
 
-    auto cas_shard = service::cas_shard(*_statements[0].statement->s, request->key()[0].start()->value().as_decorated_key().token());
+    auto token = request->key()[0].start()->value().as_decorated_key().token();
+    auto cas_shard = service::cas_shard(*_statements[0].statement->s, token);
     if (!cas_shard.this_shard()) {
         return make_ready_future<shared_ptr<cql_transport::messages::result_message>>(
                 qp.bounce_to_shard(cas_shard.shard(), std::move(cached_fn_calls))
             );
     }
 
+    std::optional<locator::tablet_routing_info> tablet_info;
+    auto&& table = schema->table();
+    if (table.uses_tablets() && qs.get_client_state().is_protocol_extension_set(cql_transport::cql_protocol_extension::TABLETS_ROUTING_V1)) {
+        auto erm = table.get_effective_replication_map();
+        tablet_info = erm->check_locality(token, tablet_routing_source_replica(qs.get_client_state(), *erm));
+    }
+
     auto* request_ptr = request.get();
     return qp.proxy().cas(schema, std::move(cas_shard), *request_ptr, request->read_command(qp), request->key(),
             {read_timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()},
-            std::move(cl_for_paxos).assume_value(), cl_for_learn, batch_timeout, cas_timeout).then([this, request = std::move(request)] (bool is_applied) {
-        return request->build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied);
+            std::move(cl_for_paxos).assume_value(), cl_for_learn, batch_timeout, cas_timeout).then([this, request = std::move(request), tablet_info = std::move(tablet_info)] (bool is_applied) mutable {
+        auto result = request->build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied);
+        if (tablet_info.has_value()) {
+            result->add_tablet_info(std::move(tablet_info->tablet_replicas), tablet_info->token_range);
+        }
+        return result;
     });
 }
 
@@ -489,5 +520,3 @@ audit::statement_category batch_statement::category() const {
 }
 
 }
-
-
