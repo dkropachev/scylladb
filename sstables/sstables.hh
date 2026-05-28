@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "version.hh"
 #include "shared_sstable.hh"
 #include "open_info.hh"
@@ -62,6 +64,7 @@ class in_memory_config_type;
 namespace db {
 class large_data_handler;
 class corrupt_data_handler;
+enum class simd_optimization_mode : uint8_t;
 }
 
 namespace sstables {
@@ -124,6 +127,7 @@ struct sstable_writer_config {
     sstring origin;
     bool correct_pi_block_width = true;
     uint32_t large_data_records_per_sstable = 10;
+    db::simd_optimization_mode bti_key_mismatch_simd_mode{};
 
 private:
     explicit sstable_writer_config() {}

@@ -227,6 +227,7 @@ sstable_writer_config sstables_manager::configure_writer(sstring origin) const {
 
     cfg.origin = std::move(origin);
     cfg.large_data_records_per_sstable = _config.large_data_records_per_sstable();
+    cfg.bti_key_mismatch_simd_mode = _config.bti_key_mismatch_simd_mode;
 
     return cfg;
 }

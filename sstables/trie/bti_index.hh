@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <seastar/core/shared_ptr.hh>
 #include "sstables/abstract_index_reader.hh"
@@ -28,6 +29,10 @@ namespace seastar {
 
 namespace utils {
     class hashed_key;
+}
+
+namespace db {
+    enum class simd_optimization_mode : uint8_t;
 }
 
 class schema;
@@ -73,7 +78,7 @@ public:
     // but it mustn't be extended after `finish()`,
     // because `finish()` writes a footer which is used by the reader
     // to find the root of the trie.
-    explicit bti_partition_index_writer(sstables::file_writer&);
+    explicit bti_partition_index_writer(sstables::file_writer&, db::simd_optimization_mode);
     bti_partition_index_writer(bti_partition_index_writer&&) noexcept;
     bti_partition_index_writer& operator=(bti_partition_index_writer&&) noexcept;
     ~bti_partition_index_writer() noexcept;
@@ -103,7 +108,7 @@ public:
     // The trie will be written to the given file writer.
     // Note: the file doesn't have to be empty,
     // and it can be extended later.
-    explicit bti_row_index_writer(sstables::file_writer&);
+    explicit bti_row_index_writer(sstables::file_writer&, db::simd_optimization_mode);
     bti_row_index_writer(bti_row_index_writer&&) noexcept;
     bti_row_index_writer& operator=(bti_row_index_writer&&) noexcept;
     explicit operator bool() const noexcept { return bool(_impl); }

@@ -928,6 +928,17 @@ rf_rack_valid_keyspaces: false
 # Options for encrypted connections to the vector store. These options are used for HTTPS URIs in vector_store_primary_uri and vector_store_secondary_uri.
 # vector_store_encryption_options:
 #    truststore: <not set, use system trust>
+#
+# Selects SIMD implementation families for CPU-optimized code paths. Per-feature keys set to default or omitted inherit simd_optimization_options.default.
+# Valid values are: default, auto, off, sse, avx2, avx512, neon, sve.
+# The default value is valid only for per-feature keys.
+# simd_optimization_options:
+#    default: auto
+#    vector_similarity: default
+#    bti_key_mismatch: default
+#    comparable_bytes: default
+#    bti_dense_node: default
+#    bti_sparse_node: default
 
 # 
 # Background IO rate limiting
@@ -942,4 +953,3 @@ rf_rack_valid_keyspaces: false
 # 75% of disk bytes is: 0.75 * 1831 = 1373 megabytes/s
 # maintenance_io_throughput_mb_per_sec: 1373
 # 
-

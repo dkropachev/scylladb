@@ -12,6 +12,7 @@
 #include <boost/program_options.hpp>
 #include <xxhash.h>
 #include <fmt/std.h>
+#include "db/config.hh"
 #include "readers/from_mutations.hh"
 #include "schema/schema_builder.hh"
 #include "sstables/sstable_writer.hh"
@@ -499,8 +500,8 @@ void do_test(const test_config& cfg) {
             auto close_rows_db = defer([&] () { rows_db_writer.close(); });
 
             // Construct BTI index writers on top of the `file_writer`s.
-            auto bti_partition_index_writer = sstables::trie::bti_partition_index_writer(partitions_db_writer);
-            auto bti_row_index_writer = sstables::trie::bti_row_index_writer(rows_db_writer);
+            auto bti_partition_index_writer = sstables::trie::bti_partition_index_writer(partitions_db_writer, db::simd_optimization_mode::automatic);
+            auto bti_row_index_writer = sstables::trie::bti_row_index_writer(rows_db_writer, db::simd_optimization_mode::automatic);
 
             struct current_partition_data {
                 uint64_t data_file_offset;
