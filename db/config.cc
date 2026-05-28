@@ -7,9 +7,10 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <array>
 #include <optional>
-#include <unordered_map>
 #include <sstream>
+#include <unordered_map>
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim_all.hpp>
@@ -645,6 +646,73 @@ static db::tri_mode_restriction_t::mode strict_allow_filtering_default() {
     return db::tri_mode_restriction_t::mode::WARN; // TODO: make it TRUE after Scylla 4.6.
 }
 
+namespace {
+
+using simd_mode = db::simd_optimization_mode;
+using simd_feature = db::simd_optimization_feature;
+
+constexpr auto simd_mode_entries = std::to_array<std::pair<std::string_view, simd_mode>>({
+    {"auto", simd_mode::automatic},
+    {"off", simd_mode::off},
+    {"sse", simd_mode::sse},
+    {"avx2", simd_mode::avx2},
+    {"avx512", simd_mode::avx512},
+    {"neon", simd_mode::neon},
+    {"sve", simd_mode::sve},
+});
+
+constexpr auto simd_feature_entries = std::to_array<std::pair<std::string_view, simd_feature>>({
+    {"vector_similarity", simd_feature::vector_similarity},
+    {"bti_key_mismatch", simd_feature::bti_key_mismatch},
+    {"comparable_bytes", simd_feature::comparable_bytes},
+    {"bti_dense_node", simd_feature::bti_dense_node},
+    {"bti_sparse_node", simd_feature::bti_sparse_node},
+});
+
+constexpr std::string_view simd_default_key = "default";
+constexpr std::string_view simd_default_value = "default";
+
+simd_mode parse_simd_optimization_mode(std::string_view value, std::string_view key) {
+    for (const auto& [name, mode] : simd_mode_entries) {
+        if (value == name) {
+            return mode;
+        }
+    }
+    throw exceptions::configuration_exception(fmt::format(
+            "Invalid value for simd_optimization_options.{}: {}. Valid values are: default, auto, off, sse, avx2, avx512, neon, sve",
+            key, value));
+}
+
+bool is_simd_feature_key(std::string_view key) {
+    for (const auto& [name, feature] : simd_feature_entries) {
+        if (key == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void validate_simd_optimization_options(const db::config::string_map& options) {
+    for (const auto& [key, value] : options) {
+        if (key == simd_default_key) {
+            if (value == simd_default_value) {
+                throw exceptions::configuration_exception("simd_optimization_options.default cannot be set to default");
+            }
+            parse_simd_optimization_mode(value, key);
+        } else if (is_simd_feature_key(key)) {
+            if (value != simd_default_value) {
+                parse_simd_optimization_mode(value, key);
+            }
+        } else {
+            throw exceptions::configuration_exception(fmt::format(
+                    "Invalid key in simd_optimization_options: {}. Valid keys are: default, vector_similarity, bti_key_mismatch, comparable_bytes, bti_dense_node, bti_sparse_node",
+                    key));
+        }
+    }
+}
+
+} // anonymous namespace
+
 static std::vector<sstring> experimental_feature_names() {
     std::vector<sstring> ret;
     for (const auto& f : db::experimental_features_t::map()) {
@@ -1240,6 +1308,11 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , vector_store_encryption_options(this, "vector_store_encryption_options", value_status::Used, {},
         "Options for encrypted connections to the vector store. These options are used for HTTPS URIs in `vector_store_primary_uri` and `vector_store_secondary_uri`. The available options are:\n"
         "* truststore: (Default: <not set, use system truststore>) Location of the truststore containing the trusted certificate for authenticating remote servers.")
+    , simd_optimization_options(this, "simd_optimization_options", liveness::MustRestart, value_status::Used, string_map{{"default", "auto"}},
+        "Controls SIMD implementation selection for CPU-optimized code paths. The `default` value is used by feature keys set to `default` or omitted. "
+        "Valid keys are: default, vector_similarity, bti_key_mismatch, comparable_bytes, bti_dense_node, bti_sparse_node. "
+        "Valid values are: default, auto, off, sse, avx2, avx512, neon, sve. "
+        "The `default` value is valid only for per-feature keys.")
     /**
     * @Group Security properties
     * @GroupDescription Server and client security settings.
@@ -1997,6 +2070,45 @@ std::unordered_map<sstring, db::tablets_mode_t::mode> db::tablets_mode_t::map() 
             {"enforced", db::tablets_mode_t::mode::enforced},
             {"2", db::tablets_mode_t::mode::enforced}
             };
+}
+
+std::string_view db::config::simd_optimization_mode_name(simd_optimization_mode mode) noexcept {
+    for (const auto& [name, candidate] : simd_mode_entries) {
+        if (mode == candidate) {
+            return name;
+        }
+    }
+    return "unknown";
+}
+
+std::string_view db::config::simd_optimization_feature_name(simd_optimization_feature feature) noexcept {
+    for (const auto& [name, candidate] : simd_feature_entries) {
+        if (feature == candidate) {
+            return name;
+        }
+    }
+    return "unknown";
+}
+
+db::simd_optimization_mode db::config::get_simd_optimization_mode(simd_optimization_feature feature) const {
+    const auto& options = simd_optimization_options();
+    validate_simd_optimization_options(options);
+
+    auto default_mode = simd_mode::automatic;
+    if (auto it = options.find(sstring(simd_default_key)); it != options.end()) {
+        default_mode = parse_simd_optimization_mode(it->second, simd_default_key);
+    }
+
+    if (default_mode == simd_mode::off) {
+        return simd_mode::off;
+    }
+
+    const auto feature_name = simd_optimization_feature_name(feature);
+    if (auto it = options.find(sstring(feature_name)); it != options.end() && it->second != simd_default_value) {
+        return parse_simd_optimization_mode(it->second, feature_name);
+    }
+
+    return default_mode;
 }
 
 template struct utils::config_file::named_value<seastar::log_level>;

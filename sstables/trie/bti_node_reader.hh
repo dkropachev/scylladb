@@ -8,8 +8,14 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "utils/cached_file.hh"
 #include "node_reader.hh"
+
+namespace db {
+    enum class simd_optimization_mode : uint8_t;
+}
 
 namespace sstables {
     [[noreturn, gnu::noinline]] void on_bti_parse_error(uint64_t pos);
@@ -18,6 +24,9 @@ namespace sstables {
 namespace sstables::trie {
 
 // Implementation of concept `node_reader`.
+void set_bti_dense_node_simd_optimization_mode(db::simd_optimization_mode mode) noexcept;
+db::simd_optimization_mode get_bti_dense_node_simd_optimization_mode() noexcept;
+
 get_child_result bti_get_child(uint64_t pos, const_bytes sp, int child_idx, bool forward);
 std::byte bti_get_child_transition(uint64_t pos, const_bytes raw, int idx);
 load_final_node_result bti_read_node(int64_t pos, const_bytes sp);

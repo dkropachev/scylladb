@@ -7,9 +7,13 @@
  */
 
 #include <seastar/testing/thread_test_case.hh>
+#include <seastar/util/defer.hh>
 
+#include <algorithm>
+#include <array>
 #include <fmt/ranges.h>
 #include <ranges>
+#include "db/config.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
 #include "utils/memory_data_sink.hh"
@@ -420,6 +424,90 @@ void test_one_body(
                 REQUIRE_EQUAL(n_observed_children, int(offsets.size()));
             }
         }
+    }
+}
+
+void test_dense_lookup_shape(
+    node_type type,
+    std::span<const uint8_t> child_transitions,
+    std::span<const int64_t> offsets,
+    sink_pos pos
+) {
+    auto whatever = string_as_bytes("dense lookup shape");
+    bump_allocator alctr(128 * 1024);
+    auto node = make_node(pos, whatever, child_transitions, offsets, std::nullopt, alctr);
+    auto serialized = serialize_body(*node, pos, type);
+    auto first_transition = child_transitions.front();
+    auto n_slots = child_transitions.back() - first_transition + 1;
+
+    {
+        auto result = bti_read_node(pos.value, serialized);
+        REQUIRE_EQUAL(result.n_children, n_slots);
+    }
+
+    for (int slot = 0; slot < n_slots; ++slot) {
+        auto transition = uint8_t(first_transition + slot);
+        auto next_child = std::ranges::lower_bound(child_transitions, transition) - child_transitions.begin();
+        auto previous_child = std::ranges::upper_bound(child_transitions, transition) - child_transitions.begin() - 1;
+
+        auto next = bti_get_child(pos.value, serialized, slot, true);
+        REQUIRE_EQUAL(next.idx, child_transitions[next_child] - first_transition);
+        REQUIRE_EQUAL(next.offset, uint64_t(offsets[next_child]));
+
+        auto previous = bti_get_child(pos.value, serialized, slot, false);
+        REQUIRE_EQUAL(previous.idx, child_transitions[previous_child] - first_transition);
+        REQUIRE_EQUAL(previous.offset, uint64_t(offsets[previous_child]));
+    }
+
+    for (int key_byte = 0; key_byte < 256; ++key_byte) {
+        auto key = std::byte(key_byte);
+        auto result = bti_walk_down_along_key(pos.value, serialized, std::span<const std::byte>(&key, 1));
+        auto target_child = std::ranges::lower_bound(child_transitions, uint8_t(key_byte)) - child_transitions.begin();
+        if (target_child < int(child_transitions.size())) {
+            REQUIRE_EQUAL(result.found_idx, child_transitions[target_child] - first_transition);
+            REQUIRE_EQUAL(result.found_byte, child_transitions[target_child]);
+            REQUIRE_EQUAL(result.child_offset, offsets[target_child]);
+        } else {
+            REQUIRE_EQUAL(result.found_idx, n_slots);
+            REQUIRE_EQUAL(result.found_byte, -1);
+            REQUIRE_EQUAL(result.child_offset, -1);
+        }
+    }
+}
+
+// Covers #5: SIMD dense-node scans for optimized packed offset widths,
+// including first, middle, last, and missing child transitions.
+SEASTAR_THREAD_TEST_CASE(test_dense_lookup_optimized_offset_widths) {
+    const auto previous_mode = get_bti_dense_node_simd_optimization_mode();
+    auto restore_mode = defer([previous_mode] {
+        set_bti_dense_node_simd_optimization_mode(previous_mode);
+    });
+
+    const std::array<uint8_t, 4> transitions_with_full_span = {0x00, 0x1f, 0x7f, 0xff};
+    const std::array<uint8_t, 3> transitions_with_tail_miss = {0x00, 0x1f, 0x7f};
+
+    const std::array<int64_t, 4> offsets_16 = {1, 17, 1024, (int64_t(1) << 16) - 1};
+    const std::array<int64_t, 3> offsets_16_tail = {1, 17, 1024};
+    const std::array<int64_t, 4> offsets_32 = {1, int64_t(1) << 16, int64_t(1) << 24, (int64_t(1) << 32) - 1};
+    const std::array<int64_t, 3> offsets_32_tail = {1, int64_t(1) << 16, int64_t(1) << 24};
+    const std::array<int64_t, 4> offsets_64 = {1, int64_t(1) << 40, int64_t(1) << 48, int64_t(1) << 55};
+    const std::array<int64_t, 3> offsets_64_tail = {1, int64_t(1) << 40, int64_t(1) << 48};
+
+    for (auto mode : {
+            db::simd_optimization_mode::automatic,
+            db::simd_optimization_mode::off,
+            db::simd_optimization_mode::sse,
+            db::simd_optimization_mode::avx2,
+            db::simd_optimization_mode::avx512,
+            db::simd_optimization_mode::neon,
+            db::simd_optimization_mode::sve}) {
+        set_bti_dense_node_simd_optimization_mode(mode);
+        test_dense_lookup_shape(DENSE_16, transitions_with_full_span, offsets_16, sink_pos((int64_t(1) << 16) + 4096));
+        test_dense_lookup_shape(DENSE_16, transitions_with_tail_miss, offsets_16_tail, sink_pos((int64_t(1) << 16) + 4096));
+        test_dense_lookup_shape(DENSE_32, transitions_with_full_span, offsets_32, sink_pos((int64_t(1) << 32) + 4096));
+        test_dense_lookup_shape(DENSE_32, transitions_with_tail_miss, offsets_32_tail, sink_pos((int64_t(1) << 32) + 4096));
+        test_dense_lookup_shape(LONG_DENSE, transitions_with_full_span, offsets_64, sink_pos((int64_t(1) << 56) + 4096));
+        test_dense_lookup_shape(LONG_DENSE, transitions_with_tail_miss, offsets_64_tail, sink_pos((int64_t(1) << 56) + 4096));
     }
 }
 

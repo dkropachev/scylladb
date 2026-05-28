@@ -9,7 +9,324 @@
 #include "bti_node_reader.hh"
 #include "bti_node_type.hh"
 
+#include <algorithm>
+#include <bit>
+#include <cstdint>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+#include "db/config.hh"
+
 namespace sstables::trie {
+
+namespace {
+
+static thread_local db::simd_optimization_mode bti_dense_node_simd_optimization_mode = db::simd_optimization_mode::automatic;
+
+static int dense_first_nonzero_offset_scalar(const_bytes offsets, int first, int last, int bits_per_pointer) {
+    for (int idx = first; idx < last; ++idx) {
+        if (read_offset(offsets, idx, bits_per_pointer) != 0) {
+            return idx;
+        }
+    }
+    return last;
+}
+
+static int dense_last_nonzero_offset_scalar(const_bytes offsets, int first, int last, int bits_per_pointer) {
+    for (int idx = last - 1; idx >= first; --idx) {
+        if (read_offset(offsets, idx, bits_per_pointer) != 0) {
+            return idx;
+        }
+    }
+    return first - 1;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+template <int BytesPerOffset>
+[[gnu::target("sse2")]]
+static int dense_first_nonzero_offset_sse2(const_bytes offsets, int first, int last) {
+    constexpr int lane_bytes = 16;
+    constexpr int offsets_per_lane = lane_bytes / BytesPerOffset;
+    constexpr uint32_t all_bytes = (uint32_t(1) << lane_bytes) - 1;
+
+    const auto zero = _mm_setzero_si128();
+    int idx = first;
+    for (; idx + offsets_per_lane <= last; idx += offsets_per_lane) {
+        const auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(offsets.data() + idx * BytesPerOffset));
+        const auto eq = _mm_cmpeq_epi8(v, zero);
+        const auto nonzero_bytes = (~uint32_t(_mm_movemask_epi8(eq))) & all_bytes;
+        if (nonzero_bytes != 0) {
+            return idx + std::countr_zero(nonzero_bytes) / BytesPerOffset;
+        }
+    }
+    return dense_first_nonzero_offset_scalar(offsets, idx, last, BytesPerOffset * 8);
+}
+
+template <int BytesPerOffset>
+[[gnu::target("sse2")]]
+static int dense_last_nonzero_offset_sse2(const_bytes offsets, int first, int last) {
+    constexpr int lane_bytes = 16;
+    constexpr int offsets_per_lane = lane_bytes / BytesPerOffset;
+    constexpr uint32_t all_bytes = (uint32_t(1) << lane_bytes) - 1;
+
+    const auto zero = _mm_setzero_si128();
+    int idx = last;
+    for (; idx - offsets_per_lane >= first; idx -= offsets_per_lane) {
+        const int block_start = idx - offsets_per_lane;
+        const auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(offsets.data() + block_start * BytesPerOffset));
+        const auto eq = _mm_cmpeq_epi8(v, zero);
+        const auto nonzero_bytes = (~uint32_t(_mm_movemask_epi8(eq))) & all_bytes;
+        if (nonzero_bytes != 0) {
+            return block_start + (std::bit_width(nonzero_bytes) - 1) / BytesPerOffset;
+        }
+    }
+    return dense_last_nonzero_offset_scalar(offsets, first, idx, BytesPerOffset * 8);
+}
+
+template <int BytesPerOffset>
+[[gnu::target("avx2")]]
+static int dense_first_nonzero_offset_avx2(const_bytes offsets, int first, int last) {
+    constexpr int lane_bytes = 32;
+    constexpr int offsets_per_lane = lane_bytes / BytesPerOffset;
+    constexpr uint32_t all_bytes = ~uint32_t(0);
+
+    const auto zero = _mm256_setzero_si256();
+    int idx = first;
+    for (; idx + offsets_per_lane <= last; idx += offsets_per_lane) {
+        const auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(offsets.data() + idx * BytesPerOffset));
+        const auto eq = _mm256_cmpeq_epi8(v, zero);
+        const auto nonzero_bytes = (~uint32_t(_mm256_movemask_epi8(eq))) & all_bytes;
+        if (nonzero_bytes != 0) {
+            return idx + std::countr_zero(nonzero_bytes) / BytesPerOffset;
+        }
+    }
+    if constexpr (BytesPerOffset <= 2) {
+        if (last - idx >= 16 / BytesPerOffset) {
+            return dense_first_nonzero_offset_sse2<BytesPerOffset>(offsets, idx, last);
+        }
+    }
+    return dense_first_nonzero_offset_scalar(offsets, idx, last, BytesPerOffset * 8);
+}
+
+template <int BytesPerOffset>
+[[gnu::target("avx2")]]
+static int dense_last_nonzero_offset_avx2(const_bytes offsets, int first, int last) {
+    constexpr int lane_bytes = 32;
+    constexpr int offsets_per_lane = lane_bytes / BytesPerOffset;
+    constexpr uint32_t all_bytes = ~uint32_t(0);
+
+    const auto zero = _mm256_setzero_si256();
+    int idx = last;
+    for (; idx - offsets_per_lane >= first; idx -= offsets_per_lane) {
+        const int block_start = idx - offsets_per_lane;
+        const auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(offsets.data() + block_start * BytesPerOffset));
+        const auto eq = _mm256_cmpeq_epi8(v, zero);
+        const auto nonzero_bytes = (~uint32_t(_mm256_movemask_epi8(eq))) & all_bytes;
+        if (nonzero_bytes != 0) {
+            return block_start + (std::bit_width(nonzero_bytes) - 1) / BytesPerOffset;
+        }
+    }
+    if constexpr (BytesPerOffset <= 2) {
+        if (idx - first >= 16 / BytesPerOffset) {
+            return dense_last_nonzero_offset_sse2<BytesPerOffset>(offsets, first, idx);
+        }
+    }
+    return dense_last_nonzero_offset_scalar(offsets, first, idx, BytesPerOffset * 8);
+}
+
+template <int BytesPerOffset>
+[[gnu::target("avx512f,avx512bw")]]
+static int dense_first_nonzero_offset_avx512(const_bytes offsets, int first, int last) {
+    constexpr int lane_bytes = 64;
+    constexpr int offsets_per_lane = lane_bytes / BytesPerOffset;
+    constexpr uint64_t all_bytes = ~uint64_t(0);
+
+    const auto zero = _mm512_setzero_si512();
+    int idx = first;
+    for (; idx + offsets_per_lane <= last; idx += offsets_per_lane) {
+        const auto v = _mm512_loadu_si512(reinterpret_cast<const void*>(offsets.data() + idx * BytesPerOffset));
+        const auto nonzero_bytes = (~uint64_t(_mm512_cmpeq_epi8_mask(v, zero))) & all_bytes;
+        if (nonzero_bytes != 0) {
+            return idx + std::countr_zero(nonzero_bytes) / BytesPerOffset;
+        }
+    }
+    return dense_first_nonzero_offset_scalar(offsets, idx, last, BytesPerOffset * 8);
+}
+
+template <int BytesPerOffset>
+[[gnu::target("avx512f,avx512bw")]]
+static int dense_last_nonzero_offset_avx512(const_bytes offsets, int first, int last) {
+    constexpr int lane_bytes = 64;
+    constexpr int offsets_per_lane = lane_bytes / BytesPerOffset;
+    constexpr uint64_t all_bytes = ~uint64_t(0);
+
+    const auto zero = _mm512_setzero_si512();
+    int idx = last;
+    for (; idx - offsets_per_lane >= first; idx -= offsets_per_lane) {
+        const int block_start = idx - offsets_per_lane;
+        const auto v = _mm512_loadu_si512(reinterpret_cast<const void*>(offsets.data() + block_start * BytesPerOffset));
+        const auto nonzero_bytes = (~uint64_t(_mm512_cmpeq_epi8_mask(v, zero))) & all_bytes;
+        if (nonzero_bytes != 0) {
+            return block_start + (std::bit_width(nonzero_bytes) - 1) / BytesPerOffset;
+        }
+    }
+    return dense_last_nonzero_offset_scalar(offsets, first, idx, BytesPerOffset * 8);
+}
+
+static bool cpu_supports_avx512() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
+}
+
+static bool cpu_supports_avx2() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2");
+}
+
+static bool cpu_supports_sse2() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("sse2");
+}
+#endif
+
+#if defined(__aarch64__)
+template <int BytesPerOffset>
+static int dense_first_nonzero_offset_neon(const_bytes offsets, int first, int last) {
+    constexpr int lane_bytes = 16;
+    constexpr int offsets_per_lane = lane_bytes / BytesPerOffset;
+
+    const auto zero = vdupq_n_u8(0);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(offsets.data());
+    int idx = first;
+    for (; idx + offsets_per_lane <= last; idx += offsets_per_lane) {
+        const auto v = vld1q_u8(bytes + idx * BytesPerOffset);
+        const auto eq = vceqq_u8(v, zero);
+        if (vminvq_u8(eq) != 0xff) {
+            return dense_first_nonzero_offset_scalar(offsets, idx, idx + offsets_per_lane, BytesPerOffset * 8);
+        }
+    }
+    return dense_first_nonzero_offset_scalar(offsets, idx, last, BytesPerOffset * 8);
+}
+
+template <int BytesPerOffset>
+static int dense_last_nonzero_offset_neon(const_bytes offsets, int first, int last) {
+    constexpr int lane_bytes = 16;
+    constexpr int offsets_per_lane = lane_bytes / BytesPerOffset;
+
+    const auto zero = vdupq_n_u8(0);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(offsets.data());
+    int idx = last;
+    for (; idx - offsets_per_lane >= first; idx -= offsets_per_lane) {
+        const int block_start = idx - offsets_per_lane;
+        const auto v = vld1q_u8(bytes + block_start * BytesPerOffset);
+        const auto eq = vceqq_u8(v, zero);
+        if (vminvq_u8(eq) != 0xff) {
+            return dense_last_nonzero_offset_scalar(offsets, block_start, idx, BytesPerOffset * 8);
+        }
+    }
+    return dense_last_nonzero_offset_scalar(offsets, first, idx, BytesPerOffset * 8);
+}
+#endif
+
+template <int BytesPerOffset>
+static int dense_first_nonzero_offset_fixed(const_bytes offsets, int first, int last, db::simd_optimization_mode mode) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (mode == db::simd_optimization_mode::off) {
+        return dense_first_nonzero_offset_scalar(offsets, first, last, BytesPerOffset * 8);
+    }
+
+    static const bool has_avx512 = cpu_supports_avx512();
+    if ((mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::avx512) && has_avx512) {
+        return dense_first_nonzero_offset_avx512<BytesPerOffset>(offsets, first, last);
+    }
+    static const bool has_avx2 = cpu_supports_avx2();
+    if ((mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::avx2) && has_avx2) {
+        return dense_first_nonzero_offset_avx2<BytesPerOffset>(offsets, first, last);
+    }
+    static const bool has_sse2 = cpu_supports_sse2();
+    if ((mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::sse) && has_sse2) {
+        return dense_first_nonzero_offset_sse2<BytesPerOffset>(offsets, first, last);
+    }
+#elif defined(__aarch64__)
+    if (mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::neon) {
+        return dense_first_nonzero_offset_neon<BytesPerOffset>(offsets, first, last);
+    }
+#endif
+    return dense_first_nonzero_offset_scalar(offsets, first, last, BytesPerOffset * 8);
+}
+
+template <int BytesPerOffset>
+static int dense_last_nonzero_offset_fixed(const_bytes offsets, int first, int last, db::simd_optimization_mode mode) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (mode == db::simd_optimization_mode::off) {
+        return dense_last_nonzero_offset_scalar(offsets, first, last, BytesPerOffset * 8);
+    }
+
+    static const bool has_avx512 = cpu_supports_avx512();
+    if ((mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::avx512) && has_avx512) {
+        return dense_last_nonzero_offset_avx512<BytesPerOffset>(offsets, first, last);
+    }
+    static const bool has_avx2 = cpu_supports_avx2();
+    if ((mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::avx2) && has_avx2) {
+        return dense_last_nonzero_offset_avx2<BytesPerOffset>(offsets, first, last);
+    }
+    static const bool has_sse2 = cpu_supports_sse2();
+    if ((mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::sse) && has_sse2) {
+        return dense_last_nonzero_offset_sse2<BytesPerOffset>(offsets, first, last);
+    }
+#elif defined(__aarch64__)
+    if (mode == db::simd_optimization_mode::automatic || mode == db::simd_optimization_mode::neon) {
+        return dense_last_nonzero_offset_neon<BytesPerOffset>(offsets, first, last);
+    }
+#endif
+    return dense_last_nonzero_offset_scalar(offsets, first, last, BytesPerOffset * 8);
+}
+
+static int dense_first_nonzero_offset(const_bytes offsets, int first, int last, int bits_per_pointer) {
+    switch (bits_per_pointer) {
+    case 8:
+        return dense_first_nonzero_offset_fixed<1>(offsets, first, last, bti_dense_node_simd_optimization_mode);
+    case 16:
+        return dense_first_nonzero_offset_fixed<2>(offsets, first, last, bti_dense_node_simd_optimization_mode);
+    case 32:
+        return dense_first_nonzero_offset_fixed<4>(offsets, first, last, bti_dense_node_simd_optimization_mode);
+    case 64:
+        return dense_first_nonzero_offset_fixed<8>(offsets, first, last, bti_dense_node_simd_optimization_mode);
+    default:
+        return dense_first_nonzero_offset_scalar(offsets, first, last, bits_per_pointer);
+    }
+}
+
+static int dense_last_nonzero_offset(const_bytes offsets, int first, int last, int bits_per_pointer) {
+    switch (bits_per_pointer) {
+    case 8:
+        return dense_last_nonzero_offset_fixed<1>(offsets, first, last, bti_dense_node_simd_optimization_mode);
+    case 16:
+        return dense_last_nonzero_offset_fixed<2>(offsets, first, last, bti_dense_node_simd_optimization_mode);
+    case 32:
+        return dense_last_nonzero_offset_fixed<4>(offsets, first, last, bti_dense_node_simd_optimization_mode);
+    case 64:
+        return dense_last_nonzero_offset_fixed<8>(offsets, first, last, bti_dense_node_simd_optimization_mode);
+    default:
+        return dense_last_nonzero_offset_scalar(offsets, first, last, bits_per_pointer);
+    }
+}
+
+} // anonymous namespace
+
+void set_bti_dense_node_simd_optimization_mode(db::simd_optimization_mode mode) noexcept {
+    bti_dense_node_simd_optimization_mode = mode;
+}
+
+db::simd_optimization_mode get_bti_dense_node_simd_optimization_mode() noexcept {
+    return bti_dense_node_simd_optimization_mode;
+}
 
 get_child_result bti_get_child(uint64_t pos, const_bytes sp, int child_idx, bool forward) {
     auto type = uint8_t(sp[0]) >> 4;
@@ -28,15 +345,17 @@ get_child_result bti_get_child(uint64_t pos, const_bytes sp, int child_idx, bool
     auto dense = [&] [[gnu::always_inline]] (int type) {
         auto bpp = bits_per_pointer_arr[type];
         auto dense_span = uint64_t(sp[2]) + 1;
-        int idx = child_idx;
-        int increment = forward ? 1 : -1;
-        while (idx < int(dense_span) && idx >= 0) {
-            if (auto off = read_offset(sp.subspan(3), idx, bpp)) {
+        const int start_idx = child_idx;
+        const int end_idx = int(dense_span);
+        if (start_idx >= 0 && start_idx < end_idx) {
+            auto offsets = sp.subspan(3);
+            auto idx = forward
+                ? dense_first_nonzero_offset(offsets, start_idx, end_idx, bpp)
+                : dense_last_nonzero_offset(offsets, 0, start_idx + 1, bpp);
+            if (idx >= 0 && idx < end_idx) {
                 result.idx = idx;
-                result.offset = off;
+                result.offset = read_offset(offsets, idx, bpp);
                 return result;
-            } else {
-                idx += increment;
             }
         }
         [[unlikely]] sstables::on_bti_parse_error(pos);
@@ -241,15 +560,13 @@ node_traverse_result bti_walk_down_along_key(int64_t pos, const_bytes sp, const_
         auto bpp = bits_per_pointer_arr[type];
         result.n_children = dense_span;
         result.payload_bits = uint8_t(sp[0]) & 0xf;
-        while (idx < int(dense_span)) {
-            if (auto off = read_offset(sp.subspan(3), idx, bpp)) {
-                result.child_offset = off;
-                result.found_idx = idx;
-                result.found_byte = start + idx;
-                return result;
-            } else {
-                ++idx;
-            }
+        auto offsets = sp.subspan(3);
+        idx = dense_first_nonzero_offset(offsets, idx, int(dense_span), bpp);
+        if (idx < int(dense_span)) {
+            result.child_offset = read_offset(offsets, idx, bpp);
+            result.found_idx = idx;
+            result.found_byte = start + idx;
+            return result;
         }
         result.found_idx = dense_span;
         result.child_offset = -1;
