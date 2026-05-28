@@ -709,6 +709,7 @@ perf_tests = set([
     'test/perf/perf_vint',
     'test/perf/perf_big_decimal',
     'test/perf/perf_bti_key_translation',
+    'test/perf/perf_comparable_bytes',
     'test/perf/perf_sort_by_proximity',
 ])
 

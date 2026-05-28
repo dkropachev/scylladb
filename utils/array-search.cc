@@ -8,12 +8,21 @@
 
 
 #include "array-search.hh"
+
+#include <bit>
+
 #ifdef __x86_64__
 #include <x86intrin.h>
 #define arch_target(name) [[gnu::target(name)]]
 #else
 #define arch_target(name)
 #endif
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+#include "db/config.hh"
 
 namespace utils {
 
@@ -40,6 +49,34 @@ static inline unsigned array_search_eq_impl(uint8_t val, const uint8_t* arr, uns
     return i;
 }
 
+template <bool equal>
+static inline size_t byte_search_scalar(uint8_t val, const int8_t* array, size_t size) {
+    const auto signed_val = static_cast<int8_t>(val);
+    for (size_t i = 0; i < size; ++i) {
+        if ((array[i] == signed_val) == equal) {
+            return i;
+        }
+    }
+    return size;
+}
+
+#ifdef __x86_64__
+static bool cpu_supports_avx2() noexcept {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2");
+}
+
+static bool cpu_supports_avx512() noexcept {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
+}
+
+static bool cpu_supports_sse2() noexcept {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("sse2");
+}
+#endif
+
 arch_target("default") unsigned array_search_16_eq_impl(uint8_t val, const uint8_t* arr) {
     return array_search_eq_impl(val, arr, 16);
 }
@@ -50,6 +87,14 @@ arch_target("default") unsigned array_search_32_eq_impl(uint8_t val, const uint8
 
 arch_target("default") unsigned array_search_x32_eq_impl(uint8_t val, const uint8_t* arr, int nr) {
     return array_search_eq_impl(val, arr, 32 * nr);
+}
+
+arch_target("default") size_t byte_search_eq_impl(uint8_t val, const int8_t* array, size_t size) {
+    return byte_search_scalar<true>(val, array, size);
+}
+
+arch_target("default") size_t byte_search_ne_impl(uint8_t val, const int8_t* array, size_t size) {
+    return byte_search_scalar<false>(val, array, size);
 }
 
 #ifdef __x86_64__
@@ -136,6 +181,221 @@ arch_target("avx2") unsigned array_search_x32_eq_impl(uint8_t val, const uint8_t
     return len;
 }
 
+arch_target("sse2") static size_t byte_search_eq_sse2(uint8_t val, const int8_t* array, size_t size) {
+    constexpr size_t vector_size = 16;
+    const auto needle = _mm_set1_epi8(static_cast<char>(val));
+    size_t i = 0;
+    for (; i + vector_size <= size; i += vector_size) {
+        const auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(array + i));
+        const auto matches = _mm_cmpeq_epi8(chunk, needle);
+        const auto mask = static_cast<unsigned>(_mm_movemask_epi8(matches));
+        if (mask != 0) {
+            return i + __builtin_ctz(mask);
+        }
+    }
+    return i + byte_search_scalar<true>(val, array + i, size - i);
+}
+
+arch_target("sse2") static size_t byte_search_ne_sse2(uint8_t val, const int8_t* array, size_t size) {
+    constexpr size_t vector_size = 16;
+    const auto needle = _mm_set1_epi8(static_cast<char>(val));
+    size_t i = 0;
+    for (; i + vector_size <= size; i += vector_size) {
+        const auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(array + i));
+        const auto matches = _mm_cmpeq_epi8(chunk, needle);
+        const auto mask = static_cast<unsigned>(_mm_movemask_epi8(matches)) ^ 0xffffu;
+        if (mask != 0) {
+            return i + __builtin_ctz(mask);
+        }
+    }
+    return i + byte_search_scalar<false>(val, array + i, size - i);
+}
+
+arch_target("sse2") size_t byte_search_eq_impl(uint8_t val, const int8_t* array, size_t size) {
+    return byte_search_eq_sse2(val, array, size);
+}
+
+arch_target("sse2") size_t byte_search_ne_impl(uint8_t val, const int8_t* array, size_t size) {
+    return byte_search_ne_sse2(val, array, size);
+}
+
+arch_target("avx2") static size_t byte_search_eq_avx2(uint8_t val, const int8_t* array, size_t size) {
+    constexpr size_t vector_size = 32;
+    constexpr size_t tail_vector_size = 16;
+    const auto needle = _mm256_set1_epi8(static_cast<char>(val));
+    size_t i = 0;
+    for (; i + 2 * vector_size <= size; i += 2 * vector_size) {
+        const auto chunk0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(array + i));
+        const auto matches0 = _mm256_cmpeq_epi8(chunk0, needle);
+        const auto mask0 = static_cast<unsigned>(_mm256_movemask_epi8(matches0));
+        if (mask0 != 0) {
+            return i + __builtin_ctz(mask0);
+        }
+
+        const auto chunk1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(array + i + vector_size));
+        const auto matches1 = _mm256_cmpeq_epi8(chunk1, needle);
+        const auto mask1 = static_cast<unsigned>(_mm256_movemask_epi8(matches1));
+        if (mask1 != 0) {
+            return i + vector_size + __builtin_ctz(mask1);
+        }
+    }
+    for (; i + vector_size <= size; i += vector_size) {
+        const auto chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(array + i));
+        const auto matches = _mm256_cmpeq_epi8(chunk, needle);
+        const auto mask = static_cast<unsigned>(_mm256_movemask_epi8(matches));
+        if (mask != 0) {
+            return i + __builtin_ctz(mask);
+        }
+    }
+    if (i + tail_vector_size <= size) {
+        const auto tail_needle = _mm256_castsi256_si128(needle);
+        const auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(array + i));
+        const auto matches = _mm_cmpeq_epi8(chunk, tail_needle);
+        const auto mask = static_cast<unsigned>(_mm_movemask_epi8(matches));
+        if (mask != 0) {
+            return i + __builtin_ctz(mask);
+        }
+        i += tail_vector_size;
+    }
+    return i + byte_search_scalar<true>(val, array + i, size - i);
+}
+
+arch_target("avx2") static size_t byte_search_ne_avx2(uint8_t val, const int8_t* array, size_t size) {
+    constexpr size_t vector_size = 32;
+    constexpr size_t tail_vector_size = 16;
+    const auto needle = _mm256_set1_epi8(static_cast<char>(val));
+    size_t i = 0;
+    for (; i + 2 * vector_size <= size; i += 2 * vector_size) {
+        const auto chunk0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(array + i));
+        const auto matches0 = _mm256_cmpeq_epi8(chunk0, needle);
+        const auto mask0 = static_cast<unsigned>(_mm256_movemask_epi8(matches0)) ^ 0xffffffffu;
+        if (mask0 != 0) {
+            return i + __builtin_ctz(mask0);
+        }
+
+        const auto chunk1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(array + i + vector_size));
+        const auto matches1 = _mm256_cmpeq_epi8(chunk1, needle);
+        const auto mask1 = static_cast<unsigned>(_mm256_movemask_epi8(matches1)) ^ 0xffffffffu;
+        if (mask1 != 0) {
+            return i + vector_size + __builtin_ctz(mask1);
+        }
+    }
+    for (; i + vector_size <= size; i += vector_size) {
+        const auto chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(array + i));
+        const auto matches = _mm256_cmpeq_epi8(chunk, needle);
+        const auto mask = static_cast<unsigned>(_mm256_movemask_epi8(matches)) ^ 0xffffffffu;
+        if (mask != 0) {
+            return i + __builtin_ctz(mask);
+        }
+    }
+    if (i + tail_vector_size <= size) {
+        const auto tail_needle = _mm256_castsi256_si128(needle);
+        const auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(array + i));
+        const auto matches = _mm_cmpeq_epi8(chunk, tail_needle);
+        const auto mask = static_cast<unsigned>(_mm_movemask_epi8(matches)) ^ 0xffffu;
+        if (mask != 0) {
+            return i + __builtin_ctz(mask);
+        }
+        i += tail_vector_size;
+    }
+    return i + byte_search_scalar<false>(val, array + i, size - i);
+}
+
+arch_target("avx2") size_t byte_search_eq_impl(uint8_t val, const int8_t* array, size_t size) {
+    return byte_search_eq_avx2(val, array, size);
+}
+
+arch_target("avx2") size_t byte_search_ne_impl(uint8_t val, const int8_t* array, size_t size) {
+    return byte_search_ne_avx2(val, array, size);
+}
+
+arch_target("avx512f,avx512bw") static size_t byte_search_eq_avx512(uint8_t val, const int8_t* array, size_t size) {
+    constexpr size_t vector_size = 64;
+    const auto needle = _mm512_set1_epi8(static_cast<char>(val));
+    size_t i = 0;
+    for (; i + 2 * vector_size <= size; i += 2 * vector_size) {
+        const auto chunk0 = _mm512_loadu_si512(reinterpret_cast<const void*>(array + i));
+        const auto mask0 = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(chunk0, needle));
+        if (mask0 != 0) {
+            return i + std::countr_zero(mask0);
+        }
+
+        const auto chunk1 = _mm512_loadu_si512(reinterpret_cast<const void*>(array + i + vector_size));
+        const auto mask1 = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(chunk1, needle));
+        if (mask1 != 0) {
+            return i + vector_size + std::countr_zero(mask1);
+        }
+    }
+    for (; i + vector_size <= size; i += vector_size) {
+        const auto chunk = _mm512_loadu_si512(reinterpret_cast<const void*>(array + i));
+        const auto mask = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(chunk, needle));
+        if (mask != 0) {
+            return i + std::countr_zero(mask);
+        }
+    }
+    return i + byte_search_scalar<true>(val, array + i, size - i);
+}
+
+arch_target("avx512f,avx512bw") static size_t byte_search_ne_avx512(uint8_t val, const int8_t* array, size_t size) {
+    constexpr size_t vector_size = 64;
+    constexpr uint64_t lane_mask = ~uint64_t(0);
+    const auto needle = _mm512_set1_epi8(static_cast<char>(val));
+    size_t i = 0;
+    for (; i + 2 * vector_size <= size; i += 2 * vector_size) {
+        const auto chunk0 = _mm512_loadu_si512(reinterpret_cast<const void*>(array + i));
+        const auto mask0 = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(chunk0, needle)) ^ lane_mask;
+        if (mask0 != 0) {
+            return i + std::countr_zero(mask0);
+        }
+
+        const auto chunk1 = _mm512_loadu_si512(reinterpret_cast<const void*>(array + i + vector_size));
+        const auto mask1 = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(chunk1, needle)) ^ lane_mask;
+        if (mask1 != 0) {
+            return i + vector_size + std::countr_zero(mask1);
+        }
+    }
+    for (; i + vector_size <= size; i += vector_size) {
+        const auto chunk = _mm512_loadu_si512(reinterpret_cast<const void*>(array + i));
+        const auto mask = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(chunk, needle)) ^ lane_mask;
+        if (mask != 0) {
+            return i + std::countr_zero(mask);
+        }
+    }
+    return i + byte_search_scalar<false>(val, array + i, size - i);
+}
+
+#endif
+
+#if defined(__aarch64__)
+static size_t byte_search_eq_neon(uint8_t val, const int8_t* array, size_t size) {
+    constexpr size_t vector_size = 16;
+    const auto needle = vdupq_n_u8(val);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(array);
+    size_t i = 0;
+    for (; i + vector_size <= size; i += vector_size) {
+        const auto chunk = vld1q_u8(bytes + i);
+        const auto matches = vceqq_u8(chunk, needle);
+        if (vmaxvq_u8(matches) != 0) {
+            return i + byte_search_scalar<true>(val, array + i, vector_size);
+        }
+    }
+    return i + byte_search_scalar<true>(val, array + i, size - i);
+}
+
+static size_t byte_search_ne_neon(uint8_t val, const int8_t* array, size_t size) {
+    constexpr size_t vector_size = 16;
+    const auto needle = vdupq_n_u8(val);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(array);
+    size_t i = 0;
+    for (; i + vector_size <= size; i += vector_size) {
+        const auto chunk = vld1q_u8(bytes + i);
+        const auto matches = vceqq_u8(chunk, needle);
+        if (vminvq_u8(matches) != 0xff) {
+            return i + byte_search_scalar<false>(val, array + i, vector_size);
+        }
+    }
+    return i + byte_search_scalar<false>(val, array + i, size - i);
+}
 #endif
 
 int array_search_gt(int64_t val, const int64_t* array, const int capacity, const int size) {
@@ -152,6 +412,102 @@ unsigned array_search_32_eq(uint8_t val, const uint8_t* array) {
 
 unsigned array_search_x32_eq(uint8_t val, const uint8_t* array, int nr) {
     return array_search_x32_eq_impl(val, array, nr);
+}
+
+size_t byte_search_eq(uint8_t val, const int8_t* array, size_t size, db::simd_optimization_mode mode) {
+    switch (mode) {
+    case db::simd_optimization_mode::automatic:
+#if defined(__aarch64__)
+        return byte_search_eq_neon(val, array, size);
+#else
+        return byte_search_eq_impl(val, array, size);
+#endif
+    case db::simd_optimization_mode::off:
+        return byte_search_scalar<true>(val, array, size);
+#ifdef __x86_64__
+    case db::simd_optimization_mode::sse:
+        if (cpu_supports_sse2()) {
+            return byte_search_eq_sse2(val, array, size);
+        }
+        break;
+    case db::simd_optimization_mode::avx2:
+        if (cpu_supports_avx2()) {
+            return byte_search_eq_avx2(val, array, size);
+        }
+        break;
+    case db::simd_optimization_mode::avx512:
+        if (cpu_supports_avx512()) {
+            return byte_search_eq_avx512(val, array, size);
+        }
+        break;
+#elif defined(__aarch64__)
+    case db::simd_optimization_mode::neon:
+        return byte_search_eq_neon(val, array, size);
+    case db::simd_optimization_mode::sse:
+    case db::simd_optimization_mode::avx2:
+    case db::simd_optimization_mode::avx512:
+        break;
+#else
+    case db::simd_optimization_mode::sse:
+    case db::simd_optimization_mode::avx2:
+    case db::simd_optimization_mode::avx512:
+        break;
+#endif
+#if !defined(__aarch64__)
+    case db::simd_optimization_mode::neon:
+#endif
+    case db::simd_optimization_mode::sve:
+        break;
+    }
+    return byte_search_scalar<true>(val, array, size);
+}
+
+size_t byte_search_ne(uint8_t val, const int8_t* array, size_t size, db::simd_optimization_mode mode) {
+    switch (mode) {
+    case db::simd_optimization_mode::automatic:
+#if defined(__aarch64__)
+        return byte_search_ne_neon(val, array, size);
+#else
+        return byte_search_ne_impl(val, array, size);
+#endif
+    case db::simd_optimization_mode::off:
+        return byte_search_scalar<false>(val, array, size);
+#ifdef __x86_64__
+    case db::simd_optimization_mode::sse:
+        if (cpu_supports_sse2()) {
+            return byte_search_ne_sse2(val, array, size);
+        }
+        break;
+    case db::simd_optimization_mode::avx2:
+        if (cpu_supports_avx2()) {
+            return byte_search_ne_avx2(val, array, size);
+        }
+        break;
+    case db::simd_optimization_mode::avx512:
+        if (cpu_supports_avx512()) {
+            return byte_search_ne_avx512(val, array, size);
+        }
+        break;
+#elif defined(__aarch64__)
+    case db::simd_optimization_mode::neon:
+        return byte_search_ne_neon(val, array, size);
+    case db::simd_optimization_mode::sse:
+    case db::simd_optimization_mode::avx2:
+    case db::simd_optimization_mode::avx512:
+        break;
+#else
+    case db::simd_optimization_mode::sse:
+    case db::simd_optimization_mode::avx2:
+    case db::simd_optimization_mode::avx512:
+        break;
+#endif
+#if !defined(__aarch64__)
+    case db::simd_optimization_mode::neon:
+#endif
+    case db::simd_optimization_mode::sve:
+        break;
+    }
+    return byte_search_scalar<false>(val, array, size);
 }
 
 }

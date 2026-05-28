@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string_view>
 #include <unordered_map>
 
 #include <seastar/core/sstring.hh>
@@ -148,6 +150,24 @@ struct tablets_mode_t {
     static std::unordered_map<sstring, mode> map(); // for enum_option<>
 };
 
+enum class simd_optimization_mode : uint8_t {
+    automatic,
+    off,
+    sse,
+    avx2,
+    avx512,
+    neon,
+    sve,
+};
+
+enum class simd_optimization_feature : uint8_t {
+    vector_similarity,
+    bti_key_mismatch,
+    comparable_bytes,
+    bti_dense_node,
+    bti_sparse_node,
+};
+
 class config final : public utils::config_file {
 public:
     config();
@@ -165,6 +185,10 @@ public:
 
     /// True iff the feature is enabled.
     bool check_experimental(experimental_features_t::feature f) const;
+    simd_optimization_mode get_simd_optimization_mode(simd_optimization_feature feature) const;
+
+    static std::string_view simd_optimization_mode_name(simd_optimization_mode mode) noexcept;
+    static std::string_view simd_optimization_feature_name(simd_optimization_feature feature) noexcept;
 
     void setup_directories();
 
@@ -367,6 +391,7 @@ public:
     named_value<sstring> vector_store_secondary_uri;
     named_value<uint32_t> vector_store_unreachable_node_detection_time_in_ms;
     named_value<string_map> vector_store_encryption_options;
+    named_value<string_map> simd_optimization_options;
     named_value<sstring> authenticator;
     named_value<sstring> internode_authenticator;
     named_value<sstring> authorizer;
