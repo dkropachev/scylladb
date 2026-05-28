@@ -17,6 +17,7 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/core/future-util.hh>
 #include "db/config.hh"
+#include "exceptions/exceptions.hh"
 #include "utils/updateable_value.hh"
 
 using namespace db;
@@ -863,6 +864,88 @@ SEASTAR_TEST_CASE(test_parse_broken) {
 
     BOOST_REQUIRE(ok);
 
+    return make_ready_future<>();
+}
+
+using simd_mode = simd_optimization_mode;
+using simd_feature = simd_optimization_feature;
+
+SEASTAR_TEST_CASE(test_simd_optimization_options_defaults) {
+    config cfg;
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::vector_similarity) == simd_mode::automatic);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::bti_key_mismatch) == simd_mode::automatic);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::comparable_bytes) == simd_mode::automatic);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::bti_dense_node) == simd_mode::automatic);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::bti_sparse_node) == simd_mode::automatic);
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_simd_optimization_options_inheritance) {
+    config cfg;
+    cfg.read_from_yaml(R"foo(
+simd_optimization_options:
+    default: avx2
+    vector_similarity: default
+    bti_key_mismatch: off
+    comparable_bytes: sse
+)foo", throw_on_error);
+
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::vector_similarity) == simd_mode::avx2);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::bti_key_mismatch) == simd_mode::off);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::comparable_bytes) == simd_mode::sse);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::bti_dense_node) == simd_mode::avx2);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::bti_sparse_node) == simd_mode::avx2);
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_simd_optimization_options_missing_default) {
+    config cfg;
+    cfg.read_from_yaml(R"foo(
+simd_optimization_options:
+    vector_similarity: neon
+)foo", throw_on_error);
+
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::vector_similarity) == simd_mode::neon);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::bti_key_mismatch) == simd_mode::automatic);
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_simd_optimization_options_global_off) {
+    config cfg;
+    cfg.read_from_yaml(R"foo(
+simd_optimization_options:
+    default: off
+    vector_similarity: avx2
+    bti_dense_node: neon
+)foo", throw_on_error);
+
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::vector_similarity) == simd_mode::off);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::bti_dense_node) == simd_mode::off);
+    BOOST_CHECK(cfg.get_simd_optimization_mode(simd_feature::bti_sparse_node) == simd_mode::off);
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_simd_optimization_options_reject_invalid_values) {
+    config cfg;
+    cfg.read_from_yaml(R"foo(
+simd_optimization_options:
+    default: default
+)foo", throw_on_error);
+    BOOST_REQUIRE_THROW(cfg.get_simd_optimization_mode(simd_feature::vector_similarity), exceptions::configuration_exception);
+
+    config cfg_bad_value;
+    cfg_bad_value.read_from_yaml(R"foo(
+simd_optimization_options:
+    vector_similarity: scalar
+)foo", throw_on_error);
+    BOOST_REQUIRE_THROW(cfg_bad_value.get_simd_optimization_mode(simd_feature::vector_similarity), exceptions::configuration_exception);
+
+    config cfg_bad_key;
+    cfg_bad_key.read_from_yaml(R"foo(
+simd_optimization_options:
+    vector_similarity_typo: auto
+)foo", throw_on_error);
+    BOOST_REQUIRE_THROW(cfg_bad_key.get_simd_optimization_mode(simd_feature::vector_similarity), exceptions::configuration_exception);
     return make_ready_future<>();
 }
 

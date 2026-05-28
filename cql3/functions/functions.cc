@@ -18,6 +18,7 @@
 #include "cql3/functions/uuid_fcts.hh"
 #include "cql3/functions/vector_similarity_fcts.hh"
 #include "data_dictionary/data_dictionary.hh"
+#include "db/config.hh"
 #include "as_json_function.hh"
 #include "cql3/prepare_context.hh"
 #include "user_aggregate.hh"
@@ -402,7 +403,8 @@ functions::get(data_dictionary::database db,
     const auto func_name = name.has_keyspace() ? name : name.as_native_function();
     if (SIMILARITY_FUNCTIONS.contains(func_name)) {
         auto arg_types = retrieve_vector_arg_types(func_name, provided_args);
-        auto fun = ::make_shared<vector_similarity_fct>(func_name.name, arg_types);
+        auto fun = ::make_shared<vector_similarity_fct>(
+                func_name.name, arg_types, db.get_config().get_simd_optimization_mode(db::simd_optimization_feature::vector_similarity));
         validate_types(db, keyspace, schema.get(), fun, provided_args, receiver_ks, receiver_cf);
         return fun;
     }
@@ -677,5 +679,3 @@ void change_batch::clear_functions() noexcept {
 
 }
 }
-
-

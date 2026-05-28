@@ -7,6 +7,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 
 #include <boost/test/unit_test.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
@@ -20,6 +21,7 @@
 #include "test/lib/cql_assertions.hh"
 
 #include <seastar/core/future-util.hh>
+#include "db/config.hh"
 #include "transport/messages/result_message.hh"
 #include "types/vector.hh"
 #include "utils/assert.hh"
@@ -513,6 +515,81 @@ SEASTAR_THREAD_TEST_CASE(test_extract_float_vector) {
             seastar::testing::exception_predicate::message_contains("Invalid vector size")
         );
     }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_vector_similarity_serialized_helpers_match_scalar) {
+    // GH #3: direct serialized scoring must preserve the scalar formulas across SIMD lane and tail sizes.
+    auto serialize = [](size_t dim, const std::vector<float>& values) {
+        auto vector_type = vector_type_impl::get_instance(float_type, dim);
+        std::vector<data_value> data_vals;
+        data_vals.reserve(values.size());
+        for (float f : values) {
+            data_vals.push_back(data_value(f));
+        }
+        return vector_type->decompose(make_list_value(vector_type, data_vals));
+    };
+
+    auto check_close = [] (float expected, float actual) {
+        if (std::isnan(expected)) {
+            BOOST_REQUIRE(std::isnan(actual));
+            return;
+        }
+        BOOST_REQUIRE(!std::isnan(actual));
+        const float tolerance = std::max(1e-5f, std::abs(expected) * 1e-4f);
+        BOOST_REQUIRE_LE(std::abs(expected - actual), tolerance);
+    };
+
+    auto check = [&] (const std::vector<float>& v1, const std::vector<float>& v2) {
+        const auto dim = static_cast<vector_dimension_t>(v1.size());
+        const auto serialized_v1 = serialize(dim, v1);
+        const auto serialized_v2 = serialize(dim, v2);
+
+        check_close(
+                cql3::functions::detail::compute_cosine_similarity(v1, v2),
+                cql3::functions::detail::compute_serialized_cosine_similarity(serialized_v1, serialized_v2, dim));
+        check_close(
+                cql3::functions::detail::compute_euclidean_similarity(v1, v2),
+                cql3::functions::detail::compute_serialized_euclidean_similarity(serialized_v1, serialized_v2, dim));
+        check_close(
+                cql3::functions::detail::compute_dot_product_similarity(v1, v2),
+                cql3::functions::detail::compute_serialized_dot_product_similarity(serialized_v1, serialized_v2, dim));
+    };
+
+    for (size_t dim : {1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 128, 768, 1536}) {
+        std::vector<float> v1(dim);
+        std::vector<float> v2(dim);
+        for (size_t i = 0; i < dim; ++i) {
+            v1[i] = static_cast<float>(static_cast<int>(i % 17) - 8) * 0.25f;
+            v2[i] = static_cast<float>(static_cast<int>((i * 7) % 19) - 9) * 0.125f;
+        }
+        check(v1, v2);
+
+        for (size_t i = 0; i < dim; ++i) {
+            v1[i] = static_cast<float>((i % 5) + 1) / static_cast<float>(dim + 3);
+            v2[i] = -static_cast<float>((i % 11) + 2) / static_cast<float>(dim + 5);
+        }
+        check(v1, v2);
+
+        std::ranges::fill(v1, 0.0f);
+        check(v1, v2);
+
+        std::ranges::fill(v2, 0.0f);
+        check(v1, v2);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_vector_similarity_backend_selection) {
+    using mode = db::simd_optimization_mode;
+    BOOST_REQUIRE_EQUAL(cql3::functions::detail::select_serialized_similarity_backend(mode::off), "scalar");
+
+    const auto selected = cql3::functions::detail::select_serialized_similarity_backend(mode::automatic);
+    BOOST_REQUIRE(
+            selected == "scalar" ||
+            selected == "ssse3" ||
+            selected == "avx2" ||
+            selected == "avx512" ||
+            selected == "avx512_vnni" ||
+            selected == "neon");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
