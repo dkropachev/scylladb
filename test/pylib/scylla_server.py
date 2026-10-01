@@ -42,7 +42,7 @@ from cassandra.connection import UnixSocketEndPoint
 from cassandra.policies import ExponentialReconnectionPolicy  # type: ignore
 from cassandra.policies import WhiteListRoundRobinPolicy  # type: ignore
 
-from test import TOP_SRC_DIR, TEST_DIR
+from test import TOP_SRC_DIR, TEST_DIR, asan_options, ubsan_options
 from test.pylib.driver_utils import safe_driver_shutdown, safe_shutting_down
 from test.pylib.internal_types import ServerNum, IPAddress, HostID, ServerInfo, ServerUpState
 from test.pylib.rest_client import ScyllaRESTAPIClient, HTTPError
@@ -151,7 +151,6 @@ def make_scylla_conf(mode: str, host_addr: str, seed_addrs: List[str], cluster_n
 SCYLLA_CMDLINE_OPTIONS = [
     '--smp', '2',
     '-m', '1G',
-    '--collectd', '0',
     '--overprovisioned',
     '--max-networking-io-control-blocks', '1000',
     '--unsafe-bypass-fsync', '1',
@@ -205,6 +204,21 @@ async def get_scylla_2025_1_description(build_mode: str) -> ScyllaVersionDescrip
     # own version-specific config.
     return ScyllaVersionDescription(
         path=str(await get_scylla_2025_1_executable(build_mode)),
+        config={},
+        argv=[],
+    )
+
+
+async def get_scylla_2026_1_executable(build_mode: str) -> str:
+    is_debug = build_mode == 'debug' or build_mode == 'sanitize'
+    package = "debug" if is_debug else ""
+    arch = platform.machine()
+    return fetch_and_install_scylla_version(2026, 1, arch=arch, pack=package)
+
+
+async def get_scylla_2026_1_description(build_mode: str) -> ScyllaVersionDescription:
+    return ScyllaVersionDescription(
+        path=str(await get_scylla_2026_1_executable(build_mode)),
         config={},
         argv=[],
     )
@@ -297,7 +311,9 @@ def stop_event(func):
 # up to ~64 attempts to give up, i.e. hours, to notice a control connection is unreachable.
 # Any Cluster created by this module must bound both individual connection attempts and
 # the overall retry budget.
-_DRIVER_RECONNECTION_POLICY = ExponentialReconnectionPolicy(base_delay=1.0, max_delay=10.0, max_attempts=10)
+# The base delay decides how quickly a node that comes back is noticed; max_attempts
+# keeps the overall budget at ~78s.
+_DRIVER_RECONNECTION_POLICY = ExponentialReconnectionPolicy(base_delay=0.1, max_delay=1.0, max_attempts=80)
 
 
 class ScyllaServer:
@@ -337,6 +353,13 @@ class ScyllaServer:
         self.logger = logger
         self.log_file = None
         self.cmdline_options = cmdline_options
+        # Kept so a later switch_version() can recompute cmdline_options without
+        # re-baking in the old version's version-specific argv (e.g. a
+        # --logger-log-level for a logger the new executable doesn't know about).
+        # Populated by the caller (ScyllaCluster.add_server) with the per-server
+        # `cmdline` it was given, i.e. everything in `cmdline_options` above except
+        # SCYLLA_CMDLINE_OPTIONS, the version's argv, and the cluster-level options.
+        self._per_server_cmdline_options: List[str] = []
         self.auth_provider: Optional[AuthProvider] = None
         self.cmd: Optional[Process] = None
         self.start_stop_lock = asyncio.Lock()
@@ -565,7 +588,22 @@ class ScyllaServer:
     def update_cmdline(self, cmdline_options: List[str]) -> None:
         """Update the command-line options by merging the new options into the existing ones.
            Takes effect only after the node is restarted."""
+        # Also merge into _per_server_cmdline_options so a later switch_version() keeps
+        # options added here, not just the ones supplied when the server was added.
+        self._per_server_cmdline_options = merge_cmdline_options(self._per_server_cmdline_options, cmdline_options)
         self.cmdline_options = merge_cmdline_options(self.cmdline_options, cmdline_options)
+
+    def switch_version(self, version: ScyllaVersionDescription, cluster_cmdline_options: List[str],
+                        cluster_cmdline_options_override: List[str]) -> None:
+        """Recompute cmdline_options for a different Scylla version, so that
+           version-specific argv (e.g. from ScyllaVersionDescription.argv) doesn't
+           leak across a switch_executable() to a version which doesn't support it.
+           Takes effect only after the node is restarted."""
+        cmdline_options = merge_cmdline_options(SCYLLA_CMDLINE_OPTIONS, version.argv)
+        cmdline_options = merge_cmdline_options(cmdline_options, cluster_cmdline_options)
+        cmdline_options = merge_cmdline_options(cmdline_options, self._per_server_cmdline_options)
+        cmdline_options = merge_cmdline_options(cmdline_options, cluster_cmdline_options_override)
+        self.cmdline_options = cmdline_options
 
     def take_log_savepoint(self) -> None:
         """Save the server current log size when a test starts so that if
@@ -849,8 +887,8 @@ class ScyllaServer:
         # remove from env to make sure user's SCYLLA_HOME has no impact
         env.pop('SCYLLA_HOME', None)
         env.update(self.append_env if append_env_override is None else append_env_override)
-        env['UBSAN_OPTIONS'] = f'halt_on_error=1:abort_on_error=1:suppressions={TOP_SRC_DIR / "ubsan-suppressions.supp"}'
-        env['ASAN_OPTIONS'] = f'disable_coredump=0:abort_on_error=1:detect_stack_use_after_return=1'
+        env['UBSAN_OPTIONS'] = ubsan_options()
+        env['ASAN_OPTIONS'] = asan_options()
 
         # Set up socket for receiving sd_notify messages from Scylla
         self._setup_notify_socket()
@@ -1026,9 +1064,11 @@ class ScyllaServer:
 
     @stop_event
     @start_stop_lock
-    async def stop_gracefully(self) -> None:
+    async def stop_gracefully(self, timeout: float) -> None:
         """Stop a running server. No-op if not running. Uses SIGTERM to
-        stop, so it is graceful. Waits for the process to exit before return."""
+        stop, so it is graceful. Waits up to `timeout` seconds for the process
+        to exit, then kills it and raises. The caller picks the timeout because
+        it scales with the build mode, which the server does not know."""
         self.logger.info("gracefully stopping %s", self)
         if not self.cmd:
             return
@@ -1039,17 +1079,16 @@ class ScyllaServer:
         except ProcessLookupError:
             pass
         else:
-            STOP_TIMEOUT_SECONDS = 120
             wait_task = self.cmd.wait()
             try:
-                await asyncio.wait_for(wait_task, timeout=STOP_TIMEOUT_SECONDS)
+                await asyncio.wait_for(wait_task, timeout=timeout)
                 if self.cmd.returncode != 0:
                     raise RuntimeError(f"Server {self} exited with non-zero exit code: {self.cmd.returncode}")
             except asyncio.TimeoutError:
                 self.cmd.kill()
                 await self.cmd.wait()
                 raise RuntimeError(
-                    f"Stopping server {self} gracefully took longer than {STOP_TIMEOUT_SECONDS}s")
+                    f"Stopping server {self} gracefully took longer than {timeout}s")
         finally:
             if self.cmd:
                 self.logger.info("gracefully stopped %s", self)
@@ -1076,20 +1115,16 @@ class ScyllaServer:
         except FileNotFoundError:
             pass
         self.log_filename.unlink(missing_ok=True)
-        self.log_file = None
+        if self.log_file:
+            self.log_file.close()
+            self.log_file = None
+        self.maintenance_socket_dir.cleanup()
 
     def write_log_marker(self, msg) -> None:
         """Write a message to the server's log file (e.g. separator/marker)"""
         self.log_file.seek(0, 2)  # seek to file end
         self.log_file.write(msg.encode())
         self.log_file.flush()
-
-    def setLogger(self, logger: logging.LoggerAdapter):
-        """Change the logger used by the server.
-           Called when a cluster is reused between tests so that logs during the new test
-           are prefixed appropriately with the corresponding test's name.
-        """
-        self.logger = logger
 
     def __str__(self):
         host_id = getattr(self, '_host_id', 'undefined id')

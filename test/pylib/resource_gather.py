@@ -11,13 +11,16 @@ import logging
 import os
 import platform
 import shlex
+import sqlite3
 import subprocess
 import time
 from abc import ABC
 from concurrent.futures.thread import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+from statistics import fmean, median, quantiles
 from time import sleep
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -26,12 +29,14 @@ import psutil
 
 from threading import Event
 from test import HOST_ID, TOP_SRC_DIR
-from test.pylib.db.model import HostInfo, Metric, SystemResourceMetric, CgroupMetric, Test
+from test.pylib.internal_types import SeastarIOMetricName
+from test.pylib.db.model import HostInfo, Metric, ResourceUtilization, SystemResourceMetric, CgroupMetric, Test
 from test.pylib.db.writer import (
     CGROUP_MEMORY_METRICS_TABLE,
     DEFAULT_DB_NAME,
     HOST_INFO_TABLE,
     METRICS_TABLE,
+    RESOURCE_UTILIZATION_TABLE,
     SYSTEM_RESOURCE_METRICS_TABLE,
     TESTS_TABLE,
     SQLiteWriter,
@@ -76,7 +81,7 @@ class ResourceGather(ABC):
     def put_process_to_cgroup(self) -> None:
         pass
 
-    def get_test_metrics(self) -> Metric:
+    def get_test_metrics(self, seastar_io: dict[str, int] | None = None) -> Metric:
         pass
 
     def write_metrics_to_db(self, metrics: Metric, success: bool = False) -> None:
@@ -119,8 +124,13 @@ class ResourceGatherRecord(ResourceGather):
             ),
             TESTS_TABLE)
 
-    def get_test_metrics(self) -> Metric:
-        test_metrics = Metric(test_id=self.test_id, host_id=HOST_ID, worker_id=self.worker_id)
+    def get_test_metrics(self, seastar_io: dict[str, int] | None = None) -> Metric:
+        test_metrics = Metric(test_id=self.test_id, worker_id=self.worker_id)
+        if seastar_io:
+            test_metrics.seastar_read_bytes = seastar_io.get(SeastarIOMetricName.READ_BYTES, 0)
+            test_metrics.seastar_read_ops = seastar_io.get(SeastarIOMetricName.READ_OPS, 0)
+            test_metrics.seastar_write_bytes = seastar_io.get(SeastarIOMetricName.WRITE_BYTES, 0)
+            test_metrics.seastar_write_ops = seastar_io.get(SeastarIOMetricName.WRITE_OPS, 0)
         test_metrics.time_taken = self.test.time_end - self.test.time_start
         test_metrics.time_start = datetime.fromtimestamp(self.test.time_start)
         test_metrics.time_end = datetime.fromtimestamp(self.test.time_end)
@@ -169,7 +179,6 @@ class ResourceGatherOn(ResourceGatherRecord):
                 try:
                     timeline_record = CgroupMetric(
                         test_id=self.test_id,
-                        host_id=HOST_ID,
                         memory=int(memory_current.read_text().strip()),
                         timestamp=datetime.now()
                     )
@@ -181,12 +190,28 @@ class ResourceGatherOn(ResourceGatherRecord):
             sqlite_writer.close()
 
     def setup_test_tracking(self) -> None:
-        # Open a fresh FD on memory.peak so the kernel resets its per-FD peak tracker
-        # to the current memory. Reading this FD later returns the peak memory since it
-        # was opened, i.e., the peak during this test only.
+        # memory.peak's per-FD tracker is reset by *writing* a non-empty string to the
+        # FD, not by opening it: a read-only open returns the cgroup's lifetime
+        # watermark, which for an xdist worker is whatever the heaviest test before
+        # this one reached.  Reset here so later reads through this FD give the peak
+        # during this test alone.  Kernels without the writable memory.peak keep the
+        # old watermark semantics -- an upper bound rather than a per-test figure.
+        #
+        # The write is unbuffered: on such a kernel the file has no write handler,
+        # and cgroupfs reports that only once the write reaches it.  A buffered
+        # write would keep the payload pending, so the error would surface from
+        # flush() *and again* from close() in the except branch below, escaping it.
         memory_peak_path = self.cgroup_path / 'memory.peak'
         if memory_peak_path.exists():
-            self._memory_peak_fd = open(memory_peak_path, 'r')
+            try:
+                self._memory_peak_fd = open(memory_peak_path, 'rb+', buffering=0)
+                self._memory_peak_fd.write(b'reset')
+            except OSError as e:
+                self.logger.debug("Could not reset %s, memory_peak will be a cgroup "
+                                  "lifetime watermark: %s", memory_peak_path, e)
+                if self._memory_peak_fd is not None:
+                    self._memory_peak_fd.close()
+                self._memory_peak_fd = open(memory_peak_path, 'rb', buffering=0)
 
         # Snapshot cpu.stat at the start of the test. Unlike memory.peak, cpu.stat
         # has no per-FD reset mechanism — values are cumulative for the cgroup's
@@ -197,8 +222,8 @@ class ResourceGatherOn(ResourceGatherRecord):
             with open(cpu_stat_path, 'r') as f:
                 self._cpu_stat_start = self._read_cpu_stat(f)
 
-    def get_test_metrics(self) -> Metric:
-        test_metrics = super().get_test_metrics()
+    def get_test_metrics(self, seastar_io: dict[str, int] | None = None) -> Metric:
+        test_metrics = super().get_test_metrics(seastar_io)
         if self._memory_peak_fd is not None:
             try:
                 self._memory_peak_fd.seek(0)
@@ -243,18 +268,33 @@ class ResourceGatherOn(ResourceGatherRecord):
         return result
 
 
-def gather_host_info() -> HostInfo:
-    """Collect static hardware information about the current host."""
+def _get_cpu_model() -> str:
     try:
-        cpu_model = "unknown"
         with open("/proc/cpuinfo") as f:
             for line in f:
                 if line.startswith("model name"):
-                    cpu_model = line.split(":", 1)[1].strip()
-                    break
+                    return line.split(":", 1)[1].strip()
     except OSError:
-        cpu_model = platform.processor() or "unknown"
+        pass
+    # aarch64 /proc/cpuinfo has no "model name" line; lscpu decodes the
+    # implementer/part ids into one (e.g. "Neoverse-N1").  LC_ALL=C keeps the
+    # label we match untranslated: lscpu calls setlocale() and its labels go
+    # through gettext, so "Model name" is localized where util-linux
+    # translations are installed.
+    try:
+        lscpu = subprocess.run(["lscpu"], capture_output=True, text=True, check=True,
+                               env={**os.environ, "LC_ALL": "C"})
+        for line in lscpu.stdout.splitlines():
+            if line.startswith("Model name"):
+                return line.split(":", 1)[1].strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return platform.processor() or "unknown"
 
+
+def gather_host_info() -> HostInfo:
+    """Collect static hardware information about the current host."""
+    cpu_model = _get_cpu_model()
     cpu_cores = psutil.cpu_count(logical=False) or os.cpu_count() or 0
     ram_bytes = psutil.virtual_memory().total
     return HostInfo(host_id=HOST_ID, cpu_model=cpu_model, cpu_cores=cpu_cores, ram_bytes=ram_bytes)
@@ -399,3 +439,96 @@ class SystemResourceMonitor:
                 sqlite_writer.write_row(timeline_record, SYSTEM_RESOURCE_METRICS_TABLE)
         finally:
             sqlite_writer.close()
+
+
+# The utilization a test run is meant to hold the machine at: below it the builder idles
+# and the run takes longer than it has to, above it the tests contend for the machine and
+# begin to time out. The score is the percentage of the run that was spent inside it.
+SCORE_BAND = (80.0, 90.0)
+
+
+def _summary(values: list[float]) -> tuple[float, float, float, float, float]:
+    """Return the average, the median, the p95, the p99 and the score of the samples."""
+    low, high = SCORE_BAND
+    score = sum(low <= value <= high for value in values) * 100 / len(values)
+    if len(values) == 1:
+        p95 = p99 = values[0]
+    else:
+        percentiles = quantiles(values, n=100, method='inclusive')
+        p95, p99 = percentiles[94], percentiles[98]
+    return fmean(values), median(values), p95, p99, score
+
+
+def summarize_resource_utilization(temp_dir: Path) -> ResourceUtilization | None:
+    """Aggregate the run's host-wide CPU/memory samples into a single final record.
+
+    Writes the record to the metrics database and returns it, or None when there is
+    nothing to summarize: a session that ran no test, one too short to be sampled, or
+    a database that was never created.
+    """
+    db_path = temp_dir / DEFAULT_DB_NAME
+    if not db_path.exists():
+        return None
+
+    # The database is this host's own - it is named after its id - so nothing below
+    # filters by host: every row in it was written by this run, on this machine.
+    with closing(sqlite3.connect(db_path)) as connection:
+        host_info = connection.execute(f'SELECT ram_bytes FROM {HOST_INFO_TABLE}').fetchone()
+
+        # Only what was sampled while tests were running counts: the sampler also covers
+        # the build mode preparation before the first test and the cleanup after the last
+        # one, and those idle stretches drag every figure of the run towards zero.
+        first_test, last_test = connection.execute(
+            f'SELECT min(time_start), max(time_end) FROM {METRICS_TABLE}').fetchone()
+        samples = connection.execute(
+            f'SELECT cpu, memory_available FROM {SYSTEM_RESOURCE_METRICS_TABLE} '
+            f'WHERE timestamp BETWEEN ? AND ?',
+            (first_test, last_test)).fetchall() if first_test and last_test else []
+        if not samples and first_test and last_test:
+            # A run so short that no sample fell between its first and its last test:
+            # summarize what there is rather than nothing. A session that ran no test at
+            # all has no window, and gets no record - its samples describe an idle
+            # machine, not a test run.
+            samples = connection.execute(
+                f'SELECT cpu, memory_available FROM {SYSTEM_RESOURCE_METRICS_TABLE}').fetchall()
+
+        # The samples are host-wide, so all modes of the run share one record. On CI a
+        # run covers a single mode (one database per architecture and mode), which is
+        # what makes the figures per-mode there; a local multi-mode run gets them joined.
+        # ponytail: comma-joined modes. Splitting them needs every sample attributed to
+        # the tests running at its timestamp - an indexed join, if it is ever asked for.
+        modes = [row[0] for row in connection.execute(
+            f'SELECT DISTINCT mode FROM {TESTS_TABLE} ORDER BY mode')]
+
+    if not samples or host_info is None:
+        return None
+    ram_bytes = host_info[0]
+
+    cpu_avg, cpu_median, cpu_p95, cpu_p99, cpu_score = _summary([row[0] for row in samples])
+    memory_avg, memory_median, memory_p95, memory_p99, memory_score = _summary(
+        [(ram_bytes - row[1]) * 100 / ram_bytes for row in samples])
+
+    record = ResourceUtilization(
+        host_id=HOST_ID,
+        architecture=platform.machine(),
+        mode=','.join(modes),
+        samples=len(samples),
+        cpu_avg=cpu_avg,
+        cpu_median=cpu_median,
+        cpu_p95=cpu_p95,
+        cpu_p99=cpu_p99,
+        cpu_score=cpu_score,
+        memory_avg=memory_avg,
+        memory_median=memory_median,
+        memory_p95=memory_p95,
+        memory_p99=memory_p99,
+        memory_score=memory_score,
+        timestamp=datetime.now(),
+    )
+
+    sqlite_writer = SQLiteWriter(db_path)
+    try:
+        sqlite_writer.write_row(record, RESOURCE_UTILIZATION_TABLE)
+    finally:
+        sqlite_writer.close()
+    return record

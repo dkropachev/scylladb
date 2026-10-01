@@ -35,6 +35,7 @@
 #include "encryption.hh"
 #include "encryption_exceptions.hh"
 #include "symmetric_key.hh"
+#include "key_cache.hh"
 #include "utils.hh"
 #include "utils/exponential_backoff_retry.hh"
 #include "utils/hash.hh"
@@ -164,10 +165,8 @@ private:
 
     std::unordered_map<credentials_source, std::optional<google_credentials>> _cached_credentials;
 
-    utils::loading_cache<attr_cache_key, key_and_id_type, 2, utils::loading_cache_reload_enabled::yes,
-        utils::simple_entry_size<key_and_id_type>, attr_cache_key_hash> _attr_cache;
-    utils::loading_cache<id_cache_key, bytes, 2, utils::loading_cache_reload_enabled::yes, 
-        utils::simple_entry_size<bytes>, id_cache_key_hash> _id_cache;
+    attr_cache<attr_cache_key, key_and_id_type, attr_cache_key_hash> _attr_cache;
+    id_cache<id_cache_key, bytes, id_cache_key_hash> _id_cache;
     shared_ptr<seastar::tls::certificate_credentials> _creds;
     std::unordered_map<bytes, shared_ptr<symmetric_key>> _cache;
     bool _initialized = false;
@@ -206,7 +205,7 @@ future<std::tuple<shared_ptr<encryption::symmetric_key>, encryption::gcp_host::i
     } catch (rjson::malformed_value& e) {
         std::throw_with_nested(malformed_response_error(fmt::format("get_or_create_key: {}", e.what())));
     } catch (...) {
-        std::throw_with_nested(service_error(fmt::format("get_or_create_key: {}", std::current_exception())));
+        std::throw_with_nested(service_error(fmt::format("get_or_create_key: {:t}", std::current_exception())));
     }
 }
 
@@ -232,7 +231,7 @@ future<shared_ptr<encryption::symmetric_key>> encryption::gcp_host::impl::get_ke
     } catch (rjson::malformed_value& e) {
         std::throw_with_nested(malformed_response_error(fmt::format("get_or_create_key: {}", e.what())));
     } catch (...) {
-        std::throw_with_nested(service_error(fmt::format("get_key_by_id: {}", std::current_exception())));
+        std::throw_with_nested(service_error(fmt::format("get_key_by_id: {:t}", std::current_exception())));
     }
 }
 
@@ -257,7 +256,7 @@ future<rjson::value> encryption::gcp_host::impl::gcp_auth_post_with_retry(std::s
             }
             i = _cached_credentials.emplace(src, std::move(c)).first;
         } catch (...) {
-            gcp_log.warn("Error resolving credentials for {}: {}", src, std::current_exception());
+            gcp_log.warn("Error resolving credentials for {}: {:t}", src, std::current_exception());
             throw;
         }
     }
@@ -458,6 +457,16 @@ future<encryption::gcp_host::impl::key_and_id_type> encryption::gcp_host::impl::
     bytes id(sid.begin(), sid.end());
 
     gcp_log.trace("Created key id {}", sid);
+
+    id_cache_key key2 {
+        .src = k.src,
+        .id = id,
+    };
+    co_await _id_cache.insert(key2, [&](const id_cache_key& kin) -> future<bytes>{
+        assert(kin.id == key2.id);
+        assert(kin.src == key2.src);
+        co_return key->key();
+    });
 
     co_return key_and_id_type{ key, id };
 }

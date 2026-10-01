@@ -525,6 +525,7 @@ public:
     named_value<sstring> alternator_write_isolation;
     named_value<uint32_t> alternator_streams_time_window_s;
     named_value<bool> alternator_streams_increased_compatibility;
+    named_value<bool> alternator_vector_search_extra_operators;
     named_value<uint32_t> alternator_timeout_in_ms;
     named_value<double> alternator_ttl_period_in_seconds;
     named_value<sstring> alternator_describe_endpoints;
@@ -550,6 +551,7 @@ public:
     named_value<tri_mode_restriction> restrict_replication_simplestrategy;
     named_value<tri_mode_restriction> restrict_dtcs;
     named_value<tri_mode_restriction> restrict_twcs_without_default_ttl;
+    named_value<tri_mode_restriction> restrict_mixed_storage_clusters;
     named_value<bool> restrict_future_timestamp;
 
     named_value<bool> ignore_truncation_record;

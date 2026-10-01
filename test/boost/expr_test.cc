@@ -1354,7 +1354,7 @@ BOOST_AUTO_TEST_CASE(prepare_nested_overloaded_function_probing_is_not_exponenti
     auto make_overload = [&] (data_type t) {
         return functions::make_native_scalar_function<true>(
                 overloaded_test_fn, t, std::vector<data_type>{t},
-                [] (std::span<const bytes_opt> args) -> bytes_opt { return args[0]; });
+                [] (std::span<const managed_bytes_opt> args) -> managed_bytes_opt { return args[0]; });
     };
     // Snapshot the original registry, then install our two overloads. On scope exit we
     // commit the original snapshot back, so we do not leak them into other tests sharing
@@ -1407,7 +1407,7 @@ BOOST_AUTO_TEST_CASE(infer_collection_of_function_calls_keeps_narrow_overload) {
 
     auto narrow_fn = functions::make_native_scalar_function<true>(
             "expr_test_narrow_identity", byte_type, std::vector<data_type>{byte_type, byte_type},
-            [] (std::span<const bytes_opt> args) -> bytes_opt { return args[0]; });
+            [] (std::span<const managed_bytes_opt> args) -> managed_bytes_opt { return args[0]; });
     auto restore = functions::change_batch();
     {
         auto batch = functions::change_batch();
@@ -1489,7 +1489,7 @@ BOOST_AUTO_TEST_CASE(integer_literal_prefers_int_overload) {
     auto make_overload = [] (data_type t) {
         return functions::make_native_scalar_function<true>(
                 "expr_test_int_or_bigint", t, std::vector<data_type>{t},
-                [] (std::span<const bytes_opt> args) -> bytes_opt { return args[0]; });
+                [] (std::span<const managed_bytes_opt> args) -> managed_bytes_opt { return args[0]; });
     };
     auto restore = functions::change_batch();
     {
@@ -1543,7 +1543,7 @@ BOOST_AUTO_TEST_CASE(widening_converts_value) {
     auto make_overload = [] (data_type t) {
         return functions::make_native_scalar_function<true>(
                 "expr_test_iob", t, std::vector<data_type>{t},
-                [] (std::span<const bytes_opt> a) -> bytes_opt { return a[0]; });
+                [] (std::span<const managed_bytes_opt> a) -> managed_bytes_opt { return a[0]; });
     };
     auto restore = functions::change_batch();
     {
@@ -3514,6 +3514,22 @@ BOOST_AUTO_TEST_CASE(evaluate_binary_operator_is_not) {
     BOOST_REQUIRE_EQUAL(evaluate(empty_is_not_null, evaluation_inputs{}), make_bool_raw(true));
 }
 
+BOOST_AUTO_TEST_CASE(evaluate_binary_operator_is) {
+    expression false_is_binop = binary_operator(make_int_const(1), oper_t::IS, constant::make_null(int32_type));
+    BOOST_REQUIRE_EQUAL(evaluate(false_is_binop, evaluation_inputs{}), make_bool_raw(false));
+
+    expression true_is_binop =
+        binary_operator(constant::make_null(int32_type), oper_t::IS, constant::make_null(int32_type));
+    BOOST_REQUIRE_EQUAL(evaluate(true_is_binop, evaluation_inputs{}), make_bool_raw(true));
+
+    expression forbidden_is_binop = binary_operator(make_int_const(1), oper_t::IS, make_int_const(2));
+    BOOST_REQUIRE_THROW(evaluate(forbidden_is_binop, evaluation_inputs{}), exceptions::invalid_request_exception);
+
+    expression empty_is_null =
+        binary_operator(make_empty_const(int32_type), oper_t::IS, constant::make_null(int32_type));
+    BOOST_REQUIRE_EQUAL(evaluate(empty_is_null, evaluation_inputs{}), make_bool_raw(false));
+}
+
 BOOST_AUTO_TEST_CASE(evaluate_binary_operator_like) {
     expression true_like_binop = binary_operator(make_text_const("some_text"), oper_t::LIKE, make_text_const("some_%"));
     BOOST_REQUIRE_EQUAL(evaluate(true_like_binop, evaluation_inputs{}), make_bool_raw(true));
@@ -4272,6 +4288,8 @@ enum struct expected_rhs_type {
     float_in_list,
     // list<tuple<float, int, text, double>
     multi_column_tuple_in_list,
+    // IS allows only NULL as the RHS, everything else is invalid
+    is_null_rhs,
     // IS_NOT allows only NULL as the RHS, everything else is invalid
     is_not_null_rhs
 };
@@ -4373,6 +4391,13 @@ std::vector<expression> get_invalid_rhs_values(expected_rhs_type expected_rhs) {
         invalid_rhs_vals.push_back(
             collection_constructor{.style = collection_constructor::style_type::list_or_vector, .elements = {}});
     }
+
+    // A bind marker is a valid RHS for the other operators, but IS/IS NOT require the RHS to be a NULL literal,
+    // so a bind marker is invalid there.
+    if (expected_rhs == expected_rhs_type::is_null_rhs || expected_rhs == expected_rhs_type::is_not_null_rhs) {
+        invalid_rhs_vals.push_back(bind_variable{.bind_index = 0});
+    }
+
     return invalid_rhs_vals;
 }
 
@@ -4562,7 +4587,7 @@ BOOST_AUTO_TEST_CASE(prepare_binary_operator_eq_neq_lt_lte_gt_gte_multi_column) 
                                        column_value(table_schema->get_column_definition("c3")),
                                        column_value(table_schema->get_column_definition("c4"))},
                           .type = tuple_type_impl::get_instance(
-                              {float_type, int32_type, utf8_type, reversed_type_impl::get_instance(double_type)})};
+                              {float_type, int32_type, utf8_type, double_type})};
 
     expression unprepared_rhs =
         tuple_constructor{.elements = {make_float_untyped("123.4"), make_int_untyped("1234"),
@@ -4755,7 +4780,7 @@ BOOST_AUTO_TEST_CASE(prepare_binary_operator_multi_col_in_empty_list) {
         .type = nullptr};
 
     data_type tuple_type = tuple_type_impl::get_instance(
-        {float_type, int32_type, utf8_type, reversed_type_impl::get_instance(double_type)});
+        {float_type, int32_type, utf8_type, double_type});
 
     expression prepared_lhs =
         tuple_constructor{.elements = {column_value(table_schema->get_column_definition("float_col")),
@@ -4767,7 +4792,6 @@ BOOST_AUTO_TEST_CASE(prepare_binary_operator_multi_col_in_empty_list) {
     expression unprepared_rhs =
         collection_constructor{.style = collection_constructor::style_type::list_or_vector, .elements = {}};
 
-    // reversed is removed!
     expression prepared_rhs = constant(
         make_list_raw({}), list_type_impl::get_instance(
                                tuple_type_impl::get_instance({float_type, int32_type, utf8_type, double_type}), false));
@@ -4806,7 +4830,7 @@ BOOST_AUTO_TEST_CASE(prepare_binary_operator_multi_col_in_values) {
         .type = nullptr};
 
     data_type tuple_type = tuple_type_impl::get_instance(
-        {float_type, int32_type, utf8_type, reversed_type_impl::get_instance(double_type)});
+        {float_type, int32_type, utf8_type, double_type});
 
     expression prepared_lhs =
         tuple_constructor{.elements = {column_value(table_schema->get_column_definition("float_col")),
@@ -4835,7 +4859,6 @@ BOOST_AUTO_TEST_CASE(prepare_binary_operator_multi_col_in_values) {
         {make_tuple_raw({make_float_raw(1.2), make_int_raw(3), make_text_raw("four"), make_double_raw(8.9)}),
          make_tuple_raw({make_float_raw(5), make_int_raw(6), make_text_raw("seven"), make_double_raw(10.11)})});
 
-    // reversed is removed!
     data_type prepared_rhs_type = list_type_impl::get_instance(
         tuple_type_impl::get_instance({float_type, int32_type, utf8_type, double_type}), false);
 
@@ -4989,6 +5012,28 @@ BOOST_AUTO_TEST_CASE(prepare_binary_operator_is_not_null) {
         test_prepare_good_binary_operator(to_prepare, expected, db, table_schema);
 
         test_prepare_binary_operator_invalid_rhs_values(to_prepare, expected_rhs_type::is_not_null_rhs, db,
+                                                        table_schema);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(prepare_binary_operator_is_null) {
+    schema_ptr table_schema = schema_builder(1, "test_ks", "test_cf")
+                                  .with_column("pk", int32_type, column_kind::partition_key)
+                                  .with_column("float_col", float_type, column_kind::regular_column)
+                                  .build();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    for (const comparison_order& comp_order : get_possible_comparison_orders()) {
+        expression to_prepare =
+            binary_operator(unresolved_identifier{.ident = ::make_shared<column_identifier_raw>("float_col", false)},
+                            oper_t::IS, make_null_untyped(), comp_order);
+
+        expression expected = binary_operator(column_value(table_schema->get_column_definition("float_col")),
+                                              oper_t::IS, constant::make_null(float_type), comp_order);
+
+        test_prepare_good_binary_operator(to_prepare, expected, db, table_schema);
+
+        test_prepare_binary_operator_invalid_rhs_values(to_prepare, expected_rhs_type::is_null_rhs, db,
                                                         table_schema);
     }
 }
@@ -5810,6 +5855,49 @@ BOOST_AUTO_TEST_CASE(evaluate_neg_reversed_type) {
     expression neg_expr = unary_operator{unary_oper_t::NEG, ck_col};
     raw_value result = evaluate(neg_expr, inputs);
     BOOST_REQUIRE_EQUAL(raw_to<int32_t>(result, int32_type), -5);
+}
+
+// query_options::prepare() reorders _value_views to match the statement's
+// bind-marker order (given by `specs`), but leaves _unset in the client's
+// wire order. get_value_at()/is_unset() index both vectors with the same
+// (spec-order) index, so a named request whose wire order differs from
+// `specs` pairs each value with the wrong client's unset flag.
+BOOST_AUTO_TEST_CASE(query_options_prepare_permutes_unset_incorrectly) {
+    // Statement declares bind markers in this order: a, b, c.
+    std::vector<lw_shared_ptr<column_specification>> specs = {
+        make_lw_shared<column_specification>("ks", "tab", make_shared<column_identifier>("a", true), int32_type),
+        make_lw_shared<column_specification>("ks", "tab", make_shared<column_identifier>("b", true), int32_type),
+        make_lw_shared<column_specification>("ks", "tab", make_shared<column_identifier>("c", true), int32_type),
+    };
+
+    // Client lists them in a different order on the wire: c, a, b, and
+    // marks "b" (its own value, not "a"'s) as UNSET.
+    std::optional<std::vector<std::string_view>> names = std::vector<std::string_view>{"c", "a", "b"};
+    std::vector<cql3::raw_value> values;
+    values.push_back(raw_value::make_value(int32_type->decompose(30))); // c
+    values.push_back(raw_value::make_value(int32_type->decompose(10))); // a
+    values.push_back(raw_value::make_value(int32_type->decompose(20))); // b, but marked unset below
+    cql3::unset_bind_variable_vector unset = {false, false, true}; // c=set, a=set, b=UNSET
+
+    query_options qo(default_cql_config, db::consistency_level::ONE, names,
+        cql3::raw_value_vector_with_unset(std::move(values), std::move(unset)),
+        false, query_options::specific_options::DEFAULT);
+
+    qo.prepare(specs);
+
+    // Correct behaviour: querying by the statement's declared bind-marker
+    // index (0=a, 1=b, 2=c), "b" should read as unset...
+    BOOST_CHECK_MESSAGE(qo.is_unset(1),
+        "bind marker \"b\" (index 1) should be reported unset, matching what the client sent");
+    // ...and "c" should NOT be unset, since the client never marked it so.
+    BOOST_CHECK_MESSAGE(!qo.is_unset(2),
+        "bind marker \"c\" (index 2) should not be reported unset -- the client sent a real value for it");
+
+    // get_value_at() must agree with is_unset(): a marker that is_unset()
+    // says is NOT unset must yield a value rather than throw, and one that
+    // IS unset must throw rather than silently hand back a value.
+    BOOST_CHECK_NO_THROW(qo.get_value_at(2));   // "c" has a real value
+    BOOST_CHECK_THROW(qo.get_value_at(1), exceptions::invalid_request_exception); // "b" is unset
 }
 
 // A temporary is a slot in evaluation_inputs::temporaries; evaluating it is

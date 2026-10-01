@@ -22,7 +22,6 @@ Options:
   --root /path/to/root     alternative install root (default /)
   --prefix /prefix         directory prefix (default /usr)
   --python3 /opt/python3   path of the python3 interpreter relative to install root (default /opt/scylladb/python3/bin/python3)
-  --housekeeping           enable housekeeping service
   --nonroot                install Scylla without required root privilege
   --sysconfdir /etc/sysconfig   specify sysconfig directory name
   --packaging               use install.sh for packaging
@@ -64,7 +63,6 @@ EOF
 # isn't changed by it.
 
 root=/
-housekeeping=false
 nonroot=false
 packaging=false
 upgrade=false
@@ -83,10 +81,6 @@ while [ $# -gt 0 ]; do
         "--prefix")
             prefix="$2"
             shift 2
-            ;;
-        "--housekeeping")
-            housekeeping=true
-            shift 1
             ;;
         "--python3")
             python3="$2"
@@ -332,7 +326,6 @@ if ! $nonroot; then
     rsystemd=$(realpath -m "$rusr/lib/systemd/system")
     rdoc="$rprefix/share/doc"
     rdata=$(realpath -m "$root/var/lib/scylla")
-    rhkdata=$(realpath -m "$root/var/lib/scylla-housekeeping")
 else
     retc="$rprefix/etc"
     rsysconfdir="$rprefix/$sysconfdir"
@@ -354,9 +347,6 @@ installconfig 644 $scylla_yaml "$retc"/scylla
 rm -rf $scylla_yaml_dir
 
 installconfig 644 conf/cassandra-rackdc.properties "$retc"/scylla
-if $housekeeping; then
-    installconfig 644 conf/housekeeping.cfg "$retc"/scylla.d
-fi
 # scylla-perf-collector
 if ! $nonroot; then
     install -d -m755 "$root"/var/log/scylla-perf
@@ -388,7 +378,6 @@ relocate_python3 "$rprefix"/kernel_conf dist/common/kernel_conf/scylla_tune_sche
 # scylla-server
 install -m755 -d "$rprefix"
 install -m755 -d "$retc/scylla.d"
-installconfig 644 dist/common/sysconfig/scylla-housekeeping "$rsysconfdir"
 installconfig 644 dist/common/sysconfig/scylla-server "$rsysconfdir"
 for file in dist/common/scylla.d/*.conf; do
     installconfig 644 "$file" "$retc"/scylla.d
@@ -397,8 +386,6 @@ done
 install -d -m755 "$retc"/scylla "$rprefix/bin" "$rprefix/libexec" "$rprefix/libreloc" "$rprefix/libreloc/fipscheck" "$rprefix/libreloc/pkcs11" "$rprefix/scripts" "$rprefix/bin"
 if ! $without_systemd; then
     install -m644 dist/common/systemd/scylla-fstrim.service -Dt "$rsystemd"
-    install -m644 dist/common/systemd/scylla-housekeeping-daily.service -Dt "$rsystemd"
-    install -m644 dist/common/systemd/scylla-housekeeping-restart.service -Dt "$rsystemd"
     install -m644 dist/common/systemd/scylla-server.service -Dt "$rsystemd"
     install -m644 dist/common/perf-collector/scylla-perf-collector.service -Dt "$rsystemd"
     install -m644 dist/common/systemd/*.slice -Dt "$rsystemd"
@@ -467,9 +454,12 @@ install -d -m755 -d "$rprefix"/api
 cp -pr api/api-doc "$rprefix"/api
 install -d -m755 -d "$rprefix"/scyllatop
 cp -pr tools/scyllatop/* "$rprefix"/scyllatop
+install -d -m755 -d "$rprefix"/lib-python/tablets
+cp -pr scripts/tablets/*.py "$rprefix"/lib-python/tablets
 install -d -m755 -d "$rprefix"/scripts
 cp -pr dist/common/scripts/* "$rprefix"/scripts
 ln -srf "$rprefix/scyllatop/scyllatop.py" "$rprefix/bin/scyllatop"
+ln -srf "$rprefix/lib-python/scylla-tablets.py" "$rprefix/bin/scylla-tablets"
 if $supervisor; then
     install -d -m755 "$rprefix"/supervisor
     install -m755 dist/common/supervisor/* -Dt "$rprefix"/supervisor
@@ -494,14 +484,6 @@ EnvironmentFile=$sysconfdir/scylla-server
 EnvironmentFile=/etc/scylla.d/*.conf
 EOS
         chmod 644 "$retc"/systemd/system/scylla-server.service.d/sysconfdir.conf
-        for i in daily restart; do
-            install -d -m755 "$retc"/systemd/system/scylla-housekeeping-$i.service.d
-            cat << EOS > "$retc"/systemd/system/scylla-housekeeping-$i.service.d/sysconfdir.conf
-[Service]
-EnvironmentFile=
-EnvironmentFile=$sysconfdir/scylla-housekeeping
-EOS
-        done
     fi
 elif ! $without_systemd; then
     install -d -m755 "$rsystemd"/scylla-server.service.d
@@ -550,10 +532,10 @@ EOS
         chmod 644 "$rprefix"/scripts/scylla_sysconfdir.py
     fi
     install -m755 -d "$rusr/bin"
-    install -m755 -d "$rhkdata"
     ln -srf "$rprefix/bin/scylla" "$rusr/bin/scylla"
     ln -srf "$rprefix/bin/iotune" "$rusr/bin/iotune"
     ln -srf "$rprefix/bin/scyllatop" "$rusr/bin/scyllatop"
+    ln -srf "$rprefix/bin/scylla-tablets" "$rusr/bin/scylla-tablets"
     ln -srf "$rprefix/bin/nodetool" "$rusr/bin/nodetool"
     install -d -m755 "$rusr"/sbin
     for i in $SBINFILES; do
@@ -597,6 +579,7 @@ for i in seastar/scripts/{perftune.py,addr2line.py,seastar-addr2line}; do
     relocate_python3 "$rprefix"/scripts "$i"
 done
 relocate_python3 "$rprefix"/scyllatop tools/scyllatop/scyllatop.py
+relocate_python3 "$rprefix"/lib-python scripts/tablets/scylla-tablets.py
 relocate_python3 "$rprefix"/scripts fix_system_distributed_tables.py
 
 if $supervisor; then
@@ -668,7 +651,6 @@ elif ! $packaging; then
         usermod -g scylla scylla
     fi
     chown -R scylla:scylla $rdata
-    chown -R scylla:scylla $rhkdata
 
     for file in dist/common/sysctl.d/*.conf; do
         bn=$(basename "$file")

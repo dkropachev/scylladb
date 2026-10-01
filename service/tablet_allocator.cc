@@ -347,7 +347,7 @@ future<rack_list_colocation_state> find_required_rack_list_colocations(
         auto& ks = db.find_keyspace(ks_name);
         std::unordered_map<sstring, sstring> saved_ks_props = *req_entry.new_keyspace_rf_change_data;
         cql3::statements::ks_prop_defs new_ks_props{std::map<sstring, sstring>{saved_ks_props.begin(), saved_ks_props.end()}};
-        new_ks_props.validate();
+        new_ks_props.validate(db.features());
         auto ks_md = new_ks_props.as_ks_metadata_update(ks.metadata(), *tmptr, db.features(), db.get_config());
 
         auto tables_with_mvs = ks.metadata()->tables();
@@ -1029,6 +1029,8 @@ private:
             case tablet_transition_stage::use_new:
                 return false;
             case tablet_transition_stage::cleanup:
+                return false;
+            case tablet_transition_stage::sc_rollback:
                 return false;
             case tablet_transition_stage::cleanup_target:
                 return false;
@@ -3038,10 +3040,13 @@ public:
     // Precondition: all migration streaming info have same source and destination.
     //  FIXME: remove precondition but it's not easy without copying noad_load_map.
     bool can_accept_load(node_load_map& nodes, const migration_streaming_info_vector& infos) {
-        // Since all migration info have the same source and destination, the load check can be easily done
-        // by informing the number of migrations.
+        // Since all migration info have the same source and destination, the load check can be done
+        // once with the combined stream weight.
         auto info = infos[0];
-        info.stream_weight = infos.size();
+        info.stream_weight = 0;
+        for (auto& i : infos) {
+            info.stream_weight += i.stream_weight;
+        }
         return can_accept_load(nodes, info);
     }
 

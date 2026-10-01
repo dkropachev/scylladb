@@ -375,6 +375,12 @@ public:
         return _marked_for_deletion == mark_for_deletion::marked;
     }
 
+    // Undo mark_for_deletion(). Used when the intent to delete could not be
+    // recorded durably, so the sstable must be left in place.
+    void unmark_for_deletion() {
+        _marked_for_deletion = mark_for_deletion::none;
+    }
+
     const std::set<generation_type>& compaction_ancestors() const {
         return _compaction_ancestors;
     }
@@ -1191,6 +1197,13 @@ public:
         return _sstable_identifier;
     }
 
+    // Set on the source of a component rewrite (see link_with_rewritten_component()):
+    // the basename of the Data component of the sstable it was cloned into. Lets holders
+    // of a reference to the replaced sstable find its current generation in the table.
+    const std::optional<sstring>& cloned_to_sstable_filename() const noexcept {
+        return _cloned_to_sstable_filename;
+    }
+
     // Drops all evictable in-memory caches of on-disk content.
     future<> drop_caches();
 
@@ -1265,7 +1278,9 @@ public:
             std::function<void(sstable&)> modifier,
             update_sstable_id);
     // Must be called in a seastar thread
-    void write_component_with_metadata(component_type type, scylla_metadata metadata);
+    void write_component_with_metadata(component_type type);
+private:
+    future<uint64_t> component_filesize(component_type type) const noexcept;
 };
 
 // Validate checksums

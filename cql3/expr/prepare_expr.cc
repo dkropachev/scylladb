@@ -10,6 +10,7 @@
 #include "expr-utils.hh"
 #include "evaluate.hh"
 #include "cql3/functions/functions.hh"
+#include "cql3/functions/scoring_fcts.hh"
 #include "cql3/functions/aggregate_fcts.hh"
 #include "cql3/functions/castas_fcts.hh"
 #include "cql3/functions/scalar_function.hh"
@@ -855,9 +856,12 @@ tuple_constructor_prepare_nontuple(const tuple_constructor& tc, data_dictionary:
     if (receiver) {
         type = receiver->type;
     } else {
+        // A DESC clustering column has a reversed type; leaving it in an element of
+        // the tuple type would make tuple comparisons invert that component.
+        auto element_type = [] (const expression& e) { return type_of(e)->underlying_type(); };
         type = tuple_type_impl::get_instance(
                 values
-                | std::views::transform(type_of)
+                | std::views::transform(element_type)
                 | std::ranges::to<std::vector>());
     }
     tuple_constructor value {
@@ -2312,13 +2316,14 @@ public:
         return "LIKE";
     }
 
-    virtual bytes_opt execute(std::span<const bytes_opt> parameters) override {
+    virtual managed_bytes_opt execute(std::span<const managed_bytes_opt> parameters) override {
         auto& str_opt = parameters[0];
         if (!str_opt) {
             return std::nullopt;
         }
-        bool match_result = _matcher(*str_opt);
-        return data_value(match_result).serialize();
+        // like_matcher only works on a linear buffer.
+        bool match_result = str_opt->with_linearized([this] (bytes_view str) { return _matcher(str); });
+        return managed_bytes(data_value(match_result).serialize_nonnull());
     }
 };
 
@@ -2350,6 +2355,12 @@ binary_operator prepare_binary_operator(binary_operator binop, data_dictionary::
         throw exceptions::invalid_request_exception(fmt::format("Could not infer type of {}", binop.lhs));
     }
     auto& prepared_lhs = *prepared_lhs_opt;
+    if (const auto* fc = as_if<function_call>(&prepared_lhs); fc && is_external_function_call(*fc)) {
+        // An external function is a placeholder the statement has to deal with; what it needs
+        // depends on its kind. Search decides which of its values a relation compares, before the
+        // right-hand side is type-checked against it, and leaves anything else alone.
+        prepared_lhs = functions::prepare_external_search_relation_lhs(std::move(prepared_lhs), db, table_schema);
+    }
     lw_shared_ptr<column_specification> lhs_receiver = get_lhs_receiver(prepared_lhs, table_schema);
 
     if (type_of(prepared_lhs)->references_duration() && is_slice(binop.op)) {
@@ -2359,14 +2370,14 @@ binary_operator prepare_binary_operator(binary_operator binop, data_dictionary::
     lw_shared_ptr<column_specification> rhs_receiver = get_rhs_receiver(lhs_receiver, binop.op, d);
     expression prepared_rhs = prepare_expression(binop.rhs, db, table_schema.ks_name(), &table_schema, rhs_receiver);
 
-    // IS NOT NULL requires an additional check that the RHS is NULL.
-    // Otherwise things like `int_col IS NOT 123` would be allowed - the types match, but the value is wrong.
-    if (binop.op == oper_t::IS_NOT) {
+    // IS NULL and IS NOT NULL require an additional check that the RHS is NULL.
+    // Otherwise things like `int_col IS 123` or `int_col IS NOT 123` would be allowed - the types match, but the value is wrong.
+    if (binop.op == oper_t::IS || binop.op == oper_t::IS_NOT) {
         bool rhs_is_null = is<constant>(prepared_rhs) && as<constant>(prepared_rhs).is_null();
 
         if (!rhs_is_null) {
             throw exceptions::invalid_request_exception(format(
-                "IS NOT NULL is the only expression that is allowed when using IS NOT. Invalid binary operator: {:user}",
+                "IS NULL and IS NOT NULL are the only expressions that are allowed when using IS/IS NOT. Invalid binary operator: {:user}",
                 binop));
         }
     }

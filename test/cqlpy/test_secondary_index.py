@@ -13,6 +13,8 @@ import pytest
 import os
 from contextlib import ExitStack
 from . import rest_api
+from . import nodetool
+from test.pylib.skip_types import skip_env
 from cassandra.protocol import InvalidRequest, ConfigurationException, ReadFailure
 from cassandra.query import SimpleStatement
 from .cassandra_tests.porting import assert_rows, assert_row_count, assert_rows_ignoring_order
@@ -2699,6 +2701,69 @@ def test_short_count(cql, test_keyspace):
         assert len(rs) == 1
         assert rs[0].count == 4
 
+# Reproducer for SCYLLADB-4057.
+# This reproducer covers two related paging bugs in indexed reads with a
+# clustering-key range tombstone. The first bug changes a reconstructed
+# "before" bound into an "after" bound. The second skips reconstruction when
+# the preceding base-table page contains no rows, so the view read resumes
+# from the wrong clustering position.
+@pytest.mark.xfail(reason="SCYLLADB-4057")
+def test_index_paging_ends_on_range_tombstone_bound(cql, test_keyspace, scylla_only):
+    schema = 'pk int, ck1 int, ck2 int, v int, PRIMARY KEY (pk, ck1, ck2)'
+    with new_test_table(cql, test_keyspace, schema, extra=" WITH tombstone_gc = {'mode': 'disabled'}") as table:
+        cql.execute(f'CREATE INDEX ON {table}(v)')
+        cql.execute(f'DELETE FROM {table} WHERE pk=0 AND ck1=0')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v) VALUES (0, 0, 0, 7)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v) VALUES (0, 0, 1, 7)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v) VALUES (0, 0, 2, 7)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v) VALUES (0, 0, 3, 7)')
+
+        # Induce a page break before the first row, after reading the range tombstone.
+        with config_value_context(cql, 'query_tombstone_page_limit', '1'):
+            stmt = SimpleStatement(f'SELECT pk, ck1, ck2 FROM {table} WHERE v = 7')
+            assert list(cql.execute(stmt)) == [(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 0, 3)]
+
+# Isolated reproducer for the first bug described in SCYLLADB-4057.
+# (The first row means that the first page is nonempty, so "empty page" problems
+# are not exercised.
+@pytest.mark.xfail(reason="SCYLLADB-4057")
+def test_index_paging_reconstructs_range_tombstone_bound(cql, test_keyspace, scylla_only):
+    schema = 'pk int, ck1 int, ck2 int, v int, PRIMARY KEY (pk, ck1, ck2)'
+    with new_test_table(cql, test_keyspace, schema, extra=" WITH tombstone_gc = {'mode': 'disabled'}") as table:
+        cql.execute(f'CREATE INDEX ON {table}(v)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v) VALUES (0, -1, 0, 7)')
+        cql.execute(f'DELETE FROM {table} WHERE pk=0 AND ck1=0')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v) VALUES (0, 0, 0, 7)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v) VALUES (0, 0, 1, 7)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v) VALUES (0, 0, 2, 7)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v) VALUES (0, 0, 3, 7)')
+
+        with config_value_context(cql, 'query_tombstone_page_limit', '1'):
+            stmt = SimpleStatement(f'SELECT pk, ck1, ck2 FROM {table} WHERE v = 7')
+            first_page = cql.execute(stmt)
+            assert list(first_page.current_rows) == [(0, -1, 0)]
+            assert first_page.has_more_pages
+        with config_value_context(cql, 'query_tombstone_page_limit', '100'):
+            assert list(cql.execute(stmt, paging_state=first_page.paging_state)) == [(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 0, 3)]
+
+# Isolated reproducer for the second bug described in SCYLLADB-4057.
+# (The `WHERE w=1` part means that the results of the test don't depend on the
+# fact that the first row is skipped due to the first bug).
+@pytest.mark.xfail(reason="SCYLLADB-4057")
+def test_index_paging_reconstructs_after_empty_page(cql, test_keyspace, scylla_only):
+    schema = 'pk int, ck1 int, ck2 int, v int, w int, PRIMARY KEY (pk, ck1, ck2)'
+    with new_test_table(cql, test_keyspace, schema, extra=" WITH tombstone_gc = {'mode': 'disabled'}") as table:
+        cql.execute(f'CREATE INDEX ON {table}(v)')
+        cql.execute(f'DELETE FROM {table} WHERE pk=0 AND ck1=0')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v, w) VALUES (0, 0, 0, 7, 0)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v, w) VALUES (0, 1, 0, 7, 1)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v, w) VALUES (0, 2, 0, 7, 1)')
+        cql.execute(f'INSERT INTO {table} (pk, ck1, ck2, v, w) VALUES (0, 3, 0, 7, 1)')
+
+        with config_value_context(cql, 'query_tombstone_page_limit', '1'):
+            stmt = SimpleStatement(f'SELECT pk, ck1, ck2 FROM {table} WHERE v = 7 AND w = 1 ALLOW FILTERING')
+            assert list(cql.execute(stmt)) == [(0, 1, 0), (0, 2, 0), (0, 3, 0)]
+
 def test_index_metrics(cql, test_keyspace, scylla_only):
     with new_test_table(cql, test_keyspace, "p int PRIMARY KEY, v int") as table:
         index_name = unique_name()
@@ -2850,3 +2915,159 @@ def test_regular_row_update_with_static_set_index(cql, test_keyspace):
         cql.execute(f"UPDATE {table} SET x = 4 WHERE pk = 1 AND ck = 2")
         assert [(1, 2, {'test'}, 4)] == list(cql.execute(f"SELECT * FROM {table} WHERE pk = 1 AND ck = 2"))
         assert [(1, 2, {'test'}, 4)] == list(cql.execute(f"SELECT * FROM {table} WHERE s CONTAINS 'test'"))
+
+# Test that IS NULL and IS NOT NULL operators work on indexed columns
+# but require ALLOW FILTERING since secondary indexes cannot efficiently
+# support null checks. The materialized view backing the secondary index
+# has a partition for each value of the indexed column, but does not have
+# a partition for the NULL key (NULL cannot be a key in a materialized view).
+# IS [NOT] NULL in a regular SELECT filter is a Scylla extension - Cassandra
+# only accepts IS NOT NULL in materialized view creation - so the test is
+# scylla_only.
+# Reproducer for issue #8517
+def test_is_null_with_secondary_index(cql, test_keyspace, scylla_only):
+    with new_test_table(cql, test_keyspace, "p int, c int, v int, PRIMARY KEY (p, c)") as table:
+        # Create secondary index on v
+        cql.execute(f"CREATE INDEX ON {table}(v)")
+
+        # Insert test data with some NULL values in indexed column
+        cql.execute(f"INSERT INTO {table} (p, c, v) VALUES (1, 1, 10)")
+        cql.execute(f"INSERT INTO {table} (p, c, v) VALUES (1, 2, 20)")
+        cql.execute(f"INSERT INTO {table} (p, c, v) VALUES (1, 3, NULL)")
+        cql.execute(f"INSERT INTO {table} (p, c, v) VALUES (2, 1, 10)")
+        cql.execute(f"INSERT INTO {table} (p, c, v) VALUES (2, 2, NULL)")
+
+        # IS NULL on indexed column should require ALLOW FILTERING
+        # because the index cannot efficiently support it
+        with pytest.raises(InvalidRequest, match='ALLOW FILTERING'):
+            cql.execute(f"SELECT * FROM {table} WHERE v IS NULL")
+
+        # IS NOT NULL on indexed column should also require ALLOW FILTERING
+        with pytest.raises(InvalidRequest, match='ALLOW FILTERING'):
+            cql.execute(f"SELECT * FROM {table} WHERE v IS NOT NULL")
+
+        # With ALLOW FILTERING, IS NULL should work correctly
+        result = list(cql.execute(f"SELECT * FROM {table} WHERE v IS NULL ALLOW FILTERING"))
+        assert {(r.p, r.c) for r in result} == {(1, 3), (2, 2)}
+
+        # With ALLOW FILTERING, IS NOT NULL should work correctly
+        result = list(cql.execute(f"SELECT * FROM {table} WHERE v IS NOT NULL ALLOW FILTERING"))
+        assert {(r.p, r.c) for r in result} == {(1, 1), (1, 2), (2, 1)}
+
+        # Can combine IS NULL with partition key restriction
+        result = list(cql.execute(f"SELECT * FROM {table} WHERE p = 1 AND v IS NULL ALLOW FILTERING"))
+        assert [r.c for r in result] == [3]
+
+        # Regular EQ query on indexed column should work without ALLOW FILTERING
+        result = list(cql.execute(f"SELECT * FROM {table} WHERE v = 10"))
+        assert {(r.p, r.c) for r in result} == {(1, 1), (2, 1)}
+
+# Reproducer for SCYLLADB-2817: force the index (a materialized view) to
+# diverge from the base table, then check that an indexed query still returns
+# only rows matching the WHERE clause. The orchestration, via error injections:
+#  1. Write rows and flush BEFORE creating the index - backfill reads the
+#     sstable snapshot, which has (1,1,1,1) = v3.
+#  2. Create the index and step the builder with two pauses, pinning the
+#     ordering: it scans the flushed snapshot now (before the overwrites
+#     below), but holds the generated postings unapplied.
+#  3. Overwrite (1,1,1,1) to v=4 then v=5, with the v=4 view update dropped
+#     by an injected, swallowed failure - so no tombstone will cover the
+#     builder's stale v=3 posting. Re-insert the other v=3 rows normally.
+#  4. Query (correct), release the builder: the stale v=3 -> (1,1,1,1)
+#     posting lands, pointing at a base row that has v=5.
+#  5. Query again: the stale posting must not produce a v=5 row for "v = 3".
+#     The read path re-validates the indexed column against the base row, so
+#     the stale posting stays in the view but is filtered out of the result.
+def test_index_query_with_stale_index_entry(cql, test_keyspace, scylla_only):
+    def inj_enable(err, one_shot=False):
+        rest_api.post_request(cql, f'v2/error_injection/injection/{err}?one_shot={one_shot}')
+        if err not in rest_api.get_request(cql, 'v2/error_injection/injection'):
+            skip_env("error injection not enabled in this build")
+    def inj_disable(err):
+        rest_api.delete_request(cql, f'v2/error_injection/injection/{err}')
+    def inj_message(err):
+        rest_api.post_request(cql, f'v2/error_injection/injection/{err}/message')
+    def inj_enters(err):
+        try:
+            return int(rest_api.get_request(cql, f'v2/error_injection/injection/{err}/enters'))
+        except Exception:
+            return -1
+    def wait_for(what, cond):
+        deadline = time.time() + 60
+        while not cond():
+            assert time.time() < deadline, f"timed out waiting for {what}"
+            time.sleep(0.2)
+
+    pause_scan = "view_building_worker_pause_build_range_task"
+    pause_apply = "populate_views_pause_before_apply"
+    fail_update = "view_update_generation_failure"
+
+    schema = 'pk int, c1 int, c2 int, c3 int, v int, PRIMARY KEY (pk, c1, c2, c3)'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        ins = f"INSERT INTO {table} (pk, c1, c2, c3, v) VALUES"
+        q_range = f"SELECT * FROM {table} WHERE pk = 1 AND c1 > 0 AND c1 < 5 AND c2 = 1 AND v = 3 ALLOW FILTERING"
+        q_in = f"SELECT * FROM {table} WHERE pk = 1 AND c1 IN(0,1,2) AND c2 = 1 AND v = 3 ALLOW FILTERING"
+        expected = [(1, 1, 1, 3, 3)]
+        try:
+            # (1) data before the index exists; flush - backfill reads sstables.
+            for i in (1, 2, 3):
+                cql.execute(f"{ins} (1, 1, 1, 1, {i})")
+                cql.execute(f"{ins} (1, 1, 1, {i}, {i})")
+                cql.execute(f"{ins} (1, 1, {i}, {i}, {i})")
+                cql.execute(f"{ins} (1, {i}, {i}, {i}, {i})")
+            nodetool.flush(cql, table)
+
+            # (2) create the index; pause the builder before its scan...
+            inj_enable(pause_scan)
+            inj_enable(pause_apply)
+            cql.execute(f"CREATE INDEX v_idx_2817 ON {table} (v)")
+            wait_for("builder to reach the scan pause", lambda: inj_enters(pause_scan) >= 1)
+
+            # ...release the scan; generation runs and parks before apply.
+            inj_message(pause_scan)
+            inj_disable(pause_scan)
+            wait_for("builder to reach the apply pause", lambda: inj_enters(pause_apply) >= 1)
+
+            # (3) legit v3 rows via the regular write path...
+            cql.execute(f"{ins} (1, 1, 1, 3, 3)")
+            cql.execute(f"{ins} (1, 1, 3, 3, 3)")
+            cql.execute(f"{ins} (1, 3, 3, 3, 3)")
+            # ...and the overwrites; the v=4 write's view update is swallowed.
+            inj_enable(fail_update, one_shot=True)
+            cql.execute(f"{ins} (1, 1, 1, 1, 4)")
+            cql.execute(f"{ins} (1, 1, 1, 4, 4)")
+            cql.execute(f"{ins} (1, 1, 4, 4, 4)")
+            cql.execute(f"{ins} (1, 4, 4, 4, 4)")
+            for i in (5,):
+                cql.execute(f"{ins} (1, 1, 1, 1, {i})")
+                cql.execute(f"{ins} (1, 1, 1, {i}, {i})")
+                cql.execute(f"{ins} (1, 1, {i}, {i}, {i})")
+                cql.execute(f"{ins} (1, {i}, {i}, {i}, {i})")
+
+            # The base is correct: (1,1,1,1) has v=5.
+            assert [r.v for r in cql.execute(f"SELECT v FROM {table} WHERE pk=1 AND c1=1 AND c2=1 AND c3=1")] == [5]
+
+            # (4) before the stale posting lands, both queries are correct.
+            assert sorted(tuple(r) for r in cql.execute(q_range)) == expected
+            assert sorted(tuple(r) for r in cql.execute(q_in)) == expected
+
+            # (5) release the apply; wait until the stale v=3 posting for
+            # (1,1,1,1) is in the index view.
+            inj_message(pause_apply)
+            inj_disable(pause_apply)
+            ks = table.split('.')[0]
+            viewq = f'SELECT pk, c1, c2, c3 FROM {ks}."v_idx_2817_index" WHERE v = 3'
+            wait_for("stale posting to land",
+                     lambda: (1, 1, 1, 1) in [tuple(r) for r in cql.execute(viewq)])
+
+            # The index has now diverged from the base: it claims (1,1,1,1)
+            # has v=3, the base says v=5. The queries must still be correct -
+            # a returned row must match the WHERE clause.
+            assert sorted(tuple(r) for r in cql.execute(q_in)) == expected
+            assert sorted(tuple(r) for r in cql.execute(q_range)) == expected
+        finally:
+            for err in (pause_scan, pause_apply, fail_update):
+                try:
+                    inj_disable(err)
+                except Exception:
+                    pass

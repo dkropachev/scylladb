@@ -101,11 +101,14 @@ future<> snapshot_ctl::check_snapshot_not_exist(sstring ks_name, sstring name, s
     });
 }
 
-future<> snapshot_ctl::run_snapshot_modify_operation(noncopyable_function<future<>()>&& f) {
-    return with_gate(_ops, [f = std::move(f), this] () mutable {
-        return container().invoke_on(0, [f = std::move(f)] (snapshot_ctl& snap) mutable {
-            return with_lock(snap._lock.for_write(), std::move(f));
-        });
+future<> snapshot_ctl::run_snapshot_modify_operation(noncopyable_function<future<>()>&& f, seastar::abort_source* as) {
+    if (as && this_shard_id() != 0) {
+        on_internal_error(snap_log, "run_snapshot_modify_operation() can only be aborted from shard 0");
+    }
+    auto gh = _ops.hold();
+    co_await container().invoke_on(0, [f = std::move(f), as] (snapshot_ctl& snap) mutable -> future<> {
+        auto holder = co_await (as ? snap._lock.hold_write_lock(*as) : snap._lock.hold_write_lock());
+        co_await f();
     });
 }
 
@@ -332,8 +335,20 @@ future<tasks::task_id> snapshot_ctl::start_backup(sstring endpoint, sstring buck
 
     cancel_expiration(snapshot_name, {keyspace}, table);
 
-    auto task = co_await _task_manager_module->make_and_start_task<::db::snapshot::backup_task_impl>(
-        {}, *this, _storage_manager.container(), std::move(endpoint), std::move(bucket), std::move(prefix), keyspace, std::move(*dir), move_files);
+    auto state = make_lw_shared<snapshot::backup_state>(*this, _storage_manager.container(), std::move(endpoint), std::move(bucket), std::move(prefix), keyspace, std::move(*dir), move_files);
+    tasks::task_manager::task_builder task_builder{_task_manager_module, snapshot::backup_task_type};
+    task_builder.set_scope("node")
+                .set_keyspace(std::move(keyspace))
+                .set_progress_units("bytes")
+                .set_is_abortable(tasks::is_abortable::yes)
+                .set_is_internal(tasks::is_internal::no)
+                .set_is_user_task(tasks::is_user_task::yes)
+                .set_progress_fn([state] {
+                    return state->get_progress().finally([state] {});
+                });
+    auto task = co_await std::move(task_builder).build([state] (tasks::task_manager::task::impl& self) {
+        return state->run(self.get_abort_source());
+    });
     co_return task->id();
 }
 
@@ -378,7 +393,7 @@ future<tasks::task_id> snapshot_ctl::start_global_backup(std::unordered_map<sstr
 
 future<>
 snapshot_ctl::backup_sstables(table_id table_id, std::string tag, std::string endpoint, std::string bucket, std::string prefix, dht::token first_token, dht::token last_token, utils::chunked_vector<sstables::sstable_id> sstable_ids, bool use_move) {
-    // backup_task_impl assumes we create and run it on shard 0
+    // Backups are created and run on shard 0
     if (this_shard_id() != 0) {
         co_return co_await container().invoke_on(0, [&](auto& local) {
             return local.backup_sstables(table_id, tag, endpoint, bucket, prefix, first_token, last_token, sstable_ids, use_move);

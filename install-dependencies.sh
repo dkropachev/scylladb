@@ -36,16 +36,10 @@ debian_base_packages=(
     cargo
     wabt
     liblua5.3-dev
-    python3-aiohttp
     python3-pyparsing
-    python3-colorama
     python3-dev
     python3-tabulate
-    python3-pytest
-    python3-pytest-asyncio
-    python3-pytest-timeout
-    python3-pytest-sugar
-    python3-pexpect
+    python3-pip
     libsnappy-dev
     libjsoncpp-dev
     rapidjson-dev
@@ -92,22 +86,11 @@ fedora_packages=(
     sudo
     patchelf
     python3
-    python3-aiohttp
     python3-devel
     python3-pip
     python3-file-magic
-    python3-colorama
     python3-tabulate
-    python3-boto3
-    python3-pytest
-    python3-pytest-asyncio
-    python3-pytest-timeout
-    python3-unidiff
-    python3-humanfriendly
     python3-jinja2
-    python3-deepdiff
-    python3-cryptography
-    python3-pexpect
     dnf-utils
     pigz
     net-tools
@@ -163,6 +146,10 @@ fedora_packages=(
     jq
 
     libev-devel # for python driver
+
+    # test.py re-execs itself under `uv run --locked` against
+    # test/pyproject.toml (see _ensure_running_under_uv() in test.py)
+    uv
 )
 
 fedora_python3_packages=(
@@ -176,21 +163,25 @@ fedora_python3_packages=(
     python3-click
     python3-six
     python3-pyudev
+    python3-tabulate
 )
 
 # an associative array from packages to constrains
+#
+# These are packages also needed outside of test.py (e.g. by cqlsh, or by the
+# shipped python3 relocatable package / dist/common/scripts). test.py's own
+# dependencies (scylla-driver and everything else it or pytest needs to run)
+# live in test/pyproject.toml / test/uv.lock instead: test.py re-execs itself
+# under `uv run --locked` on startup (see _ensure_running_under_uv() in
+# test.py), so their versions stay decoupled from this frozen toolchain
+# image, and any invocation that needs them directly (e.g. bare pytest) is
+# expected to also go through `uv run --project test --locked` rather than
+# relying on this image.
 declare -A pip_packages=(
     [scylla-driver]="==$(cat tools/cqlsh/requirements.txt | grep scylla-driver | cut -d= -f3)"
     [geomet]=""
     [traceback-with-variables]=""
     [scylla-api-client]=""
-    [treelib]=""
-    [allure-pytest]=""
-    [pytest-xdist]=""
-    [pykmip]=""
-    [universalasync]=""
-    [boto3-stubs[dynamodb]]=""
-    [setuptools_scm]=""
 )
 
 pip_symlinks=(
@@ -211,6 +202,7 @@ centos_packages=(
     openldap-servers
     openldap-devel
     cpp-jwt-devel
+    python3-pip
 )
 
 # 1) glibc 2.30-3 has sys/sdt.h (systemtap include)
@@ -230,10 +222,12 @@ arch_packages=(
     glibc
     jsoncpp
     lua
+    python-pip
     python-pyparsing
     python3
     rapidjson
     snappy
+    uv
 )
 
 ANTLR3_VERSION=3.5.3
@@ -305,27 +299,6 @@ go_arch() {
         ["aarch64"]=arm64
     )
     echo ${GO_ARCH["$(arch)"]}
-}
-
-MINIO_BINARIES_DIR=/usr/local/bin
-
-minio_server_url() {
-    echo "https://dl.minio.io/server/minio/release/linux-$(go_arch)/minio"
-}
-
-minio_client_url() {
-    echo "https://dl.min.io/client/mc/release/linux-$(go_arch)/mc"
-}
-
-minio_download_jobs() {
-    cfile=$(mktemp)
-    echo "$(curl -sL "$(minio_server_url).sha256sum" | cut -f1 -d' ') ${MINIO_BINARIES_DIR}/minio" > "$cfile"
-    echo "$(curl -sL "$(minio_client_url).sha256sum" | cut -f1 -d' ') ${MINIO_BINARIES_DIR}/mc" >> "$cfile"
-    sha256sum -c $cfile | grep -F FAILED | sed \
-        -e 's/:.*$//g' \
-        -e "s#${MINIO_BINARIES_DIR}/minio#$(minio_server_url) -o ${MINIO_BINARIES_DIR}/minio#" \
-        -e "s#${MINIO_BINARIES_DIR}/mc#$(minio_client_url) -o ${MINIO_BINARIES_DIR}/mc#"
-    rm -f ${cfile}
 }
 
 print_usage() {
@@ -474,21 +447,37 @@ elif [ "$ID" == "arch" ]; then
     echo -e "Configure example:\n\t./configure.py\n\tninja release"
 fi
 
+# test.py re-execs itself under `uv run --locked` against test/pyproject.toml
+# (see _ensure_running_under_uv() in test.py), so uv is required on PATH.
+# Fedora and Arch get it from the distro package manager above. Debian, Ubuntu
+# and CentOS have no official uv package, so install Astral's standalone,
+# self-contained binary into /usr/local/bin rather than pip-installing it into
+# the system Python, which could clash with distro-managed packages on a
+# developer workstation. The release tarball is verified against a pinned
+# checksum instead of piping Astral's install.sh into a shell.
+UV_VERSION="0.12.0"
+declare -A UV_SHA256=(
+    ["x86_64"]=eaf842262aa1c418d8ecc5605f02ee1ebfd369124fa48548e85f9481a47831a9
+    ["aarch64"]=2c5d6e3092cc5223b10ff403880cc75121bf64e84644e7a0c69f643b0d89ac95
+)
+if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ] || [ "$ID" = "centos" ]; then
+    if ! command -v uv > /dev/null; then
+        uv_tmpdir=$(mktemp -d)
+        uv_target="uv-$(arch)-unknown-linux-gnu"
+        curl -fSL -o "${uv_tmpdir}/${uv_target}.tar.gz" "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${uv_target}.tar.gz"
+        echo "${UV_SHA256["$(arch)"]}  ${uv_tmpdir}/${uv_target}.tar.gz" | sha256sum --check
+        tar -xzf "${uv_tmpdir}/${uv_target}.tar.gz" -C "${uv_tmpdir}"
+        install -m 755 "${uv_tmpdir}/${uv_target}/uv" "${uv_tmpdir}/${uv_target}/uvx" /usr/local/bin/
+        rm -rf "${uv_tmpdir}"
+    fi
+fi
+
 # Keep this version in lockstep with the `cxx` crate pinned in rust/inc/Cargo.toml
 # and rust/wasmtime_bindings/Cargo.toml: the cxxbridge CLI generates the C++ side
 # of the FFI and the cxx crate generates the Rust side, so a version mismatch
 # breaks linking (unresolved cxxbridge symbols). Bumping one requires bumping the
 # other (and rebuilding the toolchain image).
 cargo --config net.git-fetch-with-cli=true install cxxbridge-cmd --version 1.0.83 --root /usr/local
-
-CURL_ARGS=$(minio_download_jobs)
-if [ ! -z "${CURL_ARGS}" ]; then
-    curl -fSL --remove-on-error --parallel --parallel-immediate ${CURL_ARGS}
-    chmod +x "${MINIO_BINARIES_DIR}/minio"
-    chmod +x "${MINIO_BINARIES_DIR}/mc"
-else
-    echo "Minio server and client are up-to-date, skipping download"
-fi
 
 toxyproxy_version="v2.12.0"
 for bin in toxiproxy-cli toxiproxy-server; do

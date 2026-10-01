@@ -31,6 +31,7 @@
 #include "streaming/stream_reason.hh"
 #include "readers/mutation_fragment_v1_stream.hh"
 #include "locator/abstract_replication_strategy.hh"
+#include "locator/network_topology_strategy.hh"
 #include "message/messaging_service.hh"
 #include "service/storage_service.hh"
 #include "utils/error_injection.hh"
@@ -40,10 +41,11 @@
 
 #include "sstables/object_storage_client.hh"
 #include "utils/rjson.hh"
-#include "db/system_distributed_keyspace.hh"
+#include "table_helper.hh"
 
 #include <cfloat>
 #include <algorithm>
+#include <set>
 
 static logging::logger llog("sstables_loader");
 
@@ -503,7 +505,7 @@ future<> sstable_streamer::stream_sstable_mutations(streaming::plan_id ops_uuid,
     const auto cf_id = s->id();
     const auto reason = streaming::stream_reason::repair;
 
-    auto sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s, std::move(token_range)));
+    auto sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s));
     size_t estimated_partitions = 0;
     for (auto& sst : sstables) {
         estimated_partitions += co_await sst->estimated_keys_for_range(token_range);
@@ -926,7 +928,7 @@ future<tasks::task_id> sstables_loader::download_new_sstables(sstring ks_name, s
     }
     llog.info("Restore sstables from {}({}) to {}.{} using scope={}, primary_replica={}", endpoint, prefix, ks_name, cf_name, scope, primary_replica);
 
-    auto task = co_await _task_manager_module->make_and_start_task<download_task_impl>({}, container(), std::move(endpoint), std::move(bucket), std::move(ks_name), std::move(cf_name),
+    auto task = co_await _task_manager_module->make_and_start_task<download_task_impl>(tasks::make_empty_task_info(), container(), std::move(endpoint), std::move(bucket), std::move(ks_name), std::move(cf_name),
                                                                                        std::move(prefix), std::move(sstables), scope, primary_replica_only(primary_replica));
     co_return task->id();
 }
@@ -998,7 +1000,7 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
     auto snapshot_info = co_await sth.get_snapshot_remote_location(snapshot_name, datacenter);
     llog.info("Downloading sstables for tablet {} from {}@{}/{}", tid, snapshot_name, snapshot_info.endpoint, snapshot_info.bucket);
     auto sst_infos = co_await sth.get_snapshot_sstables(snapshot_name, keyspace_name, table_name, datacenter, rack,
-            db::consistency_level::LOCAL_QUORUM, tablet_range.start().transform([] (auto& v) { return v.value(); }), tablet_range.end().transform([] (auto& v) { return v.value(); }));
+            db::consistency_level::QUORUM, tablet_range.start().transform([] (auto& v) { return v.value(); }), tablet_range.end().transform([] (auto& v) { return v.value(); }));
     llog.debug("{} SSTables found for tablet {}", sst_infos.size(), tid);
     if (sst_infos.empty()) {
         // It can happen when the restored table has more tablets than the original.
@@ -1142,7 +1144,7 @@ future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets_for_test
 }
 
 static future<manifest_summary> process_manifest(input_stream<char>& is, sstring keyspace, sstring table,
-                                 const sstring& expected_snapshot_name,
+                                 const sstring& expected_snapshot_name, const sstring& expected_datacenter,
                                  const sstring& manifest_prefix, db::system_distributed_keyspace& sys_dist_ks,
                                  db::consistency_level cl) {
     // Read the entire JSON content
@@ -1175,6 +1177,10 @@ static future<manifest_summary> process_manifest(input_stream<char>& is, sstring
     auto& node_obj = rjson::get(parsed, "node");
     auto datacenter = rjson::get<std::string>(node_obj, "datacenter");
     auto rack = rjson::get<std::string>(node_obj, "rack");
+    if (datacenter != expected_datacenter) {
+        throw std::runtime_error(fmt::format("Manifest {} belongs to datacenter '{}', expected '{}'",
+            manifest_prefix, datacenter, expected_datacenter));
+    }
 
     // Process each sstable entry in the manifest
     // FIXME: cleanup of the snapshot-related rows is needed in case anything throws in here.
@@ -1198,9 +1204,11 @@ static future<manifest_summary> process_manifest(input_stream<char>& is, sstring
         auto last_token = rjson::to_token(rjson::get(sstable_entry, "last_token"));
         auto toc_name = rjson::to_sstring(rjson::get(sstable_entry, "toc_name"));
         auto tablet_id = rjson::get<size_t>(sstable_entry, "tablet_id");
-        auto repaired_at = rjson::get<int64_t>(sstable_entry, "repaired_at");
-        auto data_size = rjson::get<int64_t>(sstable_entry, "data_size");
-        auto index_size = rjson::get<int64_t>(sstable_entry, "index_size");
+        // The fields below are not needed to restore the sstable, they are only recorded
+        // in system_distributed.snapshot_sstables for informational purposes.
+        auto repaired_at = rjson::get_opt<int64_t>(sstable_entry, "repaired_at").value_or(0);
+        auto data_size = rjson::get_opt<int64_t>(sstable_entry, "data_size").value_or(0);
+        auto index_size = rjson::get_opt<int64_t>(sstable_entry, "index_size").value_or(0);
         auto prefix = sstring(std::filesystem::path(manifest_prefix).parent_path().string());
         // Insert the snapshot sstable metadata into system_distributed.snapshot_sstables with a TTL of 3 days, that should be enough
         // for any snapshot restore operation to complete, and after that the metadata will be automatically cleaned up from the table
@@ -1212,7 +1220,7 @@ static future<manifest_summary> process_manifest(input_stream<char>& is, sstring
     co_return manifest_summary{tablet_count, sstables->Size()};
 }
 
-future<manifest_summary> populate_snapshot_sstables_from_manifests(sstables::storage_manager& sm, db::system_distributed_keyspace& sys_dist_ks, sstring keyspace, sstring table, sstring endpoint, sstring bucket, sstring prefix, sstring expected_snapshot_name, utils::chunked_vector<sstring> manifest_prefixes, db::consistency_level cl) {
+future<manifest_summary> populate_snapshot_sstables_from_manifests(sstables::storage_manager& sm, db::system_distributed_keyspace& sys_dist_ks, sstring keyspace, sstring table, sstring endpoint, sstring bucket, sstring prefix, sstring expected_snapshot_name, sstring expected_datacenter, utils::chunked_vector<sstring> manifest_prefixes, db::consistency_level cl) {
     if (manifest_prefixes.empty()) {
         throw std::invalid_argument("manifest prefixes list must not be empty");
     }
@@ -1230,7 +1238,7 @@ future<manifest_summary> populate_snapshot_sstables_from_manifests(sstables::sto
         sstables::object_name name(bucket, join_path(prefix, manifest_prefix));
         auto source = client->make_download_source(name);
         return seastar::with_closeable(input_stream<char>(std::move(source)), [&] (input_stream<char>& is) {
-            return process_manifest(is, keyspace, table, expected_snapshot_name, manifest_prefix, sys_dist_ks, cl).then([&](manifest_summary ms) {
+            return process_manifest(is, keyspace, table, expected_snapshot_name, expected_datacenter, manifest_prefix, sys_dist_ks, cl).then([&](manifest_summary ms) {
                 size_t count = ms.tablet_count;
                 if (!tablet_count) {
                     tablet_count = count;
@@ -1253,6 +1261,11 @@ class sstables_loader::tablet_restore_task_impl : public tasks::task_manager::ta
     table_id _tid;
     sstring _snap_name;
     size_t _tablet_count;
+    // Pre-restore tablet hints, recovered by restore_tablets() from the schema
+    // persisted in system_distributed.snapshot_tables; run() alters the table
+    // back to them once the restore is done.
+    std::optional<size_t> _original_min_tablet_count;
+    std::optional<size_t> _original_max_tablet_count;
     tasks::task_manager::task::progress _progress;
     seastar::named_gate _gate{"progress_updater"};
     timer<seastar::lowres_clock> _progress_update_timer;
@@ -1263,30 +1276,30 @@ class sstables_loader::tablet_restore_task_impl : public tasks::task_manager::ta
         auto s = db.find_schema(_tid);
         auto md = db.get_token_metadata_ptr();
         const auto& topo = md->get_topology();
-        auto dc = topo.get_datacenter();
-        auto dc_racks_it = topo.get_datacenter_racks().find(dc);
-        if (dc_racks_it == topo.get_datacenter_racks().end()) {
-            co_return;
-        }
 
         db::snapshot_table_helper sth(loader._sys_dist_ks.qp());
         tasks::task_manager::task::progress progress = {};
-        co_await max_concurrent_for_each(dc_racks_it->second, 16, [&](const auto& rack_entry) -> future<> {
-            auto p = co_await sth.get_snapshot_sstables_progress(_snap_name, s->ks_name(), s->cf_name(), dc, rack_entry.first);
-            progress.total += p.nr_sstables;
-            progress.completed += p.nr_downloaded_sstables;
-        });
+        for (const auto& [dc, racks] : topo.get_datacenter_racks()) {
+            co_await max_concurrent_for_each(racks, 16, [&](const auto& rack_entry) -> future<> {
+                auto p = co_await sth.get_snapshot_sstables_progress(_snap_name, s->ks_name(), s->cf_name(), dc, rack_entry.first);
+                progress.total += p.nr_sstables;
+                progress.completed += p.nr_downloaded_sstables;
+            });
+        }
         _progress = progress;
     }
 
 public:
     tablet_restore_task_impl(tasks::task_manager::module_ptr module, sharded<sstables_loader>& loader, sstring ks,
-            table_id tid, sstring snap_name, manifest_summary ms) noexcept
+            table_id tid, sstring snap_name, manifest_summary ms,
+            std::optional<size_t> original_min_tablet_count, std::optional<size_t> original_max_tablet_count) noexcept
         : tasks::task_manager::task::impl(module, tasks::task_id::create_random_id(), 0, "node", ks, "", "", tasks::task_id::create_null_id())
         , _loader(loader)
         , _tid(std::move(tid))
         , _snap_name(std::move(snap_name))
         , _tablet_count(ms.tablet_count)
+        , _original_min_tablet_count(original_min_tablet_count)
+        , _original_max_tablet_count(original_max_tablet_count)
         , _progress_update_timer([this] {
             if (auto gh = _gate.try_hold()) {
                 std::ignore = update_progress().finally([this, gh = std::move(*gh)] {
@@ -1342,24 +1355,24 @@ protected:
     virtual future<> run() override {
         auto& loader = _loader.local();
 
-        auto current_schema = loader.local_db().find_schema(_tid);
-        auto min_tablet_count = current_schema->tablet_options().min_tablet_count;
-        auto max_tablet_count = current_schema->tablet_options().max_tablet_count;
         co_await loader._ss.local().alter_table_with_tablet_hints(_tid, _tablet_count, _tablet_count);
 
         std::exception_ptr eptr;
         try {
             co_await loader._ss.local().restore_tablets(_tid, _snap_name);
         } catch (...) {
-            llog.error("Failed to restore tablets for table_id {}. Error: {}", _tid, std::current_exception());
+            llog.error("Failed to restore tablets for table_id {}. Error: {:t}", _tid, std::current_exception());
             eptr = std::current_exception();
         }
 
         try {
             llog.info("Restoring table with tid {} to the original schema", _tid);
-            co_await loader._ss.local().alter_table_with_tablet_hints(_tid, min_tablet_count, max_tablet_count, false);
+            // remove_unset: the table saved nullopt because it had no hint of its own, and
+            // passing nullopt back would leave it pinned at min == max forever.
+            co_await loader._ss.local().alter_table_with_tablet_hints(_tid, _original_min_tablet_count, _original_max_tablet_count,
+                    service::wait_balancer::no, service::remove_unset::yes);
         } catch (...) {
-            llog.error("Failed to restore original schema for table_id {}. Error: {}", _tid, std::current_exception());
+            llog.error("Failed to restore original schema for table_id {}. Error: {:t}", _tid, std::current_exception());
         }
 
         if (eptr) {
@@ -1373,15 +1386,92 @@ protected:
     }
 };
 
-future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring keyspace, sstring table, sstring snap_name, sstring endpoint, sstring bucket, sstring prefix, utils::chunked_vector<sstring> manifests) {
-    auto summary = co_await populate_snapshot_sstables_from_manifests(_storage_manager, _sys_dist_ks, keyspace, table, endpoint, bucket, prefix, snap_name, std::move(manifests));
+// Every datacenter the table replicates to restores from its own backup location,
+// so the locations must map one-to-one to the replicated-to datacenters.
+static void check_datacenter_coverage(const replica::table& t, const std::vector<tablet_restore_location>& locations) {
+    auto& rs = t.get_effective_replication_map()->get_replication_strategy();
+    const auto* nts = dynamic_cast<const locator::network_topology_strategy*>(&rs);
+    if (!nts) {
+        throw std::invalid_argument(fmt::format("Table {}.{} does not use NetworkTopologyStrategy", t.schema()->ks_name(), t.schema()->cf_name()));
+    }
 
-    auto datacenter = _db.local().get_token_metadata().get_topology().get_datacenter();
+    auto replicated_dcs = nts->get_datacenters()
+        | std::views::filter([nts] (const sstring& dc) { return nts->get_replication_factor(dc) > 0; })
+        | std::ranges::to<std::set<sstring>>();
+
+    auto location_dcs = locations
+        | std::views::transform(&tablet_restore_location::datacenter)
+        | std::ranges::to<std::set<sstring>>();
+    if (location_dcs.size() != locations.size()) {
+        throw std::invalid_argument("Duplicate datacenters in backup locations");
+    }
+
+    if (location_dcs != replicated_dcs) {
+        throw std::invalid_argument(fmt::format("Backup locations datacenters [{}] don't match the datacenters [{}] keyspace {} replicates to",
+            fmt::join(location_dcs, ", "), fmt::join(replicated_dcs, ", "), t.schema()->ks_name()));
+    }
+}
+
+future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring keyspace, sstring table, sstring snap_name, std::vector<tablet_restore_location> locations) {
+    if (!_db.local().find_column_family(tid).uses_tablets()) {
+        throw std::invalid_argument(fmt::format("Table {}.{} does not use tablets", keyspace, table));
+    }
+
+    check_datacenter_coverage(_db.local().find_column_family(tid), locations);
 
     db::snapshot_table_helper sth(_sys_dist_ks.qp());
-    // TODO: update state when all restored...
-    co_await sth.insert_snapshot_remote_location(snap_name, datacenter, endpoint, bucket, prefix, db::snapshot_state::remote);
+    manifest_summary summary = { .tablet_count = 0, .nr_sstables = 0 };
 
-    auto task = co_await _task_manager_module->make_and_start_task<tablet_restore_task_impl>({}, container(), keyspace, tid, std::move(snap_name), summary);
+    for (auto& loc : locations) {
+        auto loc_summary = co_await populate_snapshot_sstables_from_manifests(_storage_manager, _sys_dist_ks, keyspace, table, loc.endpoint, loc.bucket, loc.prefix, snap_name, loc.datacenter, std::move(loc.manifests));
+        if (summary.tablet_count == 0) {
+            summary.tablet_count = loc_summary.tablet_count;
+        } else if (summary.tablet_count != loc_summary.tablet_count) {
+            throw std::runtime_error(fmt::format("Inconsistent tablet_count values across backup locations: expected {}, datacenter '{}' has {}",
+                summary.tablet_count, loc.datacenter, loc_summary.tablet_count));
+        }
+        summary.nr_sstables += loc_summary.nr_sstables;
+
+        // TODO: update state when all restored...
+        co_await sth.insert_snapshot_remote_location(snap_name, loc.datacenter, loc.endpoint, loc.bucket, loc.prefix, db::snapshot_state::remote);
+    }
+
+    // Persist the schema of the target table in system_distributed.snapshot_tables
+    // before the restore task pins the tablet hints, so the original hints survive a
+    // crash of this node. If an entry for this snapshot and table already exists, this
+    // restore either resumes an earlier attempt that may have already pinned the
+    // hints, or restores into the same table the snapshot was taken from; in both
+    // cases the original hints are recovered from the persisted schema instead of
+    // the live one.
+    auto entries = co_await sth.get_snapshot_tables(snap_name, keyspace, table, db::consistency_level::QUORUM);
+    auto t = _db.local().get_tables_metadata().get_table_if_exists(tid);
+    if (!t) {
+        throw replica::no_such_column_family(tid);
+    }
+    schema_ptr original_schema;
+    if (entries.empty()) {
+        original_schema = t->schema();
+        auto entry = sth.make_snapshot_table_entry(snap_name, *t);
+        co_await sth.insert_snapshot_tables(std::span(&entry, 1));
+    } else {
+        const auto& entry = entries.front();
+        if (entry.type != db::snapshot_table_type::cql_table) {
+            throw std::runtime_error(fmt::format("Failed to recover the pre-restore schema of table {}.{} stored for snapshot {}: the entry does not describe a CQL table (type={})",
+                keyspace, table, snap_name, static_cast<int32_t>(entry.type)));
+        }
+        try {
+            original_schema = table_helper::parse_new_cf_statement(_sys_dist_ks.qp(), entry.table_schema);
+        } catch (...) {
+            throw std::runtime_error(fmt::format("Failed to recover the pre-restore schema of table {}.{} stored for snapshot {}: {}",
+                keyspace, table, snap_name, std::current_exception()));
+        }
+        // Refresh the TTL of the entry so that repeated crash/re-issue cycles
+        // spanning a long time do not outlive it.
+        co_await sth.insert_snapshot_tables(std::span(&entry, 1));
+    }
+    auto original_hints = original_schema->tablet_options();
+
+    auto task = co_await _task_manager_module->make_and_start_task<tablet_restore_task_impl>(tasks::make_empty_task_info(), container(), keyspace, tid, std::move(snap_name), summary,
+            original_hints.min_tablet_count, original_hints.max_tablet_count);
     co_return task->id();
 }

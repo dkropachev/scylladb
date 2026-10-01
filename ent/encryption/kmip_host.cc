@@ -34,6 +34,7 @@
 #include "encryption.hh"
 #include "encryption_exceptions.hh"
 #include "symmetric_key.hh"
+#include "key_cache.hh"
 #include "utils/hash.hh"
 #include "utils/loading_cache.hh"
 #include "utils/UUID.hh"
@@ -233,14 +234,8 @@ private:
     encryption_context& _ctxt;
     sstring _name;
     host_options _options;
-    utils::loading_cache<kmip_key_info, key_and_id_type, 2,
-                    utils::loading_cache_reload_enabled::yes,
-                    utils::simple_entry_size<key_and_id_type>,
-                    kmip_key_info_hash> _attr_cache;
-
-    utils::loading_cache<id_type, ::shared_ptr<symmetric_key>, 2,
-                    utils::loading_cache_reload_enabled::yes,
-                    utils::simple_entry_size<::shared_ptr<symmetric_key>>> _id_cache;
+    attr_cache<kmip_key_info, key_and_id_type, kmip_key_info_hash> _attr_cache;
+    id_cache<id_type, ::shared_ptr<symmetric_key>> _id_cache;
 
     using connections = std::deque<con_ptr>;
     using host_to_connections = std::unordered_map<sstring, connections>;
@@ -432,7 +427,7 @@ int kmip_host::impl::connection::io_callback(KMIP *kmip, void *cb_arg, int op, v
             return conn->recv(data, len, outlen);
         }
     } catch (...) {
-        kmip_log.warn("Error in KMIP IO: {}", std::current_exception());
+        kmip_log.warn("Error in KMIP IO: {:t}", std::current_exception());
         return KMIP_ERROR_IO;
     }
 }
@@ -1099,7 +1094,7 @@ future<std::tuple<shared_ptr<symmetric_key>, kmip_host::id_type>> kmip_host::imp
     } catch (std::invalid_argument& e) {
         std::throw_with_nested(configuration_error(fmt::format("get_or_create_key: {}", e.what())));
     } catch (...) {
-        std::throw_with_nested(service_error(fmt::format("get_or_create_key: {}", std::current_exception())));
+        std::throw_with_nested(service_error(fmt::format("get_or_create_key: {:t}", std::current_exception())));
     }
 }
 
@@ -1118,7 +1113,7 @@ future<shared_ptr<symmetric_key>> kmip_host::impl::get_key_by_id(const id_type& 
     } catch (std::invalid_argument& e) {
         std::throw_with_nested(configuration_error(fmt::format("get_key_by_id: {}", e.what())));
     } catch (...) {
-        std::throw_with_nested(service_error(fmt::format("get_key_by_id: {}", std::current_exception())));
+        std::throw_with_nested(service_error(fmt::format("get_key_by_id: {:t}", std::current_exception())));
     }
 }
 

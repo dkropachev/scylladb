@@ -35,8 +35,21 @@ namespace db {
 static seastar::logger logger("raft_commitlog_replay");
 
 namespace {
-// Build a mapping from group_id to table_id using tablet metadata.
+// Build a mapping from group_id to table_id for the raft groups whose tablet this shard
+// holds a replica of.
+//
+// The ownership test is what keeps replay from applying a group's entries into a tablet
+// that has moved away: the group still exists in tablet metadata - it lives on its other
+// replicas - so its presence there says nothing about whether this shard should be
+// replaying it. has_replica() covers the old replica set and, through the transition's
+// next set, the pending replica, so a replica in the middle of joining still replays what
+// it received before the restart.
 std::unordered_map<raft::group_id, table_id> build_group_to_table_map(const locator::token_metadata& tm) {
+    const auto this_replica = locator::tablet_replica {
+        .host = tm.get_my_id(),
+        .shard = this_shard_id()
+    };
+
     std::unordered_map<raft::group_id, table_id> result;
     const auto& tablets = tm.tablets();
     for (const auto& [tid, _] : tablets.all_table_groups()) {
@@ -45,6 +58,9 @@ std::unordered_map<raft::group_id, table_id> build_group_to_table_map(const loca
             continue;
         }
         for (const auto& tablet_id : tablet_map.tablet_ids()) {
+            if (!tablet_map.has_replica(tablet_id, this_replica)) {
+                continue;
+            }
             const auto gid = tablet_map.get_tablet_raft_info(tablet_id).group_id;
             result.emplace(gid, tid);
         }
@@ -131,12 +147,25 @@ future<> raft_commitlog_replay_buffer::process_raft_replayed_items(replica::data
     }
 
     const auto token_metadata = db.get_shared_token_metadata().get();
+    if (!token_metadata->get_my_id()) {
+        // Everything below decides what to replay by asking whether this node holds a
+        // replica, so without our own host id the answer is "nothing" for every group and
+        // we would silently discard committed entries that were never flushed. The id is
+        // published into the topology config early in boot, long before replay, so this
+        // means the boot sequence changed under us. Fail loudly instead.
+        on_internal_error(logger, "processing the raft replay buffer before the local host id is known");
+    }
     const auto group_to_table = build_group_to_table_map(*token_metadata);
 
     auto* new_commitlog_ptr = db.commitlog();
     SCYLLA_ASSERT(new_commitlog_ptr);
 
     logger.info("processing {} raft groups with {} total entries from commitlog replay", remaining_groups(), total_entries());
+
+    // Shared by all groups: it resolves the table from the mutation itself, and reusing
+    // it lets entries written with the same schema version resolve their schema only once.
+    // No barrier trigger during replay, since group0 is not started yet.
+    service::strong_consistency::schema_store schemas(db, sys_ks);
 
     for (auto& [group_id, entries_list] : _replayed_commitlog_entries_by_group) {
         if (entries_list.empty()) {
@@ -146,9 +175,11 @@ future<> raft_commitlog_replay_buffer::process_raft_replayed_items(replica::data
         // Look up table_id for this group.
         auto table_it = group_to_table.find(group_id);
         if (table_it == group_to_table.end()) {
-            // Group not found in tablet metadata — the tablet may have been moved away.
-            // Discard these entries since this shard no longer owns the tablet.
-            logger.debug("group {} not found in tablet metadata, discarding {} entries", group_id, entries_list.size());
+            // Either the group is gone from tablet metadata - the table was dropped - or
+            // the tablet has no replica on this shard anymore. Discard the entries: the
+            // tablet's storage here is on its way out, and applying them would resurrect
+            // data on a node that no longer owns the range.
+            logger.info("group {} has no tablet replica on this shard, discarding {} entries", group_id, entries_list.size());
             continue;
         }
         const auto table_id = table_it->second;
@@ -156,7 +187,18 @@ future<> raft_commitlog_replay_buffer::process_raft_replayed_items(replica::data
         // Query commit_idx from raft system tables. We treat commit_idx as
         // the effective snapshot index: all entries up to commit_idx are committed
         // and will be applied to memtables during replay.
-        const auto commit_idx = co_await service::strong_consistency::raft_groups_storage::load_commit_idx(qp, group_id, this_shard_id());
+        const auto persisted_commit_idx = co_await service::strong_consistency::raft_groups_storage::load_commit_idx_if_persisted(
+                qp, group_id, this_shard_id());
+        if (!persisted_commit_idx) {
+            // Tablet cleanup erased this shard's raft state for the group, and crashed or
+            // was interrupted before it finished removing the tablet's storage; the tablet
+            // metadata we are reading is from before that. The replica has left the group,
+            // so its entries are not ours to apply - the coordinator retries the cleanup.
+            logger.info("group {} has no persisted raft state on this shard, discarding {} entries",
+                    group_id, entries_list.size());
+            continue;
+        }
+        const auto commit_idx = *persisted_commit_idx;
 
         logger.debug("group {}: {} entries, commit_idx={}", group_id, entries_list.size(), commit_idx);
 
@@ -179,11 +221,9 @@ future<> raft_commitlog_replay_buffer::process_raft_replayed_items(replica::data
             // only be deleted after the memtables are flushed. Therefore, the data will either
             // be persisted to SSTables or, in case of a crash, still be available in the old commitlog.
             if (entry->idx <= commit_idx && std::holds_alternative<raft::command>(entry->data)) {
-                utils::chunked_vector<frozen_mutation> muts;
-                muts.emplace_back(service::strong_consistency::detail::deserialize_to_frozen_mutation(entry));
-                // Resolve schema and upgrade mutation if needed (no barrier during replay).
-                auto schemas = co_await service::strong_consistency::resolve_and_upgrade_mutations(muts, table_id, db, sys_ks);
-                co_await db.apply_in_memory(muts[0], schemas[0], db::rp_handle(), db::no_timeout, db::noop_large_data_guardrail::instance());
+                auto mut = service::strong_consistency::detail::deserialize_to_frozen_mutation(entry);
+                auto schema = co_await schemas.resolve_and_upgrade(mut);
+                co_await db.apply_in_memory(mut, std::move(schema), db::rp_handle(), db::no_timeout, db::noop_large_data_guardrail::instance());
                 ++applied;
             }
 

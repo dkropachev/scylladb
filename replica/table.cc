@@ -148,7 +148,7 @@ lw_shared_ptr<const sstables::sstable_set> table::make_compound_sstable_set() co
 }
 
 lw_shared_ptr<sstables::sstable_set> compaction_group::make_maintenance_sstable_set() const {
-    return make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(_t.schema(), token_range()));
+    return make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(_t.schema()));
 }
 
 void table::refresh_compound_sstable_set() {
@@ -237,7 +237,7 @@ table::make_mutation_reader(schema_ptr s,
     }
 
     if (_logstor) [[unlikely]] {
-        return _logstor->make_reader(s, logstor_index(), std::move(permit), range, slice, std::move(trace_state));
+        return _logstor->make_reader(s, logstor_index(), std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr);
     }
 
     std::vector<mutation_reader> readers;
@@ -1372,7 +1372,7 @@ future<> tablet_storage_group_manager::maybe_split_compaction_group_of(size_t id
     if (!tablet_map().needs_split()) {
         co_return;
     }
-    tasks::task_info tablet_split_task_info{tasks::task_id{tablet_map().resize_task_info().tablet_task_id.uuid()}, 0};
+    auto tablet_split_task_info = tasks::make_cluster_task_info(tasks::task_id{tablet_map().resize_task_info().tablet_task_id.uuid()});
 
     auto sg = _storage_groups[idx];
     if (!sg) {
@@ -1815,13 +1815,13 @@ table::add_new_sstable_and_update_cache(sstables::shared_sstable new_sst,
     if (ex) {
         // on failed split, input sstable is unlinked here.
         if (new_sst) {
-            tlogger.log(failure_log_level, "Failed to load SSTable {} of origin {} due to {}, it will be unlinked...", new_sst->get_filename(), new_sst->get_origin(), ex);
+            tlogger.log(failure_log_level, "Failed to load SSTable {} of origin {} due to {:t}, it will be unlinked...", new_sst->get_filename(), new_sst->get_origin(), ex);
             co_await new_sst->unlink();
         }
         // on failure after successful split, sstables not attached yet will be unlinked
         co_await coroutine::parallel_for_each(ssts, [&ex, failure_log_level] (sstables::shared_sstable sst) -> future<> {
             if (sst) {
-                tlogger.log(failure_log_level, "Failed to load SSTable {} of origin {} due to {}, it will be unlinked...", sst->get_filename(), sst->get_origin(), ex);
+                tlogger.log(failure_log_level, "Failed to load SSTable {} of origin {} due to {:t}, it will be unlinked...", sst->get_filename(), sst->get_origin(), ex);
                 co_await sst->unlink();
             }
         });
@@ -1855,7 +1855,7 @@ table::add_new_sstables_and_update_cache(std::vector<sstables::shared_sstable> n
     if (ex) {
         co_await coroutine::parallel_for_each(new_ssts, [&ex, failure_log_level] (sstables::shared_sstable sst) -> future<> {
             if (sst) {
-                tlogger.log(failure_log_level, "Failed to load SSTable {} of origin {} due to {}, it will be unlinked...", sst->get_filename(), sst->get_origin(), ex);
+                tlogger.log(failure_log_level, "Failed to load SSTable {} of origin {} due to {:t}, it will be unlinked...", sst->get_filename(), sst->get_origin(), ex);
                 co_await sst->unlink();
             }
         });
@@ -2468,7 +2468,7 @@ table::delete_sstables_atomically(const sstable_list_permit&, std::vector<sstabl
     } catch (...) {
         // There is nothing more we can do here.
         // Any remaining SSTables will eventually be re-compacted and re-deleted.
-        tlogger.error("SSTables deletion failed: {}. Ignored.", std::current_exception());
+        tlogger.error("SSTables deletion failed: {:t}. Ignored.", std::current_exception());
     }
 }
 
@@ -2584,6 +2584,10 @@ compaction_group::do_update_sstable_sets_on_compaction_completion(compaction::co
     // to avoid a new compaction from ignoring data in the old sstables
     // if the deletion fails (note deletion of shared sstables can take
     // unbounded time, because all shards must agree on the deletion).
+
+    utils::get_local_injector().inject("update_sstable_sets_on_compaction_completion_fail", [] {
+        throw std::runtime_error{"update_sstable_sets_on_compaction_completion_fail error injection"};
+    });
 
     // make sure all old sstables belong *ONLY* to current shard before we proceed to their deletion.
     for (auto& sst : desc.old_sstables) {
@@ -2716,6 +2720,12 @@ compaction_group::do_update_sstable_sets_on_compaction_completion(compaction::co
     cache.refresh_snapshot();
 
     _t.rebuild_statistics();
+    // desc.new_gc_sstables are deliberately left out. They hold only data this
+    // compaction is dropping, they exist just long enough to keep a crash from
+    // resurrecting it, and they are released by the same compaction that
+    // created them. Their large-partition, large-row and large-collection
+    // records describe garbage, so feeding them to the guardrail would report
+    // limit violations for data that is on its way out.
     for (auto& sst : desc.new_sstables) {
         _t._large_data_guardrail->register_sstable(sst);
     }
@@ -2729,8 +2739,7 @@ compaction_group::update_sstable_sets_on_compaction_completion(compaction::compa
     // table. By the time this runs the outputs are unreachable through every other channel
     // (finish() already moved them out of the compaction, and they are sealed so ~sstable()
     // won't unlink them either), so a failure here would otherwise leak them on disk forever.
-    auto new_sstables = desc.new_sstables;
-    std::ranges::copy(desc.new_gc_sstables, std::back_inserter(new_sstables));
+    auto new_sstables = desc.all_new_sstables();
     bool attached = false;
     std::exception_ptr ex;
     try {
@@ -2781,7 +2790,7 @@ void table::try_trigger_compaction(compaction_group& cg) noexcept {
     try {
         cg.trigger_compaction();
     } catch (...) {
-        tlogger.error("Failed to trigger compaction: {}", std::current_exception());
+        tlogger.error("Failed to trigger compaction: {:t}", std::current_exception());
     }
 }
 
@@ -2853,7 +2862,7 @@ void table::trigger_offstrategy_compaction() {
     // Run in background.
     // This is safe since the the compaction task is tracked
     // by the compaction_manager until stop()
-    (void)perform_offstrategy_compaction(tasks::task_info{}).then_wrapped([this] (future<bool> f) {
+    (void)perform_offstrategy_compaction(tasks::make_empty_task_info()).then_wrapped([this] (future<bool> f) {
         if (f.failed()) {
             auto ex = f.get_exception();
             tlogger.warn("Offstrategy compaction of {}.{} failed: {}, ignoring", schema()->ks_name(), schema()->cf_name(), ex);
@@ -3451,7 +3460,7 @@ bool compaction_group::empty() const noexcept {
         && (!_logstor_state || _logstor_state->empty());
 }
 
-const schema_ptr& compaction_group::schema() const {
+const schema_ptr& compaction_group::schema() const noexcept {
     return _t.schema();
 }
 
@@ -3492,7 +3501,7 @@ table::table(schema_ptr schema, config config, lw_shared_ptr<const storage_optio
     , _compaction_manager(compaction_manager)
     , _compaction_strategy(make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
     , _logstor(logstor)
-    , _logstor_index(_schema->logstor_enabled() ? _logstor->make_primary_index(_schema, cache_enabled()) : nullptr)
+    , _logstor_index(_schema->logstor_enabled() ? _logstor->make_primary_index(cache_enabled()) : nullptr)
     , _sg_manager(make_storage_group_manager())
     , _sstables(make_compound_sstable_set())
     , _sstable_deletion_gate(format("[table {}.{}] sstable_deletion_gate", _schema->ks_name(), _schema->cf_name()))
@@ -3545,6 +3554,7 @@ bool has_size_on_leaving (locator::tablet_transition_stage stage) {
         case locator::tablet_transition_stage::streaming:                               [[fallthrough]];
         case locator::tablet_transition_stage::write_both_read_new:                     [[fallthrough]];
         case locator::tablet_transition_stage::use_new:                                 [[fallthrough]];
+        case locator::tablet_transition_stage::sc_rollback:                             [[fallthrough]];
         case locator::tablet_transition_stage::cleanup_target:                          [[fallthrough]];
         case locator::tablet_transition_stage::revert_migration:                        [[fallthrough]];
         case locator::tablet_transition_stage::rebuild_repair:                          [[fallthrough]];
@@ -3564,6 +3574,7 @@ bool has_size_on_pending (locator::tablet_transition_stage stage) {
         case locator::tablet_transition_stage::write_both_read_old:                     [[fallthrough]];
         case locator::tablet_transition_stage::write_both_read_old_fallback_cleanup:    [[fallthrough]];
         case locator::tablet_transition_stage::streaming:                               [[fallthrough]];
+        case locator::tablet_transition_stage::sc_rollback:                             [[fallthrough]];
         case locator::tablet_transition_stage::cleanup_target:                          [[fallthrough]];
         case locator::tablet_transition_stage::revert_migration:                        [[fallthrough]];
         case locator::tablet_transition_stage::rebuild_repair:
@@ -3987,7 +3998,7 @@ future<> table::update_repaired_at_for_merge() {
             }
             return filtered;
         };
-        co_await perform_component_rewrite(*sg, tasks::task_info{}, std::move(filter),
+        co_await perform_component_rewrite(*sg, tasks::make_empty_task_info(), std::move(filter),
                 sstables::component_type::Statistics, modifier);
         tlogger.info("Completed updating repaired_at={} for tablet merge in compaction group_id={} range {}",
                      new_repaired_at, id, sg->token_range());
@@ -4284,7 +4295,9 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
         std::exception_ptr ex;
 
         tlogger.debug("snapshot {}: writing schema.cql", name);
-        auto schema_desc = s->describe(replica::make_schema_describe_helper(table_shards), cql3::describe_option::STMTS);
+        // With internals, so that schema.cql records the table's dropped columns: without them, an
+        // sstable that still holds a dropped column's data is unreadable once restored.
+        auto schema_desc = s->describe(replica::make_schema_describe_helper(table_shards), cql3::describe_option::STMTS_AND_INTERNALS);
         co_await write_schema_as_cql(*writer, std::move(schema_desc)).handle_exception([&] (std::exception_ptr ptr) {
             tlogger.error("Failed writing schema file in snapshot in {} with exception {}", name, ptr);
             ex = std::move(ptr);
@@ -4773,9 +4786,6 @@ void table::set_schema(schema_ptr s) {
     if (_counter_cell_locks) {
         _counter_cell_locks->set_schema(s);
     }
-    if (_logstor_index) {
-        _logstor_index->set_schema(s);
-    }
     _schema = std::move(s);
     _large_data_guardrail = make_large_data_guardrail();
     _large_data_guardrail->rebuild(*get_sstables());
@@ -5134,6 +5144,7 @@ table::query(schema_ptr query_schema,
         auto&& range = *qs.current_partition_range++;
 
         if (!querier_opt) {
+            co_await wait_for_tablet_truncate(range);
             querier_base::querier_config conf(_config.tombstone_warn_threshold);
             querier_opt = querier(as_mutation_source(), query_schema, permit, range, qs.cmd.slice, trace_state, get_tombstone_gc_state(), conf);
         }
@@ -5188,6 +5199,7 @@ table::mutation_query(schema_ptr query_schema,
         querier_opt = std::move(*saved_querier);
     }
     if (!querier_opt) {
+        co_await wait_for_tablet_truncate(range);
         auto tombstone_gc_state = tombstone_gc_enabled ? get_tombstone_gc_state() : tombstone_gc_state::no_gc();
         querier_base::querier_config conf(_config.tombstone_warn_threshold);
         querier_opt = querier(as_mutation_source(), query_schema, permit, range, cmd.slice, trace_state, tombstone_gc_state, conf);
@@ -5287,7 +5299,8 @@ table::disable_auto_compaction() {
     auto holder = _async_gate.hold();
 
     co_await parallel_foreach_compaction_group_view([this] (compaction::compaction_group_view& view) {
-        return _compaction_manager.stop_ongoing_compactions("disable auto-compaction", &view, compaction::compaction_type::Compaction);
+        return _compaction_manager.stop_ongoing_compactions("disable auto-compaction", &view,
+                compaction::compaction_type_set::of<compaction::compaction_type::Compaction>());
     });
 
     if (uses_logstor()) {
@@ -5327,11 +5340,42 @@ table::make_mutation_reader_excluding_staging(schema_ptr s,
     return make_combined_reader(s, std::move(permit), std::move(readers), fwd, fwd_mr);
 }
 
+// Returns the sstable the table currently holds for the data of `sst`: `sst` itself if it is
+// still in the sstable set, the sstable it was cloned into by a component rewrite (incremental
+// repair marking, tablet merge) if that one is, or nullptr if the data is gone from the table
+// (tablet cleanup, already moved out of staging, or rewritten more than once since the caller
+// took its reference).
+static sstables::shared_sstable current_generation_of(const sstable_list& all, const sstables::shared_sstable& sst) {
+    if (all.contains(sst)) {
+        return sst;
+    }
+    const auto& clone = sst->cloned_to_sstable_filename();
+    if (!clone) {
+        return nullptr;
+    }
+    auto it = std::ranges::find_if(all, [&] (const sstables::shared_sstable& s) {
+        return s->component_basename(sstables::component_type::Data) == *clone;
+    });
+    return it != all.end() ? *it : nullptr;
+}
+
 future<> table::move_sstables_from_staging(std::vector<sstables::shared_sstable> sstables) {
     auto permit = co_await get_sstable_list_permit();
+    auto all = get_sstables();
     sstables::delayed_commit_changes delay_commit;
     std::unordered_set<compaction_group*> compaction_groups_to_notify;
-    for (auto sst : sstables) {
+    for (auto& registered : sstables) {
+        auto sst = current_generation_of(*all, registered);
+        if (!sst) {
+            tlogger.warn("Not moving sstable {} from staging: it is no longer part of the table", registered->get_filename());
+            continue;
+        }
+        if (sst != registered) {
+            tlogger.info("Sstable {} was rewritten into {} while in staging, moving the latter", registered->get_filename(), sst->get_filename());
+        }
+        if (!sst->requires_view_building()) {
+            continue;
+        }
         try {
             // Off-strategy can happen in parallel to view building, so the SSTable may be deleted already if the former
             // completed first.
@@ -5350,7 +5394,7 @@ future<> table::move_sstables_from_staging(std::vector<sstables::shared_sstable>
                 add_sstable_to_backlog_tracker(cg.get_backlog_tracker(), sst);
             }
         } catch (...) {
-            tlogger.warn("Failed to move sstable {} from staging: {}", sst->get_filename(), std::current_exception());
+            tlogger.warn("Failed to move sstable {} from staging: {:t}", sst->get_filename(), std::current_exception());
             throw;
         }
     }
@@ -5496,9 +5540,15 @@ compaction::compaction_backlog_tracker& compaction_group::get_backlog_tracker() 
     return *_backlog_tracker;
 }
 
+lw_shared_ptr<const sstables::sstable_set> compaction_group::sstables_for_backlog() const {
+    // The main set, not the sstables of any one view: the group has a single backlog tracker,
+    // so what it accounts for is the whole group, every repair state included.
+    return main_sstables();
+}
+
 void compaction_group::register_backlog_tracker(compaction::compaction_backlog_tracker new_backlog_tracker) {
     _backlog_tracker.emplace(std::move(new_backlog_tracker));
-    get_compaction_manager().register_backlog_tracker(*_backlog_tracker);
+    get_compaction_manager().register_backlog_tracker(*_backlog_tracker, *this);
 }
 
 compaction::compaction_manager& compaction_group::get_compaction_manager() noexcept {
@@ -5691,7 +5741,7 @@ future<> compaction_group::cleanup() {
     _t.rebuild_statistics();
 
     if (_t.uses_logstor()) {
-        co_await _t.logstor_index().erase(p_range);
+        co_await _t.logstor_index().erase(token_range());
         co_await discard_logstor_segments();
     }
 
@@ -5797,6 +5847,222 @@ future<> table::cleanup_tablet_without_deallocation(database& db, db::system_key
     co_await clear_inactive_reads_for_tablet(db, sg);
     co_await flush_compaction_groups(sg);
     co_await cleanup_compaction_groups(db, sys_ks, tid, sg);
+}
+
+// Retires the memtables of every compaction group of the tablet. The replacements are
+// built first so that the swapping loop cannot throw: while a split or a merge is in
+// progress a partition has data in more than one group, and a half-done swap would leave
+// an older version of a row visible after the newer one was dropped.
+static std::vector<shared_memtable> retire_memtables(const utils::small_vector<compaction_group_ptr, 3>& cgs) {
+    std::vector<std::vector<shared_memtable>> replacements;
+    replacements.reserve(cgs.size());
+    size_t retired_count = 0;
+    for (auto& cg : cgs) {
+        replacements.push_back(cg->memtables()->make_replacement());
+        retired_count += cg->memtables()->size();
+    }
+
+    std::vector<shared_memtable> retired;
+    retired.reserve(retired_count);
+    for (size_t i = 0; i < cgs.size(); ++i) {
+        auto old = cgs[i]->memtables()->clear_and_add(std::move(replacements[i]));
+        for (auto& mt : old) {
+            // Keeps flush_when_needed() off the retired region, as seal_active_memtable() does.
+            mt->region().ground_evictable_occupancy();
+            retired.push_back(std::move(mt));
+        }
+    }
+    return retired;
+}
+
+// Parks a new reader of a tablet whose truncate_tablet_locally() is between swapping the
+// sstables and retiring the memtables. Created then, it would read the memtables without
+// the sstables: a partition torn in two. Only new queriers wait; a paged read resuming its
+// saved querier keeps the consistent view that querier captured.
+future<> table::wait_for_tablet_truncate(const dht::partition_range& range) {
+    if (_truncating_storage_groups.empty()) [[likely]] {
+        return make_ready_future<>();
+    }
+    return _tablet_truncate_done.wait([this, &range] {
+        return std::ranges::none_of(_truncating_storage_groups, [&] (const storage_group* sg) {
+            return to_partition_range(sg->token_range()).overlaps(range, dht::ring_position_comparator(*_schema));
+        });
+    });
+}
+
+future<> table::truncate_tablet_locally(database& db, locator::tablet_id tid) {
+    auto holder = async_gate().hold();
+    auto& sg = storage_group_for_id(tid.value());
+    auto sg_holder = sg.async_gate().hold();
+    auto cgs = sg.compaction_groups_immediate();
+
+    // Compaction stays disabled until the reenablers go out of scope, so no compaction
+    // output lands in the sstable sets between capturing and swapping them. Every view has
+    // to be disabled before the first preemption point, hence parallel_for_each: otherwise
+    // set_split_mode() slips in and creates groups that cgs does not cover.
+    std::vector<compaction::compaction_group_view*> views;
+    for (auto& cg : cgs) {
+        for (auto* view : cg->all_views()) {
+            views.push_back(view);
+        }
+    }
+    std::vector<compaction::compaction_reenabler> cres;
+    cres.reserve(views.size());
+    co_await coroutine::parallel_for_each(views, [&] (compaction::compaction_group_view* view) -> future<> {
+        cres.push_back(co_await _compaction_manager.stop_and_disable_compaction("truncate", *view));
+    });
+
+    // Told apart because only the main sstables are charged to the backlog tracker below.
+    struct captured_sstables {
+        std::vector<sstables::shared_sstable> main;
+        std::vector<sstables::shared_sstable> maintenance;
+    };
+
+    // Swaps the sstable sets of all the groups in one step, for the same reason
+    // retire_memtables() swaps all the memtable lists in one.
+    class tablet_truncater : public row_cache::external_updater_impl {
+        table& _t;
+        const utils::small_vector<compaction_group_ptr, 3>& _cgs;
+        std::vector<captured_sstables>& _captured;
+        std::vector<lw_shared_ptr<sstables::sstable_set>> _empty_main_sets;
+        std::vector<lw_shared_ptr<sstables::sstable_set>> _empty_maintenance_sets;
+    public:
+        tablet_truncater(table& t, const utils::small_vector<compaction_group_ptr, 3>& cgs,
+                std::vector<captured_sstables>& captured)
+                : _t(t)
+                , _cgs(cgs)
+                , _captured(captured)
+        {
+            _empty_main_sets.reserve(_cgs.size());
+            _empty_maintenance_sets.reserve(_cgs.size());
+            for (auto& cg : _cgs) {
+                _empty_main_sets.push_back(make_lw_shared<sstables::sstable_set>(cg->make_main_sstable_set()));
+                _empty_maintenance_sets.push_back(cg->make_maintenance_sstable_set());
+            }
+        }
+        virtual future<> prepare() override {
+            // The sets cannot change before execute() swaps them out: compaction is
+            // disabled and the sstable list permit is held. Captured aside so a throw here
+            // records no live sstable as pending deletion; the transfer capacity is
+            // reserved here too, where throwing is still safe.
+            _captured.reserve(_cgs.size());
+            auto capture = [] (const lw_shared_ptr<sstables::sstable_set>& set, std::vector<sstables::shared_sstable>& out) {
+                out.reserve(set->size());
+                set->for_each_sstable([&] (const sstables::shared_sstable& sst) {
+                    out.push_back(sst);
+                });
+            };
+            for (auto& cg : _cgs) {
+                captured_sstables c;
+                capture(cg->main_sstables(), c.main);
+                capture(cg->maintenance_sstables(), c.maintenance);
+                auto& pending = cg->_sstables_compacted_but_not_deleted;
+                pending.reserve(pending.size() + c.main.size() + c.maintenance.size());
+                _captured.push_back(std::move(c));
+            }
+            return make_ready_future<>();
+        }
+        virtual void execute() override {
+            for (size_t i = 0; i < _cgs.size(); ++i) {
+                auto& cg = _cgs[i];
+                auto& pending = cg->_sstables_compacted_but_not_deleted;
+                // Copied, not moved: _captured is used again below. Reserved in prepare().
+                pending.insert(pending.end(), _captured[i].main.begin(), _captured[i].main.end());
+                pending.insert(pending.end(), _captured[i].maintenance.begin(), _captured[i].maintenance.end());
+                cg->set_main_sstables(std::move(_empty_main_sets[i]));
+                cg->set_maintenance_sstables(std::move(_empty_maintenance_sets[i]));
+            }
+            _t.refresh_compound_sstable_set();
+        }
+    };
+
+    std::vector<captured_sstables> captured;
+    std::vector<shared_memtable> old_memtables;
+    auto p_range = to_partition_range(sg.token_range());
+    {
+        // Flush permits first: a flush in progress holds one and may be waiting for the
+        // sstable list permit in update_cache(). Held until the memtables are retired, so
+        // no in-flight flush turns a memtable we are about to drop into an sstable.
+        std::optional<flush_permit> flush_permits = co_await _config.dirty_memory_manager->get_all_flush_permits();
+        auto list_permit = co_await get_sstable_list_permit();
+
+        co_await utils::get_local_injector().inject("truncate_tablet_locally_before_swap", utils::wait_for_message(std::chrono::minutes(5)));
+        {
+            // A reader created between the swap below and the retiring of the memtables
+            // would see the memtables without the sstables: a partition torn in two. New
+            // queriers wait in wait_for_tablet_truncate() until the memtables are gone.
+            _truncating_storage_groups.push_back(&sg);
+            auto reopen = defer([&] noexcept {
+                std::erase(_truncating_storage_groups, &sg);
+                _tablet_truncate_done.broadcast();
+            });
+
+            co_await _cache.invalidate(row_cache::external_updater(
+                    std::make_unique<tablet_truncater>(*this, cgs, captured)), p_range);
+            co_await utils::get_local_injector().inject("truncate_tablet_locally_before_retiring_memtables", utils::wait_for_message(std::chrono::minutes(5)));
+
+            // Retired only now, after invalidate() returned. Its cache walk is preemptible,
+            // and until it passes a partition the cache still serves that partition from an
+            // entry holding pre-swap sstable content. Retiring the memtables any earlier would
+            // let such a read return the value they were shadowing, which is neither the state
+            // before the truncate nor the state after it.
+            old_memtables = retire_memtables(cgs);
+        }
+        // In the same non-throwing stretch as the retiring: rp_set::put() already released
+        // the handles, so a later failure would pin these segments for the process lifetime.
+        for (auto& mt : old_memtables) {
+            if (commitlog()) {
+                commitlog()->discard_completed_segments(schema()->id(), mt->get_and_discard_rp_set());
+            }
+        }
+        // No flush can resurrect the retired data any more.
+        flush_permits.reset();
+        rebuild_statistics();
+
+        // A querier created before the swap reads sources that are gone, and a paged read
+        // saves it for its next page. Once every read started before the retiring is over,
+        // each such querier is either closed or saved, and the eviction drops the saved
+        // ones. Same pair as in cleanup_drop_table_on_all_shards(). After the gate above
+        // reopened, or the readers parked in it would never finish.
+        co_await await_pending_reads();
+        co_await clear_inactive_reads_for_tablet(db, sg);
+
+        // The swap changed the sstable sets and nothing else. The backlog tracker and the
+        // cleanup state learn about removals only from here, and unlike in
+        // compaction_group::cleanup() the group is not stopped afterwards.
+        for (size_t i = 0; i < cgs.size(); ++i) {
+            auto& cg = cgs[i];
+            cg->backlog_tracker_adjust_charges(captured[i].main, {});
+            for (auto& sst : captured[i].main) {
+                erase_sstable_cleanup_state(sst);
+            }
+            for (auto& sst : captured[i].maintenance) {
+                erase_sstable_cleanup_state(sst);
+            }
+        }
+
+        for (auto& cg : cgs) {
+            if (cg->_sstables_compacted_but_not_deleted.empty()) {
+                continue;
+            }
+            auto gh = _sstable_deletion_gate.hold();
+            auto deletion = make_atomic_deletion(cg->_sstables_compacted_but_not_deleted);
+            co_await deletion.commit();
+            cg->_sstables_compacted_but_not_deleted.clear();
+            co_await deletion.execute();
+        }
+        rebuild_statistics();
+    }
+
+    // Safe under a read still using one of these: iterator_reader re-derives its iterators,
+    // and invalidate() left the cache with nothing pre-truncate to pair them with. A read
+    // bypassing the cache can still see a shadowed value, as on the regular truncate path.
+    for (auto& mt : old_memtables) {
+        co_await mt->clear_gently();
+    }
+
+    tlogger.debug("Truncated tablet {} of table {}.{} locally, range {}",
+            tid, schema()->ks_name(), schema()->cf_name(), sg.token_range());
 }
 
 shard_id table::shard_for_reads(dht::token t) const {

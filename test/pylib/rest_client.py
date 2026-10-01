@@ -15,17 +15,21 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from typing import Any, Optional, AsyncIterator
 
+import pytest
 import universalasync
 from aiohttp import request, BaseConnector, ClientTimeout
 from cassandra.pool import Host                          # type: ignore # pylint: disable=no-name-in-module
-
-from test.pylib.skip_types import skip_env
 
 from test.pylib.internal_types import IPAddress, HostID
 from test.pylib.util import universalasync_typed_wrap
 
 
 logger = logging.getLogger(__name__)
+
+# The repair failure reason is a diagnostic looked up after the repair already
+# failed, so it must not hold the failure back. Bound it well below the default
+# request timeout.
+REPAIR_FAILURE_REASON_TIMEOUT = 30
 
 
 class HTTPError(Exception):
@@ -96,10 +100,11 @@ class RESTClient(metaclass=ABCMeta):
 
     async def get_json(self, resource_uri: str, host: Optional[str] = None,
                        port: Optional[int] = None, params: Optional[Mapping[str, str]] = None,
-                       allow_failed: bool = False) -> Any:
+                       allow_failed: bool = False, timeout: Optional[float] = None) -> Any:
         """Fetch URL and get JSON. Caller must check JSON content types."""
         ret = await self._fetch("GET", resource_uri, response_type = "json", host = host,
-                                port = port, params = params, allow_failed = allow_failed)
+                                port = port, params = params, allow_failed = allow_failed,
+                                timeout = timeout)
         return ret
 
     async def post(self, resource_uri: str, host: Optional[str] = None,
@@ -147,8 +152,13 @@ class TCPRESTClient(RESTClient):
 class ScyllaRESTAPIClient:
     """Async Scylla REST API client"""
 
-    def __init__(self, port: int = 10000):
+    def __init__(self, port: int = 10000, build_mode: str | None = None):
         self.client = TCPRESTClient(port)
+        # The build mode of the server this client talks to, or None when whoever
+        # created the client did not know it. A cluster test always reaches its
+        # servers through a client that knows the mode. Other clients, such as the
+        # one nodetool builds at import time, are created without it.
+        self.build_mode = build_mode
 
     async def get_host_id(self, server_ip: IPAddress) -> HostID:
         """Get server id (UUID)"""
@@ -242,6 +252,17 @@ class ScyllaRESTAPIClient:
         )
         assert isinstance(data, list)
         return data
+
+    def _fail_if_injections_unavailable(self, injection: str) -> None:
+        """Fail the test if error injections are compiled out, i.e. in release mode.
+
+           Does nothing when the client was not told the build mode, since then
+           there is nothing to check against.
+        """
+        if self.build_mode == "release":
+            pytest.fail(f"The error injection {injection} cannot be enabled because error "
+                        "injections are disabled in release mode, so the test must be marked "
+                        "with skip_mode(mode='release')")
 
     async def enable_injection(self, node_ip: str, injection: str, one_shot: bool, parameters: dict[str, Any] = {}) -> None:
         """Enable error injection named `injection` on `node_ip`. Depending on `one_shot`,
@@ -432,12 +453,7 @@ class ScyllaRESTAPIClient:
         return await self.client.post_json(f"/storage_service/restore", host=node_ip, params=params, json=sstables)
 
     async def restore_tablets(self, node_ip: str, ks: str, cf: str, snap: str, datacenter: str, endpoint: str, bucket: str, manifests, prefix: str = '') -> str:
-        """Restore tablets from a backup location"""
-        params = {
-            "keyspace": ks,
-            "table": cf,
-            "snapshot": snap
-        }
+        """Restore tablets from a single backup location"""
         backup_location = [
             {
                 "datacenter": datacenter,
@@ -447,7 +463,16 @@ class ScyllaRESTAPIClient:
                 "manifests": manifests
             }
         ]
-        return await self.client.post_json(f"/storage_service/tablets/restore", host=node_ip, params=params, json=backup_location)
+        return await self.restore_tablets_multidc(node_ip, ks, cf, snap, backup_location)
+
+    async def restore_tablets_multidc(self, node_ip: str, ks: str, cf: str, snap: str, locations: list[dict]) -> str:
+        """Restore tablets from a list of per-datacenter backup locations"""
+        params = {
+            "keyspace": ks,
+            "table": cf,
+            "snapshot": snap
+        }
+        return await self.client.post_json(f"/storage_service/tablets/restore", host=node_ip, params=params, json=locations)
 
     async def take_snapshot(self, node_ip: str, ks: str, tag: str, tables: list[str] = None, ttl: Optional[str] = None) -> None:
         """Take keyspace snapshot"""
@@ -578,6 +603,24 @@ class ScyllaRESTAPIClient:
         data = await self.client.get_json("/raft/leader_host", host=node_ip, params=params)
         return HostID(data)
 
+    async def _repair_failure_reason(self, node_ip: str, sequence_number: int) -> str:
+        """Look up why a vnode repair failed.
+
+        repair_status only reports the enum, the reason lives in the coordinator's
+        task. User started repairs are kept for user_task_ttl_in_seconds (1h by
+        default), so the error is still retrievable right after the failure. This
+        keeps a CI failure diagnosable from the test report alone, without the
+        node logs. The lookup is bounded so that an unresponsive node delays the
+        repair failure by seconds rather than by the default request timeout.
+        """
+        try:
+            tasks = await self.get_tasks(node_ip, "repair", timeout=REPAIR_FAILURE_REASON_TIMEOUT)
+            task_id = next(t["task_id"] for t in tasks if t["sequence_number"] == sequence_number)
+            status = await self.get_task_status(node_ip, task_id, timeout=REPAIR_FAILURE_REASON_TIMEOUT)
+            return status.get("error") or f"no error recorded, task state={status.get('state')}"
+        except Exception as e:
+            return f"unavailable ({type(e).__name__}: {e})"
+
     async def repair(self, node_ip: str, keyspace: str, table: str, ranges: str = '', small_table_optimization: bool = False) -> None:
         """Repair the given table and wait for it to complete"""
         vnode_keyspaces = await self.client.get_json(f"/storage_service/keyspaces", host=node_ip, params={"replication": "vnodes"})
@@ -591,7 +634,8 @@ class ScyllaRESTAPIClient:
             sequence_number = await self.client.post_json(f"/storage_service/repair_async/{keyspace}", host=node_ip, params=params)
             status = await self.client.get_json(f"/storage_service/repair_status", host=node_ip, params={"id": str(sequence_number)})
             if status != 'SUCCESSFUL':
-                raise Exception(f"Repair id {sequence_number} on node {node_ip} for table {keyspace}.{table} failed: status={status}")
+                reason = await self._repair_failure_reason(node_ip, sequence_number)
+                raise Exception(f"Repair id {sequence_number} on node {node_ip} for table {keyspace}.{table} failed: status={status}, reason={reason}")
         else:
             if ranges:
                 raise ValueError(f"Ranges parameter is not supported for tablet keyspaces")
@@ -660,11 +704,11 @@ class ScyllaRESTAPIClient:
         assert isinstance(data, list)
         return data
 
-    async def get_task_status(self, node_ip: str, task_id: str):
-        return await self.client.get_json(f'/task_manager/task_status/{task_id}', host=node_ip)
+    async def get_task_status(self, node_ip: str, task_id: str, timeout: Optional[float] = None):
+        return await self.client.get_json(f'/task_manager/task_status/{task_id}', host=node_ip, timeout=timeout)
 
-    async def get_tasks(self, node_ip: str, module: str):
-        return await self.client.get_json(f'/task_manager/list_module_tasks/{module}', host=node_ip)
+    async def get_tasks(self, node_ip: str, module: str, timeout: Optional[float] = None):
+        return await self.client.get_json(f'/task_manager/list_module_tasks/{module}', host=node_ip, timeout=timeout)
 
     async def wait_task(self, node_ip: str, task_id: str):
         return await self.client.get_json(f'/task_manager/wait_task/{task_id}', host=node_ip)
@@ -781,8 +825,8 @@ class ScyllaMetricsClient:
     def __init__(self, port: int = 9180):
         self.client = TCPRESTClient(port)
 
-    async def query(self, server_ip: IPAddress) -> ScyllaMetrics:
-        data = await self.client.get_text('/metrics', host=server_ip)
+    async def query(self, server_ip: IPAddress, timeout: Optional[float] = None) -> ScyllaMetrics:
+        data = await self.client.get_text('/metrics', host=server_ip, timeout=timeout)
         return ScyllaMetrics(data.split('\n'))
 
 
@@ -800,15 +844,21 @@ class InjectionHandler():
 async def inject_error(api: ScyllaRESTAPIClient, node_ip: IPAddress, injection: str,
                        parameters: dict[str, Any] = {}) -> AsyncIterator[InjectionHandler]:
     """Attempts to inject an error. Works only in specific build modes: debug,dev,sanitize.
-       It will trigger a test to be skipped if attempting to enable an injection has no effect.
+       It will fail a test that asks for an injection in release mode.
+       Intended for suites that start their own Scylla (e.g. cluster), so the build mode
+       is known. Suites that can run against a foreign server (e.g. cqlpy) should keep
+       their own skipping helper.
        This is a context manager for enabling and disabling when done, therefore it can't be
        used for one shot.
     """
+    api._fail_if_injections_unavailable(injection)
     await api.enable_injection(node_ip, injection, False, parameters)
     enabled = await api.get_enabled_injections(node_ip)
     logging.info(f"Error injections enabled on {node_ip}: {enabled}")
-    if not enabled:
-        skip_env("Error injection not enabled in Scylla - try compiling in dev/debug/sanitize mode")
+    # Sanity check for non-release modes.
+    if injection not in enabled:
+        pytest.fail(f"Enabling the error injection {injection} on {node_ip} had no effect. "
+                    f"Error injections enabled on the node: {enabled}")
     try:
         yield InjectionHandler(api, injection, node_ip)
     finally:
@@ -818,14 +868,17 @@ async def inject_error(api: ScyllaRESTAPIClient, node_ip: IPAddress, injection: 
 
 async def inject_error_one_shot(api: ScyllaRESTAPIClient, node_ip: IPAddress, injection: str, parameters: dict[str, Any] = {}) -> InjectionHandler:
     """Attempts to inject an error. Works only in specific build modes: debug,dev,sanitize.
-       It will trigger a test to be skipped if attempting to enable an injection has no effect.
+       It will fail a test that asks for an injection in release mode.
+       Intended for suites that start their own Scylla (e.g. cluster), so the build mode
+       is known. Suites that can run against a foreign server (e.g. cqlpy) should keep
+       their own skipping helper.
        This is a one-shot injection enable.
     """
+    api._fail_if_injections_unavailable(injection)
+    logger.info(f"Enabling one-shot error injection {injection} on {node_ip}")
     await api.enable_injection(node_ip, injection, True, parameters)
-    enabled = await api.get_enabled_injections(node_ip)
-    logging.info(f"Error injections enabled on {node_ip}: {enabled}")
-    if not enabled:
-        skip_env("Error injection not enabled in Scylla - try compiling in dev/debug/sanitize mode")
+    # We can't do the sanity check from inject_error here because the one-shot
+    # injection might be entered and disabled at this point.
     return InjectionHandler(api, injection, node_ip)
 
 
@@ -840,9 +893,9 @@ async def read_barrier(api: ScyllaRESTAPIClient, node_ip: IPAddress, group_id: O
         :param timeout: the optional timeout in seconds (for the Raft operation on the node)
     """
     params = {}
-    if group_id:
+    if group_id is not None:
         params["group_id"] = group_id
-    if timeout:
+    if timeout is not None:
         params["timeout"] = str(timeout)
 
     await api.client.post("/raft/read_barrier", host=node_ip, params=params)

@@ -266,7 +266,7 @@ SEASTAR_TEST_CASE(vector_store_client_ann_test_disabled) {
     co_await do_with_cql_env([](cql_test_env& env) -> future<> {
         auto as = abort_source_timeout();
         auto schema = co_await create_test_table(env, "ks", "vs");
-        auto& vs = env.local_qp().vector_store_client();
+        auto& vs = env.vector_store_client().local();
 
         auto keys = co_await vs.ann("ks", "idx", schema, std::vector<float>{0.1, 0.2, 0.3}, 2, rjson::empty_object(), as.reset());
         BOOST_REQUIRE(!keys);
@@ -281,7 +281,7 @@ SEASTAR_TEST_CASE(vector_store_client_test_ann_addr_unavailable) {
             [](cql_test_env& env) -> future<> {
                 auto schema = co_await create_test_table(env, "ks", "vs");
                 auto as = abort_source_timeout();
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs)
                         .with_dns_refresh_interval(seconds(1))
                         .with_dns({{"bad.authority.here", std::nullopt}})
@@ -304,7 +304,7 @@ SEASTAR_TEST_CASE(vector_store_client_test_ann_service_unavailable) {
             [&server](cql_test_env& env) -> future<> {
                 auto schema = co_await create_test_table(env, "ks", "vs");
                 auto as = abort_source_timeout();
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns_refresh_interval(seconds(1)).with_dns({{"good.authority.here", server->host()}});
 
                 vs.start_background_tasks();
@@ -327,7 +327,7 @@ SEASTAR_TEST_CASE(vector_store_client_test_ann_service_aborted) {
             [&server](cql_test_env& env) -> future<> {
                 auto schema = co_await create_test_table(env, "ks", "vs");
                 auto as = abort_source_timeout();
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns_refresh_interval(milliseconds(10)).with_dns_resolver([&server](auto const& host) -> future<std::optional<inet_address>> {
                     BOOST_CHECK_EQUAL(host, "good.authority.here");
                     co_await sleep(milliseconds(100));
@@ -355,7 +355,7 @@ SEASTAR_TEST_CASE(vector_store_client_test_ann_request) {
             [&server](cql_test_env& env) -> future<> {
                 auto schema = co_await create_test_table(env, "ks", "idx");
                 auto as = abort_source_timeout();
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns_refresh_interval(seconds(1)).with_dns({{"good.authority.here", "127.0.0.1"}});
 
                 vs.start_background_tasks();
@@ -378,6 +378,16 @@ SEASTAR_TEST_CASE(vector_store_client_test_ann_request) {
                 BOOST_REQUIRE(!server->ann_requests().empty());
                 BOOST_REQUIRE_EQUAL(server->ann_requests().back().body, R"({"vector":[0.1,0.2,0.3],"limit":2})");
                 BOOST_REQUIRE_EQUAL(server->ann_requests().back().path, "/api/v1/indexes/ks/idx/ann");
+                BOOST_REQUIRE(!keys);
+                BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(keys.error()));
+
+                // with routing explicitly disabled (as Alternator does), "routing":false
+                // must be sent; with the default (routing enabled, as CQL relies on),
+                // the field is omitted entirely, as checked above.
+                keys = co_await vs.ann(
+                        "ks", "idx", schema, std::vector<float>{0.1, 0.2, 0.3}, 2, rjson::empty_object(), as.reset(), /*routing=*/false);
+                BOOST_REQUIRE(!server->ann_requests().empty());
+                BOOST_REQUIRE_EQUAL(server->ann_requests().back().body, R"({"vector":[0.1,0.2,0.3],"limit":2,"routing":false})");
                 BOOST_REQUIRE(!keys);
                 BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(keys.error()));
 
@@ -427,6 +437,97 @@ SEASTAR_TEST_CASE(vector_store_client_test_ann_request) {
             });
 }
 
+/// ann()'s return_columns parameter, and the "column_values" member the
+/// vector store replies with for it.
+SEASTAR_TEST_CASE(vector_store_client_test_ann_column_values) {
+    auto server = co_await make_vs_mock_server();
+    auto cfg = make_config();
+    cfg.db_config->vector_store_primary_uri.set(format("http://good.authority.here:{}", server->port()));
+    co_await do_with_cql_env(
+            [&server](cql_test_env& env) -> future<> {
+                auto schema = co_await create_test_table(env, "ks", "idx");
+                auto as = abort_source_timeout();
+                auto& vs = env.vector_store_client().local();
+                configure(vs).with_dns_refresh_interval(seconds(1)).with_dns({{"good.authority.here", "127.0.0.1"}});
+
+                vs.start_background_tasks();
+
+                // The two-row "primary_keys"/"similarity_scores" part shared by
+                // all the replies below - only their "column_values" differs.
+                constexpr auto KEYS_AND_SCORES = R"("primary_keys":{"pk1":[5,6],"pk2":[7,8],"ck1":[9,1],"ck2":[2,3]},"similarity_scores":[0.1,0.2])";
+                auto const return_columns = std::vector<std::string>{"a", "b"};
+                auto ann = [&](const sstring& column_values) {
+                    server->next_ann_response({status_type::ok, format("{{{},{}}}", KEYS_AND_SCORES, column_values)});
+                    return vs.ann("ks", "idx", schema, std::vector<float>{0.1, 0.2, 0.3}, 2, rjson::empty_object(), as.reset(),
+                            /*routing=*/false, return_columns);
+                };
+
+                // correct reply - the requested columns are sent in the request,
+                // and their values returned in each key's column_values. A null
+                // (here, "a" in the second row) means the column had no stored
+                // value for that row, and is left out of the map.
+                auto keys = co_await ann(R"("column_values":{"a":["x",null],"b":[1,2]})");
+                BOOST_REQUIRE(!server->ann_requests().empty());
+                BOOST_REQUIRE_EQUAL(
+                        server->ann_requests().back().body, R"({"vector":[0.1,0.2,0.3],"limit":2,"routing":false,"return_columns":["a","b"]})");
+                BOOST_REQUIRE(keys);
+                BOOST_REQUIRE_EQUAL(keys->size(), 2);
+                BOOST_REQUIRE_EQUAL(keys->at(0).column_values.size(), 2);
+                BOOST_CHECK_EQUAL(rjson::print(keys->at(0).column_values.at("a")), R"("x")");
+                BOOST_CHECK_EQUAL(rjson::print(keys->at(0).column_values.at("b")), "1");
+                BOOST_REQUIRE_EQUAL(keys->at(1).column_values.size(), 1);
+                BOOST_CHECK_EQUAL(rjson::print(keys->at(1).column_values.at("b")), "2");
+
+                // a requested column missing from "column_values" entirely means
+                // it had no stored value in any of the rows - not an error.
+                keys = co_await ann(R"("column_values":{"b":[1,2]})");
+                BOOST_REQUIRE(keys);
+                BOOST_REQUIRE_EQUAL(keys->size(), 2);
+                BOOST_REQUIRE_EQUAL(keys->at(0).column_values.size(), 1);
+                BOOST_CHECK_EQUAL(rjson::print(keys->at(0).column_values.at("b")), "1");
+
+                // but a column which *is* there must be an array with an entry
+                // for every row - anything else is a malformed reply, and must
+                // not be silently read as "no value for this row".
+                keys = co_await ann(R"("column_values":{"a":42,"b":[1,2]})");
+                BOOST_REQUIRE(!keys);
+                BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(keys.error()));
+
+                keys = co_await ann(R"("column_values":{"a":{"x":1},"b":[1,2]})");
+                BOOST_REQUIRE(!keys);
+                BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(keys.error()));
+
+                keys = co_await ann(R"("column_values":{"a":["x"],"b":[1,2]})");
+                BOOST_REQUIRE(!keys);
+                BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(keys.error()));
+
+                // "column_values" is required when return_columns isn't empty,
+                // and must be an object
+                keys = co_await ann(R"("column_values1":{"a":["x","y"],"b":[1,2]})");
+                BOOST_REQUIRE(!keys);
+                BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(keys.error()));
+
+                keys = co_await ann(R"("column_values":[])");
+                BOOST_REQUIRE(!keys);
+                BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(keys.error()));
+
+                // with no return_columns (CQL's use of ann()) nothing is asked
+                // for and nothing is parsed, even if the reply does have a
+                // (here, malformed) "column_values"
+                server->next_ann_response({status_type::ok, format(R"({{{},"column_values":{{"a":42}}}})", KEYS_AND_SCORES)});
+                keys = co_await vs.ann("ks", "idx", schema, std::vector<float>{0.1, 0.2, 0.3}, 2, rjson::empty_object(), as.reset());
+                BOOST_REQUIRE_EQUAL(server->ann_requests().back().body, R"({"vector":[0.1,0.2,0.3],"limit":2})");
+                BOOST_REQUIRE(keys);
+                BOOST_REQUIRE_EQUAL(keys->size(), 2);
+                BOOST_CHECK(keys->at(0).column_values.empty());
+                BOOST_CHECK(keys->at(1).column_values.empty());
+            },
+            cfg)
+            .finally([&server] {
+                return server->stop();
+            });
+}
+
 SEASTAR_TEST_CASE(vector_store_client_test_filtering_ann_request) {
     auto server = co_await make_vs_mock_server();
     auto cfg = make_config();
@@ -435,7 +536,7 @@ SEASTAR_TEST_CASE(vector_store_client_test_filtering_ann_request) {
             [&server](cql_test_env& env) -> future<> {
                 auto schema = co_await create_test_table(env, "ks", "idx");
                 auto as = abort_source_timeout();
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns_refresh_interval(seconds(1)).with_dns({{"good.authority.here", "127.0.0.1"}});
 
                 vs.start_background_tasks();
@@ -469,7 +570,7 @@ SEASTAR_TEST_CASE(vector_store_client_test_filtering_ann_cql) {
                 co_await env.execute_cql("CREATE CUSTOM INDEX embedding_idx ON ks.idx (embedding) USING 'vector_index'");
                 co_await env.execute_cql("INSERT INTO ks.idx (pk1, pk2, ck1, ck2, embedding) VALUES (5, 7, 9, 2, [0.1, 0.2, 0.3])");
 
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{"good.authority.here", "127.0.0.1"}});
                 vs.start_background_tasks();
 
@@ -570,7 +671,7 @@ SEASTAR_TEST_CASE(vector_store_client_uri_update) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 constexpr auto DNS_REFRESH_INTERVAL = std::chrono::milliseconds(10);
                 configure(vs).with_dns_refresh_interval(DNS_REFRESH_INTERVAL).with_dns({{"good.authority.here", "127.0.0.1"}});
 
@@ -605,7 +706,7 @@ SEASTAR_TEST_CASE(vector_store_client_multiple_ips_high_availability) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{"good.authority.here", std::vector<std::string>{unavail_s->host(), responding_s->host()}}});
                 vs.start_background_tasks();
                 std::expected<vector_store_client::primary_keys, vector_store_client::ann_error> keys;
@@ -639,7 +740,7 @@ SEASTAR_TEST_CASE(vector_store_client_multiple_ips_load_balancing) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{"good.authority.here", std::vector<std::string>{s1->host(), s2->host()}}});
                 vs.start_background_tasks();
 
@@ -670,7 +771,7 @@ SEASTAR_TEST_CASE(vector_store_client_multiple_uris_high_availability) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{"s1.node", std::vector<std::string>{unavail_s->host()}}, {"s2.node", std::vector<std::string>{responding_s->host()}}});
                 vs.start_background_tasks();
                 std::expected<vector_store_client::primary_keys, vector_store_client::ann_error> keys;
@@ -704,7 +805,7 @@ SEASTAR_TEST_CASE(vector_store_client_multiple_uris_load_balancing) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{"s1.node", std::vector<std::string>{s1->host()}}, {"s2.node", std::vector<std::string>{s2->host()}}});
                 vs.start_background_tasks();
 
@@ -734,7 +835,7 @@ SEASTAR_TEST_CASE(vector_search_metrics_test) {
                 auto schema = co_await create_test_table(env, "ks", "test");
                 auto result = co_await env.execute_cql("CREATE CUSTOM INDEX idx ON ks.test (embedding) USING 'vector_index'");
                 result.get()->throw_if_exception();
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure{vs};
                 vs.start_background_tasks();
 
@@ -757,7 +858,7 @@ SEASTAR_TEST_CASE(vector_store_client_node_recovery_after_backoff) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{HOSTNAME, std::vector<std::string>{unavail_server->host()}}});
                 vs.start_background_tasks();
 
@@ -799,7 +900,7 @@ SEASTAR_TEST_CASE(vector_store_client_single_status_check_after_concurrent_failu
                 constexpr auto NUM_OF_PARALLEL_REQUESTS = 50;
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{"unavail.node", std::vector<std::string>{unavail_s->host()}}});
                 vs.start_background_tasks();
 
@@ -839,7 +940,7 @@ SEASTAR_TEST_CASE(vector_store_client_updates_backoff_max_time_from_read_connect
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{"unavail.node", std::vector<std::string>{unavail_s->host()}}});
                 vs.start_background_tasks();
 
@@ -887,7 +988,7 @@ SEASTAR_TEST_CASE(vector_store_client_secondary_uri) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns(
                         {{"primary.node", std::vector<std::string>{primary->host()}}, {"secondary.node", std::vector<std::string>{secondary->host()}}});
                 vs.start_background_tasks();
@@ -911,7 +1012,7 @@ SEASTAR_TEST_CASE(vector_store_client_secondary_uri_only) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{"secondary.node", std::vector<std::string>{secondary->host()}}});
                 vs.start_background_tasks();
 
@@ -935,7 +1036,7 @@ SEASTAR_TEST_CASE(vector_store_client_https) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{certs.server_cert_cn(), std::vector<std::string>{server->host()}}});
                 vs.start_background_tasks();
 
@@ -1017,7 +1118,7 @@ SEASTAR_TEST_CASE(vector_store_client_https_wrong_hostname) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{hostname, std::vector<std::string>{server->host()}}});
                 vs.start_background_tasks();
 
@@ -1043,7 +1144,7 @@ SEASTAR_TEST_CASE(vector_store_client_https_wrong_cacert_verification_error) {
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{certs.server_cert_cn(), std::vector<std::string>{server->host()}}});
                 vs.start_background_tasks();
 
@@ -1070,7 +1171,7 @@ SEASTAR_TEST_CASE(vector_store_client_https_wrong_cacert_verification_error_host
             [&](cql_test_env& env) -> future<> {
                 auto as = abort_source_timeout();
                 auto schema = co_await create_test_table(env, "ks", "idx");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{server->host(), std::vector<std::string>{server->host()}}});
                 vs.start_background_tasks();
 
@@ -1099,7 +1200,7 @@ SEASTAR_TEST_CASE(vector_store_client_high_availability_unreachable) {
     co_await do_with_cql_env(
             [&](cql_test_env& env) -> future<> {
                 auto schema = co_await create_test_table(env, "ks", "test");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns(
                         {{"unreachable.node", std::vector<std::string>{unreachable.host}}, {"server.node", std::vector<std::string>{server->host()}}});
                 vs.start_background_tasks();
@@ -1132,7 +1233,7 @@ SEASTAR_TEST_CASE(vector_store_client_abort_due_to_query_timeout) {
     co_await do_with_cql_env(
             [&](cql_test_env& env) -> future<> {
                 auto schema = co_await create_test_table(env, "ks", "test");
-                auto& vs = env.local_qp().vector_store_client();
+                auto& vs = env.vector_store_client().local();
                 configure(vs).with_dns({{"server.node", std::vector<std::string>{server->host()}}});
                 vs.start_background_tasks();
                 auto result = co_await env.execute_cql("CREATE CUSTOM INDEX idx ON ks.test (embedding) USING 'vector_index'");
@@ -1194,6 +1295,12 @@ SEASTAR_TEST_CASE(vector_store_client_test_bm25_request) {
     BOOST_CHECK_EQUAL(err->status, status_type::not_found);
     BOOST_CHECK_EQUAL(err->message, "idx2 not found");
 
+    // the reply is not an object - service should return format error
+    server->next_search_response({status_type::ok, R"([])"});
+    keys = co_await vs.bm25("ks", "idx", schema, "hello world", 2, as.reset());
+    BOOST_REQUIRE(!keys);
+    BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(keys.error()));
+
     // missing primary_keys in the reply - service should return format error
     server->next_search_response({status_type::ok, R"({"primary_keys1":{"pk1":[5,6],"pk2":[7,8],"ck1":[9,1],"ck2":[2,3]},"scores":[0.1,0.2]})"});
     keys = co_await vs.bm25("ks", "idx", schema, "hello world", 2, as.reset());
@@ -1245,6 +1352,120 @@ SEASTAR_TEST_CASE(vector_store_client_test_bm25_request) {
     BOOST_CHECK_EQUAL(seastar::format("{}", keys->at(0).clustering.explode()), "[09, 02]");
     BOOST_CHECK_EQUAL(seastar::format("{}", keys->at(1).partition.key().explode()), "[06, 08]");
     BOOST_CHECK_EQUAL(seastar::format("{}", keys->at(1).clustering.explode()), "[01, 03]");
+
+    co_await vs.stop();
+    co_await server->stop();
+}
+
+SEASTAR_TEST_CASE(vector_store_client_test_highlight_aborted) {
+    auto server = co_await make_unavailable_server();
+    auto cfg = config();
+    cfg.vector_store_primary_uri.set(format("http://good.authority.here:{}", server->port()));
+    auto vs = vector_store_client{cfg};
+    auto as = abort_source_timeout();
+    configure(vs).with_dns_refresh_interval(milliseconds(10)).with_dns_resolver([&server](auto const& host) -> future<std::optional<inet_address>> {
+        BOOST_CHECK_EQUAL(host, "good.authority.here");
+        co_await sleep(milliseconds(100));
+        co_return inet_address(server->host());
+    });
+
+    vs.start_background_tasks();
+
+    auto fragments = co_await vs.highlight("ks", "idx", "hello world", {"hello there", "world at large"}, as.reset(milliseconds(10)));
+    BOOST_REQUIRE(!fragments);
+    BOOST_CHECK(std::holds_alternative<vector_store_client::aborted>(fragments.error()));
+
+    co_await vs.stop();
+    co_await server->stop();
+}
+
+SEASTAR_TEST_CASE(vector_store_client_test_highlight_request) {
+    auto server = co_await make_vs_mock_server(vs_mock_server::mode::highlight);
+    auto cfg = config();
+    cfg.vector_store_primary_uri.set(format("http://good.authority.here:{}", server->port()));
+    auto vs = vector_store_client{cfg};
+    auto as = abort_source_timeout();
+    configure(vs).with_dns_refresh_interval(seconds(1)).with_dns({{"good.authority.here", "127.0.0.1"}});
+
+    vs.start_background_tasks();
+
+    // the query and every document must reach the request JSON-escaped - the C++ literals below
+    // hold real quote, backslash and newline characters
+    auto fragments = co_await vs.highlight("ks", "idx", "quote\"back\\slash\nnewline", {"a \"quoted\" doc", "second"}, as.reset());
+    BOOST_REQUIRE(!server->search_requests().empty());
+    BOOST_REQUIRE_EQUAL(server->search_requests().back().body,
+            R"({"query":"quote\"back\\slash\nnewline","documents":["a \"quoted\" doc","second"]})");
+    BOOST_REQUIRE(fragments);
+
+    // server responds with 404 - client should return service_error
+    server->next_search_response({status_type::not_found, "idx2 not found"});
+    fragments = co_await vs.highlight("ks", "idx2", "fox", {"a fox jumped", "second"}, as.reset());
+    BOOST_REQUIRE_EQUAL(server->search_requests().back().path, "/api/v1/indexes/ks/idx2/highlight");
+    BOOST_REQUIRE(!fragments);
+    auto* err = std::get_if<vector_store_client::service_error>(&fragments.error());
+    BOOST_CHECK(err != nullptr);
+    BOOST_CHECK_EQUAL(err->status, status_type::not_found);
+    BOOST_CHECK_EQUAL(err->message, "idx2 not found");
+
+    // a reply that is not JSON at all - service should return format error
+    server->next_search_response({status_type::ok, "not json"});
+    fragments = co_await vs.highlight("ks", "idx", "fox", {"a fox jumped", "second"}, as.reset());
+    BOOST_REQUIRE(!fragments);
+    BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(fragments.error()));
+
+    // the reply is not an object - service should return format error
+    server->next_search_response({status_type::ok, R"([])"});
+    fragments = co_await vs.highlight("ks", "idx", "fox", {"a fox jumped", "second"}, as.reset());
+    BOOST_REQUIRE(!fragments);
+    BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(fragments.error()));
+
+    // no 'highlights' member in the reply - service should return format error
+    server->next_search_response({status_type::ok, R"({"highlights1":["a <b>fox</b> jumped",null]})"});
+    fragments = co_await vs.highlight("ks", "idx", "fox", {"a fox jumped", "second"}, as.reset());
+    BOOST_REQUIRE(!fragments);
+    BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(fragments.error()));
+
+    // highlights is not an array - service should return format error
+    server->next_search_response({status_type::ok, R"({"highlights":"a <b>fox</b> jumped"})"});
+    fragments = co_await vs.highlight("ks", "idx", "fox", {"a fox jumped", "second"}, as.reset());
+    BOOST_REQUIRE(!fragments);
+    BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(fragments.error()));
+
+    // fewer fragments than documents sent - the two are matched by position and by nothing else,
+    // so a reply of a different length says nothing about which document each one came from
+    server->next_search_response({status_type::ok, R"({"highlights":["a <b>fox</b> jumped"]})"});
+    fragments = co_await vs.highlight("ks", "idx", "fox", {"a fox jumped", "second"}, as.reset());
+    BOOST_REQUIRE(!fragments);
+    BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(fragments.error()));
+
+    // more fragments than documents sent - likewise
+    server->next_search_response({status_type::ok, R"({"highlights":["a <b>fox</b> jumped",null,null]})"});
+    fragments = co_await vs.highlight("ks", "idx", "fox", {"a fox jumped", "second"}, as.reset());
+    BOOST_REQUIRE(!fragments);
+    BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(fragments.error()));
+
+    // a fragment that is neither a string nor null - service should return format error
+    server->next_search_response({status_type::ok, R"({"highlights":["a <b>fox</b> jumped",7]})"});
+    fragments = co_await vs.highlight("ks", "idx", "fox", {"a fox jumped", "second"}, as.reset());
+    BOOST_REQUIRE(!fragments);
+    BOOST_CHECK(std::holds_alternative<vector_store_client::service_reply_format_error>(fragments.error()));
+
+    // correct reply - a fragment for the document that matched, and an absent one for the document
+    // the index found nothing worth marking in
+    server->next_search_response({status_type::ok, CORRECT_HIGHLIGHT_RESPONSE});
+    fragments = co_await vs.highlight("ks", "idx", "fox", {"a fox jumped", "second"}, as.reset());
+    BOOST_REQUIRE(fragments);
+    BOOST_REQUIRE_EQUAL(fragments->size(), 2);
+    BOOST_REQUIRE(fragments->at(0).has_value());
+    BOOST_CHECK_EQUAL(*fragments->at(0), "a <b>fox</b> jumped");
+    BOOST_CHECK(!fragments->at(1).has_value());
+
+    // an empty document list is still a well-formed request, answered with no fragments
+    server->next_search_response({status_type::ok, R"({"highlights":[]})"});
+    fragments = co_await vs.highlight("ks", "idx", "fox", {}, as.reset());
+    BOOST_REQUIRE(fragments);
+    BOOST_CHECK(fragments->empty());
+    BOOST_CHECK_EQUAL(server->search_requests().back().body, R"({"query":"fox","documents":[]})");
 
     co_await vs.stop();
     co_await server->stop();

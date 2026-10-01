@@ -19,6 +19,7 @@
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/coroutine/try_future.hh>
 #include <seastar/util/defer.hh>
 #include "seastarx.hh"
 #include "error.hh"
@@ -396,6 +397,8 @@ future<std::string> server::verify_signature(const request& req, const chunked_c
         signed_headers_map.emplace(header, std::string_view());
     }
     std::vector<std::string> modified_values;
+    // The map values below point into this vector, so its elements must not move.
+    modified_values.reserve(signed_headers_map.size());
     for (auto& header : req._headers) {
         std::string header_str;
         header_str.resize(header.first.size());
@@ -650,6 +653,27 @@ read_entire_stream(input_stream<char>& inp, size_t length_limit) {
     co_return ret;
 }
 
+// Reads and discards the body of a request we reject without processing,
+// so that the connection remains reusable. Replying while the body is
+// unread results in Seastar's HTTP server closing the connection.
+static future<> drain_request_body(input_stream<char>& inp, size_t request_size_limit) {
+    size_t drained = 0;
+    while (drained <= request_size_limit) {
+        temporary_buffer<char> buf = co_await inp.read();
+        if (buf.empty()) {
+            co_return;
+        }
+        drained += buf.size();
+    }
+    // Exceeding the limit while draining is possible only for a chunked
+    // request - a non-chunked one is bounded by its Content-Length, which
+    // was checked against the limit before the drain. Seastar's httpd will
+    // close the connection after sending the reply, as it does for any
+    // reply sent before reading the entire body (the client may rarely
+    // miss the reply - see #12166).
+    throw api_error::payload_too_large(fmt::format("Request body exceeds the request size limit of {} bytes", request_size_limit));
+}
+
 // safe_gzip_stream is an exception-safe wrapper for zlib's z_stream.
 // The "z_stream" struct is used by zlib to hold state while decompressing a
 // stream of data. It allocates memory which must be freed with inflateEnd(),
@@ -772,7 +796,12 @@ future<executor::request_return_type> server::handle_api_request(std::unique_ptr
     // (transport/server.cc).
     if (_pending_requests.get_count() >= _max_concurrent_requests) {
         _executor._stats.requests_shed++;
-        co_return api_error::request_limit_exceeded(format("too many in-flight requests (configured via max_concurrent_requests_per_shard): {}", _pending_requests.get_count()));
+        // Build the msg early, before the co_await below invalidates the request counter.
+        auto err = api_error::request_limit_exceeded(format("too many in-flight requests (configured via max_concurrent_requests_per_shard): {}", _pending_requests.get_count()));
+        // Discard the unread request body before replying, so the connection stays reusable
+        throwing_assert(req->content_stream);
+        co_await coroutine::try_future(drain_request_body(*req->content_stream, request_content_length_limit));
+        co_return std::move(err);
     }
     _pending_requests.enter();
     auto leave = defer([this] () noexcept { _pending_requests.leave(); });
@@ -998,6 +1027,9 @@ server::server(executor& exec, service::storage_proxy& proxy, gms::gossiper& gos
         {"Query", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
             return e.query(client_state, std::move(trace_state), std::move(permit), std::move(json_request), audit_info);
         }},
+        {"SearchVectors", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
+            return e.search_vectors(client_state, std::move(trace_state), std::move(permit), std::move(json_request), audit_info);
+        }},
         {"TagResource", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
             return e.tag_resource(client_state, std::move(permit), std::move(json_request), audit_info);
         }},
@@ -1027,6 +1059,14 @@ server::server(executor& exec, service::storage_proxy& proxy, gms::gossiper& gos
         }},
         {"DescribeContinuousBackups", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
             return e.describe_continuous_backups(client_state, std::move(permit), std::move(json_request), audit_info);
+        }},
+        {"ExportTableToPointInTime", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
+            return e.export_table_to_point_in_time(client_state, std::move(permit), std::move(json_request), audit_info);
+        }},
+        {"UpdateContinuousBackups", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req, std::unique_ptr<audit::audit_info_alternator>& audit_info) -> future<executor::request_return_type> {
+            ++e._stats.unsupported_operations;
+            ++e._stats.api_operations.update_continuous_backups;
+            return make_ready_future<executor::request_return_type>(api_error::unknown_operation("Unsupported operation UpdateContinuousBackups - scylla doesn't support continuous backups and the call is not required for ExportTableToPointInTime to work."));
         }},
     } {
 }
@@ -1062,6 +1102,11 @@ future<> server::init(net::inet_address addr, std::optional<uint16_t> port, std:
     }
     return seastar::async([this, addr, port, https_port, port_proxy_protocol, https_port_proxy_protocol, creds] {
         _executor.start().get();
+
+        // Bound the request line and headers which Seastar's HTTP server
+        // buffers in memory before our handler ever runs.
+        _http_server.set_request_size_limit(request_line_and_headers_limit);
+        _https_server.set_request_size_limit(request_line_and_headers_limit);
 
         // Apply current config values and register observers for live updates
         // before listen() so that no responses are ever sent with stale defaults.

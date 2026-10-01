@@ -117,6 +117,18 @@ public:
     // state machine implementations shouldn't care whether an entry was applied via
     // `state_machine::apply` or via a snapshot load.
     //
+    // When forwarding is disabled, `add_entry` guarantees that entries will be appended
+    // to the log in the same order in which the `add_entry` calls were issued.
+    // More precisely, if `add_entry(A)` is called before `add_entry(B)` - without
+    // waiting for A's future before starting the call for B - the command A
+    // will be placed in the log before B (assuming that both are successfully
+    // appended).
+    //
+    // Moreover, when forwarding is disabled, `add_entry` guarantees that entries
+    // will be appended only in the term that was current at the moment when
+    // `add_entry` was called. If the term changes before the function manages
+    // to append the entry, a `raft::not_a_leader` exception will be thrown.
+    //
     // Exceptions:
     // raft::commit_status_unknown
     //     Thrown if the leader has changed and the log entry has either
@@ -247,6 +259,10 @@ public:
     virtual future<> read_barrier(seastar::abort_source* as) = 0;
 
     // Initiate leader stepdown process.
+    // If target is specified, the leadership transfer will be attempted to that target only.
+    // The target must be a voting member of the current configuration other than the leader
+    // itself. With any other target the transfer has no one to hand leadership to: it blocks the
+    // group's writes until the timeout expires, then throws raft::timeout_error.
     //
     // Exceptions:
     // raft::timeout_error
@@ -257,7 +273,7 @@ public:
     //     Thrown if there is no other voting member.
     // std::logic_error
     //     Thrown if the stepdown process is already in progress.
-    virtual future<> stepdown(logical_clock::duration timeout) = 0;
+    virtual future<> stepdown(logical_clock::duration timeout, server_id target = {}) = 0;
 
     // Register metrics for this server. Metric are global but their names
     // depend on the server's ID, so it is possible to register metrics
@@ -297,6 +313,12 @@ public:
     // `current_leader()` function and retry `wait_for_leader()` if it returns an empty
     // `raft::server_id`.
     //
+    // With `reset`, a follower first forgets the leader it knows of, so the future
+    // resolves only once a leader sends it a message again. For a caller which knows
+    // from outside of raft that the leader `current_leader()` names is gone - e.g. it
+    // was removed from the configuration - but this server hasn't heard from the new
+    // leader yet. `reset` does nothing on a leader or a candidate.
+    //
     // The caller may pass a pointer to an abort_source to make the function abortable.
     // If it passes nullptr, the function is unabortable.
     //
@@ -305,7 +327,7 @@ public:
     //     Thrown if abort() was called on the server instance.
     // raft::request_aborted
     //     Thrown if abort is requested before the operation finishes.
-    virtual future<> wait_for_leader(seastar::abort_source* as) = 0;
+    virtual future<> wait_for_leader(seastar::abort_source* as, bool reset = false) = 0;
 
     // Manually trigger snapshot creation and log truncation.
     //
@@ -331,7 +353,6 @@ public:
     virtual void elapse_election() = 0;
     // Server id of this server
     virtual raft::server_id id() const = 0;
-    virtual void set_applier_queue_max_size(size_t queue_max_size) = 0;
 
     virtual size_t max_command_size() const = 0;
 };

@@ -6,7 +6,11 @@
 # by boto3, in order to allow non-validated input to get through
 
 import base64
+import http.client
 import json
+import time
+import urllib.parse
+
 import pytest
 import requests
 import urllib3
@@ -15,7 +19,8 @@ from packaging.version import Version
 
 from test.pylib.skip_types import skip_env
 
-from test.alternator.util import random_bytes, random_string, get_signed_request, manual_request, ManualRequestError
+from test.alternator.util import random_bytes, random_string, get_signed_request, client_ssl_context, manual_request, ManualRequestError
+from test.cqlpy.util import config_value_context
 
 
 def gen_json(n):
@@ -149,7 +154,6 @@ def test_too_large_request_content_length(dynamodb, test_table, mb):
 # we can use the same limit too. In all useful cases, headers will be
 # much shorter.
 # Reproduces #23438.
-@pytest.mark.xfail(reason="issue #23438")
 def test_too_large_request_headers(dynamodb, test_table):
     # First prepare a valid signed request, which works:
     req = get_signed_request(dynamodb, 'PutItem',
@@ -164,13 +168,14 @@ def test_too_large_request_headers(dynamodb, test_table):
     response = requests.post(req.url, headers=headers, data=req.body, verify=False, cert=req.cert)
     assert response.status_code == 200
     # Finally, make the two extra headers long - totaling more than 16 KB.
-    # The request should now fail with a 400 Bad Request. Although such a
-    # 400 Bad Request could have many reasons, we know the only difference
-    # between this request and the previous ones is the length of the extra
-    # headers, so it proves the server caught the oversized headers.
+    # The request should now fail: DynamoDB fails it with a 400 Bad Request,
+    # while Alternator uses the more specific 431 Request Header Fields Too
+    # Large. Although such errors could have many reasons, we know the only
+    # difference between this request and the previous ones is the length of
+    # the extra headers, so it proves the server caught the oversized headers.
     headers.update({'header1': 'x'*8192, 'header2': 'y'*8192})
     response = requests.post(req.url, headers=headers, data=req.body, verify=False, cert=req.cert)
-    assert response.status_code == 400
+    assert response.status_code in (400, 431)
 
 # In addition to oversized request bodies and headers tested in the above
 # tests, there is also a risk that a huge request *line* (the URL) can
@@ -179,7 +184,6 @@ def test_too_large_request_headers(dynamodb, test_table):
 # can use the same limit too. In all useful cases, the request line will
 # be much shorter (for ordinary API requests, it is even empty).
 # Reproduces #23438.
-@pytest.mark.xfail(reason="issue #23438")
 def test_too_large_request_line(dynamodb, test_table):
     # First prepare a valid signed request, which works:
     req = get_signed_request(dynamodb, 'PutItem',
@@ -197,11 +201,13 @@ def test_too_large_request_line(dynamodb, test_table):
     # don't want to the 404 or InvalidSignatureException that were fine
     # with the short URL - because either of those errors would mean that
     # the server read the entire URL, and stored it entirely in memory.
-    # This time, we need to see a 400 Bad Request - but not one with a
-    # InvalidSignatureException error in its body.
+    # This time, we need to see an error which the server can produce without
+    # reading the entire URL - a 400 Bad Request on DynamoDB, or the more
+    # specific 414 URI Too Long on Alternator - and in any case, not one with
+    # an InvalidSignatureException error in its body.
     url = req.url + '/' + 'x' * 17000
     response = requests.post(url, headers=req.headers, data=req.body, verify=False, cert=req.cert)
-    assert response.status_code == 400 and not 'InvalidSignatureException' in response.text
+    assert response.status_code in (400, 414) and not 'InvalidSignatureException' in response.text
 
 def test_incorrect_json(dynamodb, test_table):
     correct_req = '{"TableName": "' + test_table.name + '", "Item": {"p": {"S": "x"}, "c": {"S": "x"}}}'
@@ -643,3 +649,69 @@ def test_write_malformed_value(dynamodb, test_table_s, op):
         # will return this broken map and boto3's attempt to parse the
         # returned map will fail, causing the following call to fail.
         test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+
+# A config_value_context() which retries the restore: at
+# max_concurrent_requests_per_shard=0 the CQL server sheds any request made
+# while another one is in flight on the same shard, the restore included.
+class retrying_config_value_context(config_value_context):
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                return super().__exit__(exc_type, exc_value, exc_traceback)
+            except Exception:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+
+# A test which verifies that a request rejected with RequestLimitExceeded
+# on a keep-alive connection does not break the connection. Until
+# SCYLLADB-3786 was solved the rejection was sent without reading the
+# request body, prompting the Seastar HTTP server to close the connection
+# right after the response was sent, despite the keep-alive header present
+# in the response. The affected HTTP client failed a later request with a
+# surprising disconnect.
+# The test uses http.client directly to hold exactly one connection with no
+# automatic reconnection or retry, and sets max_concurrent_requests_per_shard
+# to 0 (it's live-updatable) so every request is rejected.
+def test_request_limit_exceeded_connection_reuse(dynamodb, cql):
+    url = urllib.parse.urlsplit(dynamodb.meta.client._endpoint.host)
+    if url.scheme == 'https':
+        conn = http.client.HTTPSConnection(url.hostname, url.port, context=client_ssl_context(dynamodb), timeout=60)
+    else:
+        conn = http.client.HTTPConnection(url.hostname, url.port, timeout=60)
+
+    def do_request():
+        req = get_signed_request(dynamodb, 'DescribeTable', '{"TableName": "no_such_table"}')
+        conn.request('POST', '/', body=req.body, headers=req.headers)
+        response = conn.getresponse()
+        return response.status, response.read().decode('utf-8')
+
+    try:
+        # Sanity check - a normal request on this connection works (the
+        # table doesn't exist, so we expect ResourceNotFoundException):
+        status, body = do_request()
+        assert 'ResourceNotFoundException' in body, body
+        # config_value_context() returns after the new value has been applied
+        # on all shards, so the next request is already rejected.
+        # Careful: this test works only because the two servers gate on the same
+        # config item but not by the same condition - Alternator sheds on '>=',
+        # CQL on '>' (transport/server.cc). A limit of 0 thus rejects every
+        # Alternator request, while a CQL one passes as long as no other request
+        # is in flight on the same shard - hence the retry above. Aligning the
+        # two conditions would break this test for good: the CQL restore would
+        # be shed unconditionally, leaving the limit at 0 for later tests.
+        with retrying_config_value_context(cql, 'max_concurrent_requests_per_shard', '0'):
+            # The interesting part: each rejection must leave the connection
+            # usable. Before the fix the server closed it right after the
+            # first one, so the next do_request() raised an exception
+            # (http.client.RemoteDisconnected or similar).
+            for _ in range(2):
+                status, body = do_request()
+                assert status == 400 and 'RequestLimitExceeded' in body, body
+        # After the original limit is restored, the same connection must
+        # still work for normal request processing:
+        status, body = do_request()
+        assert 'ResourceNotFoundException' in body, body
+    finally:
+        conn.close()

@@ -225,7 +225,8 @@ keyspace_metadata::keyspace_metadata(std::string_view name,
              std::vector<schema_ptr> cf_defs,
              user_types_metadata user_types,
              storage_options storage_opts,
-             std::optional<locator::replication_strategy_config_options> next_options)
+             std::optional<locator::replication_strategy_config_options> next_options,
+             std::map<sstring, sstring> config_options)
     : _name{name}
     , _strategy_name{locator::abstract_replication_strategy::to_qualified_class_name(strategy_name.empty() ? "NetworkTopologyStrategy" : strategy_name)}
     , _strategy_options{std::move(strategy_options)}
@@ -235,6 +236,7 @@ keyspace_metadata::keyspace_metadata(std::string_view name,
     , _user_types{std::move(user_types)}
     , _storage_options(make_lw_shared<storage_options>(std::move(storage_opts)))
     , _consistency_option(consistency_option)
+    , _config_options(std::move(config_options))
 {
     for (auto&& s : cf_defs) {
         _cf_meta_data.emplace(s->cf_name(), s);
@@ -276,14 +278,15 @@ keyspace_metadata::new_keyspace(std::string_view name,
                                 bool durables_writes,
                                 storage_options storage_opts,
                                 std::vector<schema_ptr> cf_defs,
-                                std::optional<locator::replication_strategy_config_options> next_options)
+                                std::optional<locator::replication_strategy_config_options> next_options,
+                                std::map<sstring, sstring> config_options)
 {
-    return ::make_lw_shared<keyspace_metadata>(name, strategy_name, options, initial_tablets, consistency_option, durables_writes, cf_defs, user_types_metadata{}, storage_opts, next_options);
+    return ::make_lw_shared<keyspace_metadata>(name, strategy_name, options, initial_tablets, consistency_option, durables_writes, cf_defs, user_types_metadata{}, storage_opts, next_options, std::move(config_options));
 }
 
 lw_shared_ptr<keyspace_metadata>
 keyspace_metadata::new_keyspace(const keyspace_metadata& ksm) {
-    return new_keyspace(ksm.name(), ksm.strategy_name(), ksm.strategy_options(), ksm.initial_tablets(), ksm.consistency_option(), ksm.durable_writes(), ksm.get_storage_options(), {}, ksm.next_strategy_options_opt());
+    return new_keyspace(ksm.name(), ksm.strategy_name(), ksm.strategy_options(), ksm.initial_tablets(), ksm.consistency_option(), ksm.durable_writes(), ksm.get_storage_options(), {}, ksm.next_strategy_options_opt(), ksm.config_options());
 }
 
 void keyspace_metadata::add_user_type(const user_type ut) {
@@ -452,21 +455,22 @@ static std::string fqn_type(const std::string& fqn) {
     return fqn.substr(0, i) | std::views::transform(&toupper) | std::ranges::to<std::string>();
 }
 
-storage_options make_object_storage_options(const std::string& endpoint, const std::string& fqn, abort_source* as) {
+storage_options make_object_storage_options(const std::string& endpoint, const std::string& fqn, abort_source* as, storage_options::object_storage_layout layout) {
     std::string bucket;
     std::string object;
     auto type = fqn_type(fqn);
     object_storage_fqn_to_parts(fqn, type, bucket, object);
     object = std::filesystem::path(object).parent_path().string(); // remove the filename and trailing separator from the path
-    return make_object_storage_options(endpoint, type, bucket, object, as);
+    return make_object_storage_options(endpoint, type, bucket, object, as, layout);
 }
 
-storage_options make_object_storage_options(const std::string& endpoint, const std::string& type, const std::string& bucket, const std::string& prefix, abort_source* as) {
+storage_options make_object_storage_options(const std::string& endpoint, const std::string& type, const std::string& bucket, const std::string& prefix, abort_source* as, storage_options::object_storage_layout layout) {
     storage_options so;
     storage_options::object_storage os{
         .bucket = std::move(bucket), .endpoint = endpoint, .location = std::move(prefix),
         .abort_source = as,
-        .type = type | std::views::transform(&toupper) | std::ranges::to<std::string>()
+        .type = type | std::views::transform(&toupper) | std::ranges::to<std::string>(),
+        .layout = layout
     };
     so.value = std::move(os);
     return so;

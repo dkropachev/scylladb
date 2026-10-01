@@ -50,6 +50,7 @@
 #include "utils/UUID.hh"
 #include "utils/user_provided_param.hh"
 #include "utils/sequenced_set.hh"
+#include "utils/serialized_action.hh"
 #include "service/topology_coordinator.hh"
 
 class node_ops_cmd_request;
@@ -146,6 +147,8 @@ class node_ops_meta_data;
 
 using start_hint_manager = seastar::bool_class<class start_hint_manager_tag>;
 using loosen_constraints = seastar::bool_class<class loosen_constraints_tag>;
+using wait_balancer = seastar::bool_class<class wait_balancer_tag>;
+using remove_unset = seastar::bool_class<class remove_unset_tag>;
 
 struct token_metadata_change {
     std::vector<locator::mutable_token_metadata_ptr> pending_token_metadata_ptr{this_smp_shard_count()};
@@ -304,6 +307,10 @@ public:
 
     struct node_migration_status {
         locator::host_id host_id;
+        // The node's IP address, or empty if it is not known to the address map.
+        // Reported so that `migrate-to-tablets upgrade/downgrade`, which are
+        // addressed by IP, can be driven straight off `migrate-to-tablets status`.
+        sstring endpoint;
         sstring current_mode;  // "vnodes" or "tablets"
         sstring intended_mode; // "vnodes" or "tablets"
     };
@@ -379,14 +386,21 @@ private:
     void register_metrics();
     future<> snitch_reconfigured();
 
-    locator::tablet_map build_tablet_map_for_migration(const locator::token_metadata& tm,
+public:
+    // Builds the initial tablet map for a vnodes-to-tablets migration. Depends on
+    // nothing but its arguments, so it is static and can be driven directly with a
+    // synthetic topology.
+    static future<locator::tablet_map> build_tablet_map_for_migration(
             const locator::static_effective_replication_map_ptr& erm,
-            size_t target_pow2 = 0) const;
+            size_t target_pow2 = 0);
+
     future<std::unordered_map<table_id, uint64_t>> collect_table_sizes_for_migration(
-        const locator::token_metadata& tm,
+        const sstring& ks_name,
+        const locator::static_effective_replication_map_ptr& erm,
         const locator::tablet_aware_replication_strategy* trs,
         const std::vector<std::pair<table_id, sstring>>& tables_to_estimate);
 
+private:
     future<mutable_token_metadata_ptr> get_mutable_token_metadata_ptr() noexcept {
         return _shared_token_metadata.get()->clone_async().then([this] (token_metadata tm) {
             // bump the token_metadata ring_version
@@ -885,6 +899,11 @@ public:
 private:
      // State machine that is responsible for topology change
     topology_state_machine& _topology_state_machine;
+
+    // Batches concurrent await_topology_quiesced() callers so that they share one
+    // group0 request instead of submitting one each. Only shard 0's instance is used,
+    // since that is where the other shards forward to.
+    serialized_action _quiesce_topology{[this] { return do_await_topology_quiesced(); }};
     db::view::view_building_state_machine& _view_building_state_machine;
 
     future<> _topology_change_coordinator = make_ready_future<>();
@@ -994,6 +1013,9 @@ public:
     future<> set_tablet_balancing_enabled(bool);
 
     future<utils::UUID> submit_quiesce_topology_request();
+    // The body of await_topology_quiesced(), run through _quiesce_topology so that
+    // concurrent callers share a single request. Shard 0 only.
+    future<> do_await_topology_quiesced();
     future<> await_topology_quiesced();
     // Verifies topology is not busy, and also that topology version hasn't changed since the one provided
     // by the caller.
@@ -1104,10 +1126,14 @@ public:
     // hints are applied; if both are disengaged the call is a no-op. When
     // wait_balancer is set, waits for the load balancer to reach the requested
     // tablet count (which requires both hints to be engaged and equal).
+    // When remove_unset is set, a disengaged hint removes that key from the table's
+    // tablet options instead of leaving it unchanged - needed to put back the schema
+    // of a table which had no hint of its own.
     future<> alter_table_with_tablet_hints(table_id tid,
                                            std::optional<size_t> min_tablet_count,
                                            std::optional<size_t> max_tablet_count,
-                                           bool wait_balancer = true);
+                                           wait_balancer wait_for_balancer = wait_balancer::yes,
+                                           remove_unset erase_unset = remove_unset::no);
 
     friend class join_node_rpc_handshaker;
     friend class node_ops::node_ops_virtual_task;

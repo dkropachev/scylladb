@@ -84,11 +84,34 @@ public:
         bool sort_sstables_according_to_owner = true;
         bool garbage_collect = false;
         bool allow_numerical_generations = true;
+        // Leave out an sstable whose components are gone instead of failing the
+        // whole scan. The data dir of a running node is a moving target: it can
+        // delete an sstable between the moment the scan lists it and the moment
+        // the scan loads it.
+        bool skip_vanished_sstables = false;
         sstables::sstable_open_config sstable_open_config;
+
+        // The flags of a caller which must not modify the storage it processes,
+        // like the offline tools: nothing is rewritten or collected, and every
+        // sstable found is handed to the caller instead of being distributed
+        // among the shards owning it.
+        static process_flags read_only() {
+            return process_flags{
+                .need_mutate_level = false,
+                .sort_sstables_according_to_owner = false,
+                .garbage_collect = false,
+            };
+        }
     };
 
     class components_lister {
     public:
+        /// enumerate the SSTable components found in the underlying storage
+        ///
+        /// Must complete on all shards before any shard calls process(), which
+        /// creates and removes files in the very storage being enumerated.
+        virtual future<> scan(sstable_directory& directory) = 0;
+
         /// process all SSTable components found by the lister
         ///
         /// @li process all the listed valid TOC components with the given @c directory
@@ -134,6 +157,7 @@ public:
         filesystem_components_lister(std::filesystem::path dir);
         filesystem_components_lister(std::filesystem::path dir, sstables_manager&, const data_dictionary::storage_options::object_storage&);
 
+        virtual future<> scan(sstable_directory& directory) override;
         virtual future<> process(sstable_directory& directory, process_flags flags) override;
         virtual future<> commit() override;
         virtual future<> prepare(sstable_directory&, process_flags, storage&) override;
@@ -149,6 +173,7 @@ public:
     public:
         sstables_registry_components_lister(sstables::sstables_registry& sstables_registry, table_id tid, locator::host_id node_owner);
 
+        virtual future<> scan(sstable_directory& directory) override;
         virtual future<> process(sstable_directory& directory, process_flags flags) override;
         virtual future<> commit() override;
         virtual future<> prepare(sstable_directory&, process_flags, storage&) override;
@@ -158,6 +183,7 @@ public:
         std::vector<sstring> _toc_filenames;
     public:
         restore_components_lister(const data_dictionary::storage_options::value_type& options, std::vector<sstring> toc_filenames);
+        virtual future<> scan(sstable_directory& directory) override;
         virtual future<> process(sstable_directory& directory, process_flags flags) override;
         virtual future<> commit() override;
         virtual future<> prepare(sstable_directory&, process_flags, storage&) override;
@@ -205,6 +231,9 @@ private:
     future<> process_descriptor(sstables::entry_descriptor desc,
             process_flags flags,
             noncopyable_function<data_dictionary::storage_options()>&& get_storage_options);
+    future<> do_process_descriptor(sstables::entry_descriptor desc,
+            process_flags flags,
+            noncopyable_function<data_dictionary::storage_options()>&& get_storage_options);
     void validate(sstables::shared_sstable sst, process_flags flags) const;
     future<sstables::shared_sstable> load_sstable(sstables::entry_descriptor desc,
             const data_dictionary::storage_options& storage_opts, sstables::sstable_open_config cfg = {}) const;
@@ -215,13 +244,16 @@ private:
     future<std::vector<shard_id>> get_shards_for_this_sstable(
             const sstables::entry_descriptor& desc, const data_dictionary::storage_options& storage_opts, process_flags flags) const;
 
+public:
+    // Scans wherever the given storage options put the sstables of the table:
+    // a local directory, an object storage prefix, or the registry of a table
+    // living in object storage.
     sstable_directory(sstables_manager& manager,
           schema_ptr schema,
           std::variant<std::unique_ptr<dht::sharder>, const dht::sharder*> sharder,
           lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
           sstable_state state,
           io_error_handler_gen error_handler_gen);
-public:
     sstable_directory(replica::table& table,
             sstable_state state,
             io_error_handler_gen error_handler_gen);
@@ -270,7 +302,19 @@ public:
     // This function doesn't change on-storage state. If files are to be removed, a separate call
     // (commit_file_removals()) has to be issued. This is to make sure that all instances of this
     // class in a sharded service have the opportunity to validate its files.
+    //
+    // scan_sstable_dir() must have completed on all instances of this class in a sharded
+    // service before this is called on any of them. See scan_sstable_dir() below.
     future<> process_sstable_dir(process_flags flags);
+
+    // Enumerates the directory, recording the SSTable components found in it.
+    //
+    // This is a separate step from process_sstable_dir() because the latter creates and
+    // removes files in this very directory (e.g. when mutating the SSTable level), while
+    // the generation-based sharding of the listing means every shard lists every file.
+    // A shard that lists another shard's in-flight SSTable would take ownership of it and
+    // schedule its components for removal.
+    future<> scan_sstable_dir();
 
     // If files were scheduled to be removed, they will be removed after this call.
     future<> commit_directory_changes();

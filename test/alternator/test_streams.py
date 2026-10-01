@@ -7,6 +7,7 @@
 
 import time
 import urllib.request
+import uuid
 from contextlib import contextmanager, ExitStack
 from urllib.error import URLError
 
@@ -14,7 +15,7 @@ import pytest
 from boto3.dynamodb.types import TypeDeserializer
 from botocore.exceptions import ClientError
 
-from test.alternator.util import is_aws, scylla_config_temporary, unique_table_name, create_test_table, new_test_table, random_string, full_scan, freeze, list_tables, get_region, manual_request
+from test.alternator.util import is_aws, scylla_config_temporary, unique_table_name, create_test_table, new_test_table, random_string, full_scan, freeze, get_table_arn, list_tables, get_region, manual_request
 from test.pylib.skip_types import skip_env
 
 TAGS = []
@@ -1019,6 +1020,13 @@ def compare_events(expected_events, output, mode, expected_region):
             # some libraries rely on this. This reproduces issue #7158:
             assert 'SequenceNumber' in record
             assert record['SequenceNumber'].isdecimal()
+            if event['eventSource'] == 'scylladb:alternator':
+                # The event ID and sequence number must identify the same CDC
+                # timestamp. This reproduces issue #31294.
+                sequence_number = int(record['SequenceNumber'])
+                event_uuid = uuid.UUID(event['eventID'].rsplit(':', 2)[1])
+                assert event_uuid.time == sequence_number >> 64
+                assert event_uuid.int & ((1 << 64) - 1) == sequence_number & ((1 << 64) - 1)
             # Alternator doesn't set the SizeBytes member. Issue #6931.
             #assert 'SizeBytes' in record
             if mode == 'KEYS_ONLY':
@@ -2333,6 +2341,12 @@ def test_streams_disabled_stream(dynamodb, dynamodbstreams):
                 assert not 'NextShardIterator' in response
         assert nrecords == 1
 
+        # The log table is demonstrably still there - we just read from it -
+        # yet Alternator cannot address it by name, so ListTables must not
+        # return it. Reproduces SCYLLADB-4382.
+        tables = list_tables(dynamodb)
+        assert table.name in tables and table.name + '_scylla_cdc_log' not in tables
+
 # When streams are enabled for a table, we get a unique ARN which should be
 # unique but not change unless streams are eventually disabled for this table.
 # If this ARN changes unexpectedly, it can confuse existing readers who are
@@ -2343,7 +2357,7 @@ def test_stream_arn_unchanging(dynamodb, dynamodbstreams):
     with create_stream_test_table(dynamodb, StreamViewType='KEYS_ONLY') as table:
         (arn, label) = wait_for_active_stream(dynamodbstreams, table)
         # Change a tag on the table. This changes its schema.
-        table_arn = table.meta.client.describe_table(TableName=table.name)['Table']['TableArn']
+        table_arn = get_table_arn(table)
         table.meta.client.tag_resource(ResourceArn=table_arn, Tags=[{'Key': 'animal', 'Value': 'dog' }])
         # The change in the table's schema should not change its stream ARN
         streams = dynamodbstreams.list_streams(TableName=table.name)
@@ -2373,6 +2387,20 @@ def test_stream_list_tables(dynamodb):
             for listed_name in tables:
                 if table.name != listed_name:
                     assert table.name not in listed_name
+
+# ListTables must not hide a CDC log table by matching the "_scylla_cdc_log"
+# suffix - cdc::is_log_name() would make that a one-token mistake. The suffix
+# is legal in a DynamoDB table name, and a table the user created under it is
+# an ordinary table which has to be listed.
+# Refs SCYLLADB-4382.
+def test_list_tables_user_table_named_like_cdc_log(dynamodb):
+    with new_test_table(dynamodb,
+        name=unique_table_name() + '_scylla_cdc_log',
+        Tags=TAGS,
+        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' } ],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' }, ]
+    ) as table:
+        assert table.name in list_tables(dynamodb)
 
 # The DynamoDB documentation for GetRecords says that "GetRecords can retrieve
 # a maximum of 1 MB of data or 1000 stream records, whichever comes first.",
@@ -2486,7 +2514,7 @@ def test_streams_multiple_items_one_partition(dynamodb, dynamodbstreams, scylla_
     with create_table_ss(dynamodb, dynamodbstreams, 'NEW_AND_OLD_IMAGES') as stream:
         table, stream_arn = stream
         # Set write isolation mode on the table to the chosen "mode":
-        table_arn = table.meta.client.describe_table(TableName=table.name)['Table']['TableArn']
+        table_arn = get_table_arn(table)
         table.meta.client.tag_resource(ResourceArn=table_arn, Tags=[{'Key': 'system:write_isolation', 'Value': mode}])
         # Now try the test, a single BatchWriteItem writing three different
         # items in the same partition p:

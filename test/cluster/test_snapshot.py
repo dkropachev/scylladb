@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 pytestmark = pytest.mark.prepare_3_racks_cluster
 
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_snapshot(manager, random_tables):
     """
         Cluster A, B, C
@@ -25,7 +26,6 @@ async def test_snapshot(manager, random_tables):
         Then stop A B C and query D to check it sees the correct table schema (verify_schema).
     """
     server_a, server_b, server_c = await manager.running_servers()
-    await manager.mark_dirty()
     # Reduce the snapshot thresholds
     errs = [inject_error_one_shot(manager.api, s.ip_addr, "raft_server_set_snapshot_thresholds",
                                   parameters={'snapshot_threshold': '3', 'snapshot_trailing': '1'})
@@ -49,6 +49,7 @@ async def test_snapshot(manager, random_tables):
 
     logger.info("Driver connecting to D %s", server_d)
     await manager.driver_connect()
+    await manager.get_ready_cql([server_d])
 
     await random_tables.verify_schema(do_read_barrier=False)
 

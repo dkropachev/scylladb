@@ -8,6 +8,7 @@
 
 
 #include <seastar/core/on_internal_error.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/gate.hh>
@@ -149,7 +150,7 @@ tasks::is_user_task task_manager::task::impl::is_user_task() const noexcept {
 }
 
 static future<> abort_children(task_manager::module_ptr module, task_id parent_id) noexcept {
-    co_await utils::get_local_injector().inject("tasks_abort_children", utils::wait_for_message(10s));
+    co_await utils::get_local_injector().inject("tasks_abort_children", utils::wait_for_message(60s));
 
     auto entered = module->async_gate().try_enter();
     if (!entered) {
@@ -213,8 +214,8 @@ future<> task_manager::task::impl::done() const noexcept {
     return _done.get_shared_future();
 }
 
-void task_manager::task::impl::run_to_completion() {
-    (void)run().then([this] {
+future<> task_manager::task::impl::run_to_completion() {
+    return run().then([this] {
         _as.check();
         return finish();
     }).handle_exception([this] (std::exception_ptr ex) {
@@ -240,7 +241,7 @@ future<> task_manager::task::impl::maybe_fold_into_parent() const noexcept {
         }
     } catch (...) {
         // If folding fails, leave the subtree unfolded.
-        tasks::tmlogger.warn("Folding of task with id={} failed due to {}. Ignored", _status.id, std::current_exception());
+        tasks::tmlogger.warn("Folding of task with id={} failed due to {:t}. Ignored", _status.id, std::current_exception());
     }
 }
 
@@ -268,7 +269,7 @@ future<> task_manager::task::impl::finish_failed(std::exception_ptr ex, std::str
 future<> task_manager::task::impl::finish_failed(std::exception_ptr ex) noexcept {
     std::string error;
     try {
-        error = fmt::format("{}", ex);
+        error = fmt::format("{:t}", ex);
     } catch (...) {
         error = "Failed to get error message";
     }
@@ -330,7 +331,7 @@ void task_manager::task::start() {
         });
         _impl->_as.check();
         _impl->_status.state = task_manager::task_state::running;
-        _impl->run_to_completion();
+        (void)_impl->run_to_completion().finally([impl = _impl] {});
     } catch (...) {
         (void)_impl->finish_failed(std::current_exception()).then([impl = _impl] {});
     }
@@ -394,6 +395,228 @@ future<utils::chunked_vector<task_manager::task::task_essentials>> task_manager:
 
 void task_manager::task::set_virtual_parent() noexcept {
     _impl->set_virtual_parent();
+}
+
+task_manager::generic_task_impl::generic_task_impl(
+        module_ptr module,
+        task_id id,
+        uint64_t sequence_number,
+        std::string scope,
+        std::string keyspace,
+        std::string table,
+        std::string entity,
+        task_info parent_info,
+        std::string type,
+        std::string progress_units,
+        tasks::is_abortable is_abortable,
+        tasks::is_internal is_internal,
+        tasks::is_user_task is_user_task,
+        action_fn action,
+        lw_shared_ptr<progress_fn> progress_fn,
+        lw_shared_ptr<workload_fn> workload_fn,
+        abort_fn abort_fn,
+        finalize_fn finalizer) noexcept
+    : impl(std::move(module), id, sequence_number, std::move(scope), std::move(keyspace), std::move(table), std::move(entity), parent_info.get_id())
+    , _type(std::move(type))
+    , _is_abortable(is_abortable)
+    , _is_internal(is_internal)
+    , _is_user_task(is_user_task)
+    , _action(std::move(action))
+    , _progress_fn(std::move(progress_fn))
+    , _workload_fn(std::move(workload_fn))
+    , _abort_fn(std::move(abort_fn))
+    , _finalizer(std::move(finalizer))
+{
+    _status.progress_units = std::move(progress_units);
+    if (parent_info && parent_info.get_kind() == task_kind::cluster) {
+        set_virtual_parent();
+    }
+}
+
+std::string task_manager::generic_task_impl::type() const {
+    return _type;
+}
+
+future<task_manager::task::progress> task_manager::generic_task_impl::get_progress() const {
+    if (_cached_progress) {
+        co_return *_cached_progress;
+    }
+    auto complete = is_complete();
+    auto progress_fn = _progress_fn;
+    auto progress = co_await (progress_fn ? (*progress_fn)() : task::impl::get_progress());
+    if (complete) {
+        _cached_progress = progress;
+    }
+    co_return progress;
+}
+
+tasks::is_abortable task_manager::generic_task_impl::is_abortable() const noexcept {
+    return _is_abortable;
+}
+
+tasks::is_internal task_manager::generic_task_impl::is_internal() const noexcept {
+    return _is_internal;
+}
+
+tasks::is_user_task task_manager::generic_task_impl::is_user_task() const noexcept {
+    return _is_user_task;
+}
+
+void task_manager::generic_task_impl::abort() noexcept {
+    if (!_as.abort_requested()) {
+        _as.request_abort();
+
+        if (_abort_fn) {
+            _abort_fn(_as);
+        }
+        (void)abort_children(_module, _status.id);
+    }
+}
+
+future<> task_manager::generic_task_impl::release_resources() noexcept {
+    auto clear_callables = defer([this] () noexcept {
+        _finalizer = {};
+        _action = {};
+        _progress_fn = {};
+        _workload_fn = {};
+        _abort_fn = {};
+    });
+    if (_progress_fn) {
+        auto progress_f = co_await coroutine::as_future(get_progress());
+        if (progress_f.failed()) {
+            tmlogger.warn("Failed to cache the progress of task {}: {}", _status.id, progress_f.get_exception());
+        }
+    }
+    auto finalize_f = co_await coroutine::as_future(_finalizer ? _finalizer() : task::impl::release_resources());
+    if (finalize_f.failed()) {
+        tmlogger.warn("Failed to finalize task {}: {}", _status.id, finalize_f.get_exception());
+    }
+}
+
+future<> task_manager::generic_task_impl::run() {
+    return _action(*this);
+}
+
+future<std::optional<double>> task_manager::generic_task_impl::expected_total_workload() const {
+    if (_cached_workload) {
+        co_return _cached_workload;
+    }
+    auto workload_fn = _workload_fn;
+    auto workload = co_await (workload_fn ? (*workload_fn)() : task::impl::expected_total_workload());
+    if (workload) {
+        _cached_workload = workload;
+    }
+    co_return workload;
+}
+
+task_manager::task_builder::task_builder(module_ptr module, std::string type)
+    : _module(std::move(module))
+    , _type(std::move(type))
+    , _id(tasks::task_id::create_random_id())
+{}
+
+task_manager::task_builder::task_builder(module_ptr module, std::string type, task_id id)
+    : _module(std::move(module))
+    , _type(std::move(type))
+    , _id(id)
+{}
+
+task_manager::task_builder& task_manager::task_builder::set_sequence_number(uint64_t sequence_number) {
+    _sequence_number = sequence_number;
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_scope(std::string scope) {
+    _scope = std::move(scope);
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_keyspace(std::string keyspace) {
+    _keyspace = std::move(keyspace);
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_table(std::string table) {
+    _table = std::move(table);
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_entity(std::string entity) {
+    _entity = std::move(entity);
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_progress_units(std::string progress_units) {
+    _progress_units = std::move(progress_units);
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_parent_info(task_info parent_info) {
+    _parent_info = std::move(parent_info);
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_is_abortable(tasks::is_abortable is_abortable) {
+    _is_abortable = is_abortable;
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_is_internal(tasks::is_internal is_internal) {
+    _is_internal = is_internal;
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_is_user_task(tasks::is_user_task is_user_task) {
+    _is_user_task = is_user_task;
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_progress_fn(generic_task_impl::progress_fn progress_fn) {
+    _progress_fn = std::move(progress_fn);
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_workload_fn(generic_task_impl::workload_fn workload_fn) {
+    _workload_fn = std::move(workload_fn);
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_abort_fn(generic_task_impl::abort_fn abort_fn) {
+    _abort_fn = std::move(abort_fn);
+    return *this;
+}
+
+task_manager::task_builder& task_manager::task_builder::set_finalizer(generic_task_impl::finalize_fn finalizer) {
+    _finalizer = std::move(finalizer);
+    return *this;
+}
+
+future<task_manager::task_ptr> task_manager::task_builder::build(generic_task_impl::action_fn action) && {
+    auto progress_fn = _progress_fn ? make_lw_shared<generic_task_impl::progress_fn>(std::move(_progress_fn)) : lw_shared_ptr<generic_task_impl::progress_fn>{};
+    auto workload_fn = _workload_fn ? make_lw_shared<generic_task_impl::workload_fn>(std::move(_workload_fn)) : lw_shared_ptr<generic_task_impl::workload_fn>{};
+    auto task_impl = seastar::make_shared<generic_task_impl>(
+        _module,
+        _id,
+        _sequence_number.value_or(0),
+        _scope.value_or(""),
+        _keyspace.value_or(""),
+        _table.value_or(""),
+        _entity.value_or(""),
+        _parent_info.value_or(make_empty_task_info()),
+        std::move(_type),
+        _progress_units.value_or(""),
+        _is_abortable.value_or(tasks::is_abortable::no),
+        _is_internal.value_or(tasks::is_internal{_parent_info && *_parent_info && _parent_info->get_kind() == task_kind::node}),
+        _is_user_task.value_or(tasks::is_user_task::no),
+        std::move(action),
+        std::move(progress_fn),
+        std::move(workload_fn),
+        std::move(_abort_fn),
+        std::move(_finalizer)
+    );
+    auto task = co_await _module->make_task(std::move(task_impl), _parent_info.value_or(make_empty_task_info()));
+    task->start();
+    co_return task;
 }
 
 task_manager::virtual_task::impl::impl(module_ptr module) noexcept
@@ -619,7 +842,7 @@ future<task_manager::task_ptr> task_manager::module::make_task(task::task_impl_p
     bool abort = false;
     if (parent_d) {
         // Regular task as a parent.
-        auto sequence_number = co_await _tm.container().invoke_on(parent_d.shard, coroutine::lambda([id = parent_d.id, task = make_foreign(task), &abort] (task_manager& tm) mutable -> future<std::optional<uint64_t>> {
+        auto sequence_number = co_await _tm.container().invoke_on(parent_d.get_shard(), coroutine::lambda([id = parent_d.get_id(), task = make_foreign(task), &abort] (task_manager& tm) mutable -> future<std::optional<uint64_t>> {
             const auto& all_tasks = tm.get_local_tasks();
             if (auto it = all_tasks.find(id); it != all_tasks.end()) {
                 co_await it->second->add_child(std::move(task));

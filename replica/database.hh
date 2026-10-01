@@ -35,6 +35,7 @@
 #include "types/types.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/condition-variable.hh>
 #include "db/commitlog/replay_position.hh"
 #include "db/commitlog/commitlog_types.hh"
 #include "logstor/logstor.hh"
@@ -304,6 +305,18 @@ public:
     // Exception safe.
     std::vector<replica::shared_memtable> clear_and_add();
 
+    // Builds a fresh, empty replacement list, to be installed by the overload below.
+    // This is the only part of the swap that allocates.
+    std::vector<replica::shared_memtable> make_replacement();
+
+    // Installs a replacement and returns the old memtables.
+    // Allocates nothing and cannot fail, so a caller that has to swap the lists of
+    // several memtable_lists without letting a reader see a half-done swap can build
+    // all of the replacements first and then install them one after another.
+    std::vector<replica::shared_memtable> clear_and_add(std::vector<replica::shared_memtable> replacement) noexcept {
+        return std::exchange(_memtables, std::move(replacement));
+    }
+
     size_t size() const noexcept {
         return _memtables.size();
     }
@@ -353,7 +366,7 @@ class distributed_loader;
 class table_populator;
 
 // The CF has a "stats" structure. But we don't want all fields here,
-// since some of them are fairly complex for exporting to collectd. Also,
+// since some of them are fairly complex for exporting as metrics. Also,
 // that structure matches what we export via the API, so better leave it
 // untouched. And we need more fields. We will summarize it in here what
 // we need.
@@ -518,6 +531,11 @@ private:
     // The storage_group_manager manages either a single storage_group for vnodes or per-tablet storage_group for tablets.
     // It contains and manages both the compaction_groups list and the storage_groups vector.
     std::unique_ptr<storage_group_manager> _sg_manager;
+    // Storage groups whose truncate_tablet_locally() is between swapping the sstables and
+    // retiring the memtables, see wait_for_tablet_truncate().
+    std::vector<const storage_group*> _truncating_storage_groups;
+    seastar::condition_variable _tablet_truncate_done;
+    future<> wait_for_tablet_truncate(const dht::partition_range& range);
     // Compound SSTable set for all the compaction groups, which is useful for operations spanning all of them.
     lw_shared_ptr<const sstables::sstable_set> _sstables;
     // Control background fibers waiting for sstables to be deleted
@@ -898,6 +916,12 @@ public:
         return _logstor != nullptr;
     }
 
+    // The mutation sources of this table for SELECT ... FROM MUTATION_FRAGMENTS(), see
+    // logstor::make_mutation_sources_for_dump(). Only valid when uses_logstor().
+    std::map<sstring, mutation_source> make_logstor_mutation_sources_for_dump(schema_ptr s, const dht::decorated_key& dk, reader_permit permit) {
+        return _logstor->make_mutation_sources_for_dump(std::move(s), *_logstor_index, dk, std::move(permit));
+    }
+
     logstor::primary_index& logstor_index() noexcept {
         return *_logstor_index;
     }
@@ -1057,6 +1081,16 @@ public:
     future<> cleanup_tablet(database&, db::system_keyspace&, locator::tablet_id);
     // For tests only.
     future<> cleanup_tablet_without_deallocation(database& db, db::system_keyspace& sys_ks, locator::tablet_id tid);
+    // Drops all data of the tablet on this shard: memtables are discarded without
+    // being flushed, sstables are deleted, the row cache is invalidated for the
+    // tablet's token range. The storage group stays allocated and writable, so the
+    // tablet keeps accepting writes right after the call.
+    //
+    // Meant for truncating a strongly consistent tablet from its Raft state machine,
+    // where the position of the truncate in the Raft log decides which writes survive.
+    // Hence no truncation or commitlog cleanup record is written:
+    // the commitlog is filtered by Raft index during replay, not by replay position
+    future<> truncate_tablet_locally(database& db, locator::tablet_id tid);
     future<const_mutation_partition_ptr> find_partition(schema_ptr, reader_permit permit, const dht::decorated_key& key) const;
     future<const_row_ptr> find_row(schema_ptr, reader_permit permit, const dht::decorated_key& partition_key, clustering_key clustering_key) const;
     shard_id shard_for_reads(dht::token t) const;
@@ -1663,7 +1697,6 @@ public:
         void remove_table(database& db, table& cf) noexcept;
 
         table& get_table(table_id id) const;
-        table_id get_table_id(const std::pair<std::string_view, std::string_view>& kscf) const;
         lw_shared_ptr<table> get_table_if_exists(table_id id) const;
         table_id get_table_id_if_exists(const std::pair<std::string_view, std::string_view>& kscf) const;
         bool contains(table_id id) const;
@@ -1985,6 +2018,14 @@ public:
     std::vector<sstring> get_non_system_keyspaces() const;
     std::vector<sstring> get_user_keyspaces() const;
     std::vector<sstring> get_all_keyspaces() const;
+    // Keyspaces created by Scylla itself are always local and do not count.
+    enum class user_storage_kind {
+        none,
+        local,
+        object_storage,
+        mixed,
+    };
+    user_storage_kind get_user_storage_kind() const;
     std::vector<sstring> get_non_local_strategy_keyspaces() const;
     std::vector<sstring> get_non_local_vnode_based_strategy_keyspaces() const;
     // All static_effective_replication_map_ptr must hold a vnode_effective_replication_map

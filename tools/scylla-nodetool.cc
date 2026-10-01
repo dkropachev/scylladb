@@ -39,6 +39,7 @@
 #include <ranges>
 #include <unordered_map>
 
+#include "api/stop_compaction.hh"
 #include "api/scrub_status.hh"
 #include "gms/application_state.hh"
 #include "db/config.hh"
@@ -73,14 +74,9 @@ static std::ostream& operator<<(std::ostream& os, const std::vector<sstring>& v)
 struct file_size_printer {
     int64_t value;
     bool human_readable;
-    bool use_correct_units;
-    // Cassandra nodetool uses base_2 and base_10 units interchangeably, some
-    // commands use this, some that. Let's accomodate this for now, and maybe
-    // fix this mess at one point in the future, after the rewrite is done.
-    file_size_printer(int64_t value, bool human_readable = true, bool use_correct_units = false)
+    file_size_printer(int64_t value, bool human_readable = true)
         : value{value}
         , human_readable{human_readable}
-        , use_correct_units{use_correct_units}
     {}
 };
 
@@ -91,18 +87,17 @@ struct fmt::formatter<file_size_printer> : fmt::formatter<string_view> {
             return fmt::format_to(ctx.out(), "{}", size.value);
         }
 
-        using unit_t = std::tuple<int64_t, std::string_view, std::string_view>;
+        using unit_t = std::pair<int64_t, std::string_view>;
         const unit_t units[] = {
-            {1LL << 40, "TiB", "TB"},
-            {1LL << 30, "GiB", "GB"},
-            {1LL << 20, "MiB", "MB"},
-            {1LL << 10, "KiB", "KB"},
+            {1LL << 40, "TiB"},
+            {1LL << 30, "GiB"},
+            {1LL << 20, "MiB"},
+            {1LL << 10, "KiB"},
         };
-        for (auto [n, base_2, base_10] : units) {
-            if ((size.value > n) || (size.value < -n)) {
+        for (auto [n, unit] : units) {
+            if ((size.value >= n) || (size.value <= -n)) {
                 auto d = static_cast<float>(size.value) / n;
-                auto postfix = size.use_correct_units ? base_2 : base_10;
-                return fmt::format_to(ctx.out(), "{:.2f} {}", d, postfix);
+                return fmt::format_to(ctx.out(), "{:.2f} {}", d, unit);
             }
         }
         return fmt::format_to(ctx.out(), "{} bytes", size.value);
@@ -795,10 +790,56 @@ void print_compactionhistory(const std::vector<Entry>& history) {
     }
 }
 
+// Reproduces the log lines compaction emits at debug level when it starts and when
+// it finishes, so that the history of a node can be merged back into its log with
+// sort(1), e.g.:
+//
+//   nodetool compactionhistory -F log > history.log
+//   sort -k2 scylla.log history.log > merged.log
+//
+// The history doesn't record everything the log line carries, so the sstables are
+// identified by generation rather than by file name, and the partition counts are
+// left out.
+void print_compactionhistory_log(const std::vector<history_entry>& history) {
+    // The verbs used by report_start_desc() and report_finish_desc(), see compaction/compaction.cc.
+    // Types not listed here are compacted by regular_compaction, which uses the default below.
+    static const std::unordered_map<std::string_view, std::pair<std::string_view, std::string_view>> verbs{
+            {"Cleanup", {"Cleaning", "Cleaned"}},
+            {"Upgrade", {"Cleaning", "Cleaned"}},
+            {"Scrub", {"Scrubbing", "Finished scrubbing"}},
+            {"Reshape", {"Reshaping", "Reshaped"}},
+            {"Reshard", {"Resharding", "Resharded"}},
+            {"Split", {"Splitting", "Split"}},
+    };
+
+    auto print_line = [] (const history_entry& e, int64_t timestamp, std::string_view msg) {
+        fmt::print(std::cout, "DEBUG {:%F %T},{:03d} [shard {}:comp] compaction - [{} {}.{} {}] {}\n",
+                localtime(std::time_t(timestamp / 1000)), timestamp % 1000, e.shard_id,
+                e.compaction_type, e.ks, e.cf, e.id, msg);
+    };
+
+    // history is sorted by descending compacted_at, print the log in chronological order.
+    for (const auto& e : history | std::views::reverse) {
+        const auto it = verbs.find(std::string_view(e.compaction_type));
+        const auto [start_verb, finish_verb] = it != verbs.end()
+                ? it->second : std::pair<std::string_view, std::string_view>{"Compacting", "Compacted"};
+
+        print_line(e, e.started_at, fmt::format("{} [{}]", start_verb, fmt::join(e.sstables_in, ",")));
+
+        const auto duration_ms = e.compacted_at - e.started_at;
+        const auto ratio = e.bytes_in ? double(e.bytes_out) / double(e.bytes_in) : 0;
+        print_line(e, e.compacted_at, fmt::format("{} {} sstables to [{}]. {} to {} (~{}% of original) in {}ms = {}.",
+                finish_verb, e.sstables_in.size(), fmt::join(e.sstables_out, ","),
+                utils::pretty_printed_data_size(e.bytes_in), utils::pretty_printed_data_size(e.bytes_out),
+                int(ratio * 100), duration_ms,
+                utils::pretty_printed_throughput(e.bytes_in, std::chrono::duration<float>(std::chrono::milliseconds(duration_ms)))));
+    }
+}
+
 void compactionhistory_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     const auto format = vm["format"].as<sstring>();
 
-    static const std::vector<std::string_view> recognized_formats{"text", "json", "yaml"};
+    static const std::vector<std::string_view> recognized_formats{"text", "json", "yaml", "log"};
     if (std::ranges::find(recognized_formats, format) == recognized_formats.end()) {
         throw std::invalid_argument(fmt::format("invalid format {}, valid formats are: {}", format, recognized_formats));
     }
@@ -910,6 +951,8 @@ void compactionhistory_operation(scylla_rest_client& client, const bpo::variable
         print_compactionhistory<json_writer>(history);
     } else if (format == "yaml") {
         print_compactionhistory<yaml_writer>(history);
+    } else if (format == "log") {
+        print_compactionhistory_log(history);
     }
 }
 
@@ -1339,8 +1382,8 @@ void info_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     // the JVM heap memory usage is meaningless for Scylla
     const double mem_used = 0;
     const double mem_max = 0;
-    fmt::print("{:<23}: {:.2f} / {:.2f}\n", "Heap Memory (MB)", mem_used, mem_max);
-    fmt::print("{:<23}: {:.2f}\n", "Off Heap Memory (MB)",
+    fmt::print("{:<23}: {:.2f} / {:.2f}\n", "Heap Memory (MiB)", mem_used, mem_max);
+    fmt::print("{:<23}: {:.2f}\n", "Off Heap Memory (MiB)",
                static_cast<float>(get_off_heap_memory_used(client)) / 1_MiB);
     fmt::print("{:<23}: {}\n", "Data Center", rjson::to_string_view(client.get("/snitch/datacenter")));
     fmt::print("{:<23}: {}\n", "Rack", rjson::to_string_view(client.get("/snitch/rack")));
@@ -1395,9 +1438,8 @@ void listsnapshots_operation(scylla_rest_client& client, const bpo::variables_ma
         max_column_length[c] = header_row[c].size();
     }
 
-    auto format_hr_size = [] (uint64_t val, bool use_alternative_units) {
-        const char* const units[] = {"bytes", "KB", "MB", "GB", "TB", "PB", "EB"};
-        const char* const alternative_units[] = {"bytes", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"};
+    auto format_hr_size = [] (uint64_t val) {
+        const char* const units[] = {"bytes", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"};
 
         unsigned i = 0;
         const uint64_t step = 1024;
@@ -1415,7 +1457,7 @@ void listsnapshots_operation(scylla_rest_client& client, const bpo::variables_ma
         if (formatted_number.ends_with(".00")) {
             formatted_number.erase(formatted_number.size() - 3);
         }
-        return fmt::format("{} {}", formatted_number, use_alternative_units ? alternative_units[i] : units[i]);
+        return fmt::format("{} {}", formatted_number, units[i]);
     };
 
     std::vector<std::array<std::string, 5>> rows;
@@ -1426,8 +1468,8 @@ void listsnapshots_operation(scylla_rest_client& client, const bpo::variables_ma
                     snapshot_name,
                     std::string(rjson::to_string_view(snapshot["ks"])),
                     std::string(rjson::to_string_view(snapshot["cf"])),
-                    format_hr_size(snapshot["live"].GetInt64(), false),
-                    format_hr_size(snapshot["total"].GetInt64(), false)});
+                    format_hr_size(snapshot["live"].GetInt64()),
+                    format_hr_size(snapshot["total"].GetInt64())});
 
             for (size_t c = 0; c < rows.back().size(); ++c) {
                 max_column_length[c] = std::max(max_column_length[c], rows.back()[c].size());
@@ -1446,7 +1488,7 @@ void listsnapshots_operation(scylla_rest_client& client, const bpo::variables_ma
         fmt::print(std::cout, fmt::runtime(regular_row_format.c_str()), r[0], r[1], r[2], r[3], r[4]);
     }
 
-    fmt::print(std::cout, "\nTotal TrueDiskSpaceUsed: {}\n\n", format_hr_size(true_size, true));
+    fmt::print(std::cout, "\nTotal TrueDiskSpaceUsed: {}\n\n", format_hr_size(true_size));
 }
 
 void move_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
@@ -1481,7 +1523,7 @@ void print_stream_session(
         if (!human_readable) {
             return format("{} bytes", value);
         }
-        return format("{}", file_size_printer(value, true, true));
+        return format("{}", file_size_printer(value));
     };
 
     fmt::print(std::cout, "        {} {} files, {} total. Already {} {} files, {} total\n",
@@ -1924,7 +1966,12 @@ void restore_operation(scylla_rest_client& client, const bpo::variables_map& vm)
         auto is_close = seastar::deferred_close(is);
         auto sstables_list = seastar::util::read_entire_stream_contiguous(is).get();
         for (const auto& toc : std::views::split(sstables_list, '\n')) {
-            writer.String(std::string_view(toc));
+            auto name = std::string_view(toc);
+            // Skip empty lines, in particular the one a newline-terminated file
+            // ends with -- an empty name fails the whole restore on the server.
+            if (!name.empty()) {
+                writer.String(name);
+            }
         }
     }
     // add the list provided by the command line
@@ -2610,12 +2657,19 @@ void migrate_to_tablets_status_operation(scylla_rest_client& client, const bpo::
     if (!nodes.Empty()) {
         fmt::print(std::cout, "\nNodes:\n");
         Tabulate table;
-        table.add("Host ID", "Status");
+        table.add("Host ID", "Address", "Status");
         for (const auto& node : nodes) {
             auto current = rjson::to_string_view(node["current_mode"]);
             auto intended = rjson::to_string_view(node["intended_mode"]);
+            // The server reports an empty address when the address map
+            // doesn't know the node.
+            std::string address(rjson::to_string_view(node["endpoint"]));
+            if (address.empty()) {
+                address = "?";
+            }
             table.add(
                 std::string(rjson::to_string_view(node["host_id"])),
+                std::move(address),
                 std::string(node_status(current, intended)));
         }
         table.print();
@@ -2868,6 +2922,12 @@ void statusgossip_operation(scylla_rest_client& client, const bpo::variables_map
     fmt::print(std::cout, "{}\n", status.GetBool() ? "running" : "not running");
 }
 
+// Function-local static to avoid static-init order fiasko.
+static const std::string& stop_compaction_type_description() {
+    static const std::string description = fmt::format("the type of compaction, one of ({} or REGULAR), COMPACTION covers both REGULAR and MAJOR", fmt::join(api::valid_compaction_types_for_stop(), ", "));
+    return description;
+}
+
 void stop_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     if (vm.contains("id")) {
         throw std::invalid_argument("stopping compactions by id is not implemented");
@@ -2876,12 +2936,10 @@ void stop_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
         throw std::invalid_argument("missing required parameter: compaction_type");
     }
 
-    static const std::vector<std::string_view> recognized_compaction_types{"COMPACTION", "CLEANUP", "SCRUB", "RESHAPE", "RESHARD", "UPGRADE"};
-
     const auto compaction_type = vm["compaction_type"].as<sstring>();
 
-    if (std::ranges::find(recognized_compaction_types, compaction_type) == recognized_compaction_types.end()) {
-        throw std::invalid_argument(fmt::format("invalid compaction type: {}", compaction_type));
+    if (auto res = api::parse_compaction_types_to_stop(compaction_type); !res) {
+        throw std::invalid_argument(res.error());
     }
 
     client.post("/compaction_manager/stop_compaction", {{"type", compaction_type}});
@@ -3978,6 +4036,10 @@ void setstreamthroughput_operation(scylla_rest_client& client, const bpo::variab
 void dropquarantinedsstables_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     std::unordered_map<sstring, sstring> params;
 
+    if (vm.contains("i-accept-data-resurrection-risk")) {
+        params["accept_data_resurrection_risk"] = "true";
+    }
+
     if (vm.contains("keyspace")) {
         const auto [keyspace, tables] = parse_keyspace_and_tables(client, vm);
         params["keyspace"] = keyspace;
@@ -4255,7 +4317,9 @@ fmt::format(R"(
 For more information, see: {}
 )", doc_link("operating-scylla/nodetool-commands/compactionhistory.html")),
                 {
-                    typed_option<sstring>("format,F", "text", "Output format, one of: (json, yaml or text); defaults to text"),
+                    typed_option<sstring>("format,F", "text", "Output format, one of: (json, yaml, text or log); defaults to text. "
+                            "The log format reproduces the log lines compaction would have emitted, so that the history can be "
+                            "merged into a scylla log with sort(1), e.g. sort -k2 scylla.log history.log"),
                 },
             },
             {
@@ -5157,7 +5221,7 @@ For more information, see: {}
                     typed_option<int>("id", "The id of the compaction operation to stop (not implemented)"),
                 },
                 {
-                    typed_option<sstring>("compaction_type", "The type of compaction to be stopped", 1),
+                    typed_option<sstring>("compaction_type", stop_compaction_type_description().c_str(), 1),
                 },
             },
             {
@@ -5537,8 +5601,15 @@ Set the MiB/s throughput for streaming, or 0 to disable throttling
 R"(
 Drop quarantined SSTables from the specified keyspace and table(s), or from all
 keyspaces if no keyspace is specified.
+
+Dropping quarantined SSTables can resurrect deleted data.
+This can happen regardless of the consistency level and of the repair tombstone GC mode.
+This operation should only be used with full understanding of the risks when no viable alternatives remain.
+To accept the risk and carry out the operation, provide the --i-accept-data-resurrection-risk flag.
 )",
-            {},
+            {
+                typed_option<>("i-accept-data-resurrection-risk", "Accept data resurrection risk. The command is rejected if not specified."),
+            },
             {
                 typed_option<sstring>("keyspace", "The keyspace to drop quarantined SSTables from, if missing, all keyspaces will be affected", 1),
                 typed_option<std::vector<sstring>>("table", "The table(s) to drop quarantined SSTables from, if missing, all tables will be affected", -1),
@@ -5713,7 +5784,7 @@ For more information, see: {})";
             fmt::print(std::cerr, "error running operation: failed assert on JSON data: {}\nAPI requests: {}\n", e.what(), fmt::join(client->request_history(), "\n    "));
             return 2;
         } catch (...) {
-            fmt::print(std::cerr, "error running operation: {}\n", std::current_exception());
+            fmt::print(std::cerr, "error running operation: {:t}\n", std::current_exception());
             return 2;
         }
 

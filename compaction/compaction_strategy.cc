@@ -55,7 +55,7 @@ std::vector<compaction_descriptor> compaction_strategy_impl::get_cleanup_compact
 
 std::unique_ptr<sstables::sstable_set_impl>
 compaction_strategy_impl::make_sstable_set(const compaction_group_view& ts) const {
-    return std::make_unique<sstables::partitioned_sstable_set>(ts.schema(), ts.token_range());
+    return std::make_unique<sstables::partitioned_sstable_set>(ts.schema());
 }
 
 bool compaction_strategy_impl::worth_dropping_tombstones(const sstables::shared_sstable& sst, gc_clock::time_point compaction_time, const compaction_group_view& t) {
@@ -225,6 +225,10 @@ size_tiered_backlog_tracker::compacted_backlog(const compaction_backlog_tracker:
         if (!_contrib.sstables.contains(crp.first)) {
             continue;
         }
+        // Ci is left untaxed on purpose: the fixed cost belongs to the sstable existing,
+        // not to the compaction reading it, so it's only retired once the sstable leaves
+        // the set. Taxing Ci would cancel the tax added to Si for every sstable being
+        // compacted, and prorating it would only decay it earlier.
         auto compacted = crp.second->compacted();
         in.total_bytes += compacted;
         in.contribution += compacted * log4(crp.first->data_size());
@@ -253,7 +257,10 @@ size_tiered_backlog_tracker::sstables_backlog_contribution size_tiered_backlog_t
             continue;
         }
         contrib.value += std::ranges::fold_left(bucket | std::views::transform([] (const sstables::shared_sstable& sst) -> double {
-            return sst->data_size() * log4(sst->data_size());
+            // Si is taxed with the fixed per-sstable cost where it weighs the work, but
+            // not inside the log. See sstable_backlog_fixed_cost.
+            auto data_size = sst->data_size();
+            return effective_backlog_size(data_size) * log4(data_size);
         }), double(0.0f), std::plus{});
         // Controller is disabled if exception is caught during add / remove calls, so not making any effort to make this exception safe
         contrib.sstables.insert(bucket.begin(), bucket.end());
@@ -262,10 +269,17 @@ size_tiered_backlog_tracker::sstables_backlog_contribution size_tiered_backlog_t
     return contrib;
 }
 
-double size_tiered_backlog_tracker::backlog(const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const {
+double size_tiered_backlog_tracker::backlog(const compaction_backlog_source&, const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const {
+    if (_backlog_dirty) {
+        _contrib = calculate_sstables_backlog_contribution(_all | std::ranges::to<std::vector>(), _stcs_options);
+        _backlog_dirty = false;
+    }
+
     inflight_component compacted = compacted_backlog(oc);
 
-    auto total_backlog_bytes = std::ranges::fold_left(_contrib.sstables | std::views::transform(std::mem_fn(&sstables::sstable::data_size)), uint64_t(0), std::plus{});
+    auto total_backlog_bytes = std::ranges::fold_left(_contrib.sstables | std::views::transform([] (const sstables::shared_sstable& sst) {
+        return effective_backlog_size(sst->data_size());
+    }), uint64_t(0), std::plus{});
 
     // Bail out if effective backlog is zero, which happens in a small window where ongoing compaction exhausted
     // input files but is still sealing output files or doing managerial stuff like updating history table
@@ -310,12 +324,11 @@ void size_tiered_backlog_tracker::replace_sstables(const std::vector<sstables::s
             }
         }
     }
-    auto tmp_contrib = calculate_sstables_backlog_contribution(tmp_all | std::ranges::to<std::vector>(), _stcs_options);
-
     std::invoke([&] () noexcept {
         _all = std::move(tmp_all);
         _total_bytes = tmp_total_bytes;
-        _contrib = std::move(tmp_contrib);
+        // Defer recalculation to the next backlog() call, mirroring incremental_backlog_tracker.
+        _backlog_dirty = true;
     });
 }
 
@@ -344,7 +357,7 @@ public:
         , _stcs_options(stcs_options)
     {}
 
-    virtual double backlog(const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override {
+    virtual double backlog(const compaction_backlog_source& src, const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override {
         auto no_ow = compaction_backlog_tracker::ongoing_writes();
         auto no_oc = compaction_backlog_tracker::ongoing_compactions();
 
@@ -352,7 +365,7 @@ public:
         if (ow.empty() && oc.empty()) {
             double b = 0;
             for (auto& windows : _windows) {
-                b += windows.second.backlog(no_ow, no_oc);
+                b += windows.second.backlog(src, no_ow, no_oc);
             }
             return b;
         }
@@ -385,7 +398,7 @@ public:
             if (itc != compactions_per_window.end()) {
                 oc_this_window = &itc->second;
             }
-            b += windows.second.backlog(*ow_this_window, *oc_this_window);
+            b += windows.second.backlog(src, *ow_this_window, *oc_this_window);
             if (itw != writes_per_window.end()) {
                 // We will erase here so we can keep track of which
                 // writes belong to existing windows. Writes that don't belong to any window
@@ -397,7 +410,7 @@ public:
 
         // Partial writes that don't belong to any window are accounted here.
         for (auto& current : writes_per_window) {
-            b += size_tiered_backlog_tracker(_stcs_options).backlog(current.second, no_oc);
+            b += size_tiered_backlog_tracker(_stcs_options).backlog(src, current.second, no_oc);
         }
         return b;
     }
@@ -458,7 +471,7 @@ public:
         , _max_sstable_size(max_sstable_size_in_mb * 1024 * 1024)
     {}
 
-    virtual double backlog(const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override {
+    virtual double backlog(const compaction_backlog_source& src, const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override {
         std::vector<uint64_t> effective_size_per_level = _size_per_level;
         compaction_backlog_tracker::ongoing_writes l0_partial_writes;
         compaction_backlog_tracker::ongoing_compactions l0_compacted;
@@ -479,7 +492,7 @@ public:
             effective_size_per_level[level] -= cp.second->compacted();
         }
 
-        double b = _l0_scts.backlog(l0_partial_writes, l0_compacted);
+        double b = _l0_scts.backlog(src, l0_partial_writes, l0_compacted);
 
         size_t max_populated_level = [&effective_size_per_level] () -> size_t {
             auto it = std::find_if(effective_size_per_level.rbegin(), effective_size_per_level.rend(), [] (uint64_t s) {
@@ -570,14 +583,14 @@ public:
 };
 
 struct unimplemented_backlog_tracker final : public compaction_backlog_tracker::impl {
-    virtual double backlog(const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override {
+    virtual double backlog(const compaction_backlog_source& src, const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override {
         return compaction_controller::disable_backlog;
     }
     virtual void replace_sstables(const std::vector<sstables::shared_sstable>& old_ssts, const std::vector<sstables::shared_sstable>& new_ssts) override {}
 };
 
 struct null_backlog_tracker final : public compaction_backlog_tracker::impl {
-    virtual double backlog(const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override {
+    virtual double backlog(const compaction_backlog_source& src, const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override {
         return 0;
     }
     virtual void replace_sstables(const std::vector<sstables::shared_sstable>& old_ssts, const std::vector<sstables::shared_sstable>& new_ssts) override {}
@@ -620,7 +633,7 @@ void leveled_compaction_strategy::validate_options(const std::map<sstring, sstri
     size_tiered_compaction_strategy_options::validate(options, unchecked_options);
 
     auto tmp_value = compaction_strategy_impl::get_value(options, SSTABLE_SIZE_OPTION);
-    auto min_sstables_size = cql3::statements::property_definitions::to_long(SSTABLE_SIZE_OPTION, tmp_value, DEFAULT_MAX_SSTABLE_SIZE_IN_MB);
+    auto min_sstables_size = cql3::statements::property_definitions::to_int(SSTABLE_SIZE_OPTION, tmp_value, DEFAULT_MAX_SSTABLE_SIZE_IN_MB);
     if (min_sstables_size <= 0) {
         throw exceptions::configuration_exception(fmt::format("{} value ({}) must be positive", SSTABLE_SIZE_OPTION, min_sstables_size));
     }
@@ -800,7 +813,7 @@ future<reshape_config> make_reshape_config(const sstables::storage& storage, res
 }
 
 std::unique_ptr<sstables::sstable_set_impl> incremental_compaction_strategy::make_sstable_set(const compaction_group_view& ts) const {
-    return std::make_unique<sstables::partitioned_sstable_set>(ts.schema(), ts.token_range());
+    return std::make_unique<sstables::partitioned_sstable_set>(ts.schema());
 }
 
 }

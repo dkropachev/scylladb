@@ -34,6 +34,7 @@
 #include <seastar/testing/test_case.hh>
 #include "dht/i_partitioner.hh"
 #include "test/lib/mutation_reader_assertions.hh"
+#include "test/lib/s3_fixture.hh"
 #include "test/lib/mutation_assertions.hh"
 #include "mutation/counters.hh"
 #include "test/lib/index_reader_assertions.hh"
@@ -290,7 +291,8 @@ SEASTAR_TEST_CASE(datafile_generation_16) {
     return test_datafile_generation_16({});
 }
 
-SEASTAR_TEST_CASE(datafile_generation_16_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+SEASTAR_TEST_CASE(datafile_generation_16_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)
+        *seastar::testing::async_fixture<s3_fixture>()) {
     return test_datafile_generation_16(test_env_config{ .storage = make_test_object_storage_options("S3") });
 }
 
@@ -2573,19 +2575,16 @@ static dht::token token_from_long(int64_t value) {
 }
 
 SEASTAR_TEST_CASE(basic_interval_map_testing_for_sstable_set) {
+    // Mirrors the interval map used by partitioned_sstable_set, which is keyed
+    // by biased tokens.
     using value_set = std::unordered_set<int64_t>;
-    using interval_map_type = boost::icl::interval_map<dht::compatible_ring_position_or_view, value_set>;
+    using interval_map_type = boost::icl::interval_map<uint64_t, value_set>;
     using interval_type = interval_map_type::interval_type;
 
     interval_map_type map;
 
-        auto builder = schema_builder(this_smp_shard_count(), "tests", "test")
-                .with_column("id", utf8_type, column_kind::partition_key)
-                .with_column("value", int32_type);
-        auto s = builder.build();
-
     auto make_pos = [&] (int64_t token) {
-        return dht::compatible_ring_position_or_view(s, dht::ring_position::starting_at(token_from_long(token)));
+        return token_from_long(token).unbias();
     };
 
     auto add = [&] (int64_t start, int64_t end, int gen) {
@@ -3224,7 +3223,8 @@ SEASTAR_TEST_CASE(test_sstable_bytes_on_disk_correctness) {
     return test_sstable_bytes_correctness(get_name() + "_disk", {});
 }
 
-SEASTAR_TEST_CASE(test_sstable_bytes_on_s3_correctness) {
+SEASTAR_TEST_CASE(test_sstable_bytes_on_s3_correctness,
+        *seastar::testing::async_fixture<s3_fixture>()) {
     return test_sstable_bytes_correctness(get_name() + "_s3", test_env_config{ .storage = make_test_object_storage_options("S3") });
 }
 
@@ -3521,11 +3521,15 @@ SEASTAR_THREAD_TEST_CASE(test_small_sstable_has_reasonable_memory_usage) {
         return make_sstable_containing(env.make_sst_factory(s), {std::move(m)}).get();
     };
 
-    // Warm up: write and discard one sstable, so that any lazily-initialized,
-    // one-off allocations on the write path (and the single shared, deduplicated
-    // dictionary copy) are already accounted for before we start measuring.
-    auto warmup = write_one();
-    BOOST_REQUIRE(warmup->get_compression().get_compressor().get_algorithm() == compressor::algorithm::zstd_with_dicts);
+    // Warm up: write and discard a full batch, so the write path's one-off allocations
+    // (including the shared dictionary copy) and the pools are in steady state.
+    {
+        std::vector<shared_sstable> warmup;
+        for (int i = 0; i < num_sstables; ++i) {
+            warmup.push_back(write_one());
+        }
+        BOOST_REQUIRE(warmup.front()->get_compression().get_compressor().get_algorithm() == compressor::algorithm::zstd_with_dicts);
+    }
 
     // Now measure the live-memory growth by holding onto N freshly written
     // sstables with the same dict.
@@ -3535,20 +3539,21 @@ SEASTAR_THREAD_TEST_CASE(test_small_sstable_has_reasonable_memory_usage) {
         ssts.push_back(write_one());
     }
     auto allocated_after = memory::stats().allocated_memory();
-    auto growth = allocated_after - allocated_before;
+    // Signed: allocated_memory() can also drop across the batch.
+    auto growth = int64_t(allocated_after) - int64_t(allocated_before);
 
     // The single shared dictionary copy was already allocated during warm-up, so
     // the growth should be bounded by just the per-sstable overhead.
-    const size_t upper_bound = num_sstables * per_sstable_allowance;
-    const size_t lower_bound = num_sstables * sizeof(sstable);
+    const int64_t upper_bound = num_sstables * per_sstable_allowance;
     testlog.info("live-memory growth from holding {} dict-compressed sstables: {} bytes "
-            "(lower_bound: {} bytes, upper_bound: {} bytes, dict_size: {} bytes)",
-            num_sstables, growth, lower_bound, upper_bound, dict_size);
+            "(upper_bound: {} bytes, dict_size: {} bytes)",
+            num_sstables, growth, upper_bound, dict_size);
 
 #ifndef SEASTAR_DEFAULT_ALLOCATOR
     // memory::stats() only reflects real usage with the seastar allocator; under
     // the default allocator (e.g. sanitizer builds) the numbers are meaningless.
+    // Upper bound only: allocated_memory() is page occupancy, not live bytes, so warm
+    // pools can absorb the batch and a growth of 0 is legitimate.
     BOOST_REQUIRE_LT(growth, upper_bound);
-    BOOST_REQUIRE_GE(growth, lower_bound);
 #endif
 }

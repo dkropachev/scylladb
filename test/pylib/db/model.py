@@ -20,15 +20,17 @@ class HostInfo:
 class CgroupMetric:
     memory: int
     test_id: int
-    host_id: str
     timestamp: datetime
 
 
 @define
 class Metric:
     test_id: int
-    host_id: str
     memory_peak: int = None
+    seastar_read_bytes: int = None
+    seastar_read_ops: int = None
+    seastar_write_bytes: int = None
+    seastar_write_ops: int = None
     success: bool = None
     status: str = None
     system_sec: float = None
@@ -50,6 +52,25 @@ class SystemResourceMetric:
     memory_active: int
     memory_inactive: int
     memory_buffers: int
+    timestamp: datetime
+
+
+@define
+class ResourceUtilization:
+    host_id: str
+    architecture: str
+    mode: str
+    samples: int
+    cpu_avg: float
+    cpu_median: float
+    cpu_p95: float
+    cpu_p99: float
+    cpu_score: float
+    memory_avg: float
+    memory_median: float
+    memory_p95: float
+    memory_p99: float
+    memory_score: float
     timestamp: datetime
 
 

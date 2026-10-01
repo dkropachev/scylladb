@@ -7,6 +7,8 @@
  */
 #pragma once
 
+#include <ranges>
+
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/on_internal_error.hh>
 #include "utils/assert.hh"
@@ -17,6 +19,41 @@
 #include "log.hh"
 
 namespace raft {
+
+// The ids (index and term) of a contiguous run of log entries,
+// [first_idx(), last_idx]. The terms are stored run-length encoded: one
+// (first index, term) pair per stretch of equal terms, in index order.
+// Nearly always a single pair.
+struct entry_id_range {
+    index_t last_idx = index_t{0};
+    utils::small_vector<std::pair<index_t, term_t>, 1> terms;
+
+    bool empty() const {
+        return terms.empty();
+    }
+    index_t first_idx() const {
+        return terms.front().first;
+    }
+    size_t size() const {
+        return empty() ? 0 : (last_idx - first_idx()).value() + 1;
+    }
+    // Appends the id of the entry right after last_idx (or of the first
+    // entry, when empty).
+    void append(index_t idx, term_t term) {
+        SCYLLA_ASSERT(empty() || idx == last_idx + index_t{1});
+        if (terms.empty() || terms.back().second != term) {
+            terms.emplace_back(idx, term);
+        }
+        last_idx = idx;
+    }
+};
+
+// The entries that became committed with one fsm output.
+struct committed_batch {
+    entry_id_range ids;
+    // A non-joint configuration entry is among them.
+    bool non_joint_conf_committed = false;
+};
 
 // State of the FSM that needs logging & sending.
 struct fsm_output {
@@ -30,8 +67,11 @@ struct fsm_output {
     std::optional<std::pair<term_t, server_id>> term_and_vote;
     log_entry_ptr_list log_entries;
     utils::chunked_vector<std::pair<server_id, rpc_message>> messages;
-    // Entries to apply.
-    log_entry_ptr_list committed;
+    // Empty when the commit index did not advance. Only the entry ids are
+    // reported: the entries themselves stay in the log, the consumer reads
+    // them from there while the log still holds them, and the terms let it
+    // resolve the waiters even after a snapshot has replaced the entries.
+    committed_batch committed;
     std::optional<applied_snapshot> snp;
     // In a typical scenario contains only one item, occasionally more.
     utils::small_vector<snapshot_id, 1> snps_to_drop;
@@ -115,7 +155,7 @@ struct leader {
     // Used to access new leader to set semaphore exception
     const raft::fsm& fsm;
     // Used to limit log size
-    std::unique_ptr<seastar::semaphore> log_limiter_semaphore;
+    lw_shared_ptr<seastar::semaphore> log_limiter_semaphore;
     // If the leader is in the process of transferring the leadership
     // contains a time point in the future the transfer will be aborted at
     // unless completes successfully till then.
@@ -123,6 +163,9 @@ struct leader {
     // If timeout_now was already sent to one of the followers contains the id of the follower
     // it was sent to
     std::optional<server_id> timeout_now_sent;
+    // If set, leadership transfer must select this voting follower once it has
+    // caught up with the leader's log.
+    std::optional<server_id> leadership_transfer_target;
     // A source of read ids - a monotonically growing (in single term) identifiers of
     // reads issued by the state machine. Using monotonic ids allows the leader to
     // resolve all preceding read requests when a quorum of acks from followers arrive
@@ -182,7 +225,7 @@ struct leader {
     // again in reverse when the clock recovers. Drawn once per leadership term.
     mono_clock::duration clock_stepdown_jitter{0};
 
-    leader(size_t max_log_size, const class fsm& fsm_) : fsm(fsm_), log_limiter_semaphore(std::make_unique<seastar::semaphore>(max_log_size)) {}
+    leader(size_t max_log_size, const class fsm& fsm_) : fsm(fsm_), log_limiter_semaphore(make_lw_shared<seastar::semaphore>(max_log_size)) {}
     leader(leader&&) = default;
     ~leader();
 };
@@ -466,6 +509,24 @@ protected: // For testing
     }
 
 public:
+    class memory_permit {
+    private:
+        lw_shared_ptr<seastar::semaphore> _semaphore;
+        seastar::semaphore_units<> _units;
+
+        memory_permit(lw_shared_ptr<seastar::semaphore> semaphore, seastar::semaphore_units<> units)
+                : _semaphore(std::move(semaphore)), _units(std::move(units))
+        {}
+
+    public:
+        size_t release() {
+            return _units.release();
+        }
+
+        memory_permit() = default;
+        friend class fsm;
+    };
+
     explicit fsm(server_id id, sstring tag, term_t current_term, server_id voted_for, log log,
             index_t commit_idx, failure_detector& failure_detector, fsm_config conf,
             seastar::condition_variable& sm_events);
@@ -529,6 +590,17 @@ public:
         }
     }
 
+    // Forget the leader this follower knows of, so that current_leader()
+    // is empty until a leader sends us a message again. For a caller which
+    // knows from outside of raft that the reported leader is gone - e.g. it
+    // was removed from the configuration - but this follower hasn't heard
+    // from the new leader yet. Does nothing on a leader or a candidate.
+    void forget_leader() {
+        if (is_follower()) {
+            follower_state().current_leader = server_id{};
+        }
+    }
+
     // Ask to search for a leader if one is not known.
     // Immediately sends ping messages to all peers and keeps pinging
     // on subsequent ticks until a leader is found.
@@ -542,7 +614,7 @@ public:
     // go below max_log_size.
     // Can only be called on a leader.
     // On abort throws `semaphore_aborted`.
-    future<semaphore_units<>> wait_for_memory_permit(seastar::abort_source* as, size_t size);
+    future<memory_permit> wait_for_memory_permit(seastar::abort_source* as, size_t size);
 
     // Return current configuration.
     const configuration& get_configuration() const;
@@ -584,7 +656,12 @@ public:
     // sends timeout_now rpc to it and makes it initiate new election.
     // Can be used for leader stepdown if new configuration does not contain
     // current leader.
-    void transfer_leadership(logical_clock::duration timeout = logical_clock::duration(0));
+    // If a target is selected, the leadership transfer will be attempted to that target only.
+    // The target must be a voting member of the current configuration other than the leader
+    // itself. Nobody but the target is ever sent timeout_now, so any other target leaves the
+    // transfer with no one to hand leadership to. It then waits out `timeout` with the log limiter
+    // consumed - the group takes no writes for that whole time - before tick_leader() cancels it.
+    void transfer_leadership(logical_clock::duration timeout = logical_clock::duration(0), server_id target = {});
 
     void stop();
 
@@ -614,6 +691,13 @@ public:
     size_t log_memory_usage() const {
         return _log.memory_usage();
     };
+
+    // Returns the log entry at the given index, which must be present in
+    // the log: above the last snapshot index and at most the last index
+    // (it is a programming error otherwise, the function will abort).
+    const log_entry_ptr& log_entry_at(index_t idx) {
+        return _log[idx.value()];
+    }
 
     server_id id() const { return _my_id; }
 

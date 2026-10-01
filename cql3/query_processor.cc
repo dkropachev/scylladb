@@ -17,6 +17,7 @@
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/try_future.hh>
 
+#include "auth/authenticated_user.hh"
 #include "service/storage_proxy.hh"
 #include "service/migration_manager.hh"
 #include "service/mapreduce_service.hh"
@@ -668,7 +669,7 @@ query_processor::execute_direct_statement_without_checking_exception_message(std
             metrics.regularStatementsExecuted.inc();
 #endif
     auto user = query_state.get_client_state().user();
-    tracing::trace(query_state.get_trace_state(), "Processing a statement for authenticated user: {}", user ? (user->name ? *user->name : "anonymous") : "no user authenticated");
+    tracing::trace(query_state.get_trace_state(), "Processing a statement for authenticated user: {}", user ? (user->name ? *user->name : auth::anonymous_username) : "no user authenticated");
     return execute_maybe_with_guard(query_state, std::move(statement), options, &query_processor::do_execute_direct, std::move(p->warnings));
 }
 
@@ -728,7 +729,7 @@ query_processor::do_execute_prepared(
         try {
             co_await _authorized_prepared_cache.insert(*query_state.get_client_state().user(), std::move(cache_key), std::move(prepared));
         } catch (...) {
-            log.error("failed to cache the entry: {}", std::current_exception());
+            log.error("failed to cache the entry: {:t}", std::current_exception());
         }
     }
 
@@ -1140,7 +1141,7 @@ query_processor::execute_batch_without_checking_exception_message(
             try {
                 co_await _authorized_prepared_cache.insert(*query_state.get_client_state().user(), e.first, std::move(e.second));
             } catch (...) {
-                log.error("failed to cache the entry: {}", std::current_exception());
+                log.error("failed to cache the entry: {:t}", std::current_exception());
             }
     });
     _stats.queries_by_cl[size_t(options.get_consistency())] += batch_size;
@@ -1333,7 +1334,7 @@ future<> query_processor::query_internal(
 future<> query_processor::query_internal(
         const sstring& query_string,
         noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)> f) {
-    return query_internal(query_string, db::consistency_level::ONE, {}, 1000, std::move(f));
+    return query_internal(query_string, db::consistency_level::ONE, {}, default_internal_page_size, std::move(f));
 }
 
 shared_ptr<cql_transport::messages::result_message> query_processor::bounce_to_shard(unsigned shard, cql3::computed_function_values cached_fn_calls, bool track) {

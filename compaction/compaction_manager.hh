@@ -159,6 +159,8 @@ private:
     compaction_controller _compaction_controller;
     compaction_backlog_manager _backlog_manager;
     optimized_optional<abort_source::subscription> _early_abort_subscription;
+    future<> update_history(compaction_group_view& t, compaction_result&& res, const compaction_data& cdata);
+
     serialized_action _update_compaction_static_shares_action;
     utils::observer<float> _compaction_static_shares_observer;
     utils::observer<float> _compaction_max_shares_observer;
@@ -452,32 +454,36 @@ public:
 
     bool compaction_disabled(compaction::compaction_group_view& t) const;
 
-    // Stops ongoing compaction of a given type.
-    future<> stop_compaction(sstring type, std::function<bool(const compaction_group_view*)> filter = [] (auto) { return true; });
-
 private:
     std::vector<shared_ptr<compaction_task_executor>>
-    do_stop_ongoing_compactions(sstring reason, std::function<bool(const compaction_group_view*)> filter, std::optional<compaction_type> type_opt) noexcept;
-    future<> stop_ongoing_compactions(sstring reason, std::function<bool(const compaction_group_view*)> filter, std::optional<compaction_type> type_opt = {}) noexcept;
+    do_stop_ongoing_compactions(sstring reason, std::function<bool(const compaction_group_view*)> filter, std::optional<compaction_type_set> types_opt) noexcept;
 
 public:
-    // Stops ongoing compaction of a given table and/or compaction_type.
+    // Stops ongoing compactions of the given types, on the compaction group views selected by filter.
     // Never fails: any error encountered while stopping is logged and swallowed, so
     // callers may rely on the returned future resolving successfully. In particular it
     // is safe to co_await it while holding a future that must still be awaited
     // afterwards (see compaction_group::stop()).
-    future<> stop_ongoing_compactions(sstring reason, compaction::compaction_group_view* t = nullptr, std::optional<compaction_type> type_opt = {}) noexcept;
+    // A disengaged types_opt means: stop compactions of any type.
+    // An empty types_opt (engaged optional containing empty enum set) means: don't stop any compaction.
+    future<> stop_ongoing_compactions(sstring reason, std::optional<compaction_type_set> types_opt = {}, std::function<bool(const compaction_group_view*)> filter = [] (auto) { return true; }) noexcept;
+    future<> stop_ongoing_compactions(sstring reason, const compaction_group_view* v, std::optional<compaction_type_set> types_opt = {}) noexcept {
+        return stop_ongoing_compactions(std::move(reason), std::move(types_opt), [v] (const compaction_group_view* x) { return !v || x == v; });
+    }
 
     future<> await_ongoing_compactions(compaction_group_view* t);
 
     compaction_reenabler stop_and_disable_compaction_no_wait(compaction_group_view& t, sstring reason);
 
+    // Total size of the sstables that compaction would consider for a compaction group.
+    future<uint64_t> get_candidates_size(compaction::compaction_group_view& t) const;
+
     double backlog() {
         return _backlog_manager.backlog();
     }
 
-    void register_backlog_tracker(compaction_backlog_tracker& backlog_tracker) {
-        _backlog_manager.register_backlog_tracker(backlog_tracker);
+    void register_backlog_tracker(compaction_backlog_tracker& backlog_tracker, const compaction::compaction_backlog_source& src) {
+        _backlog_manager.register_backlog_tracker(backlog_tracker, src);
     }
 
     compaction_backlog_tracker& get_backlog_tracker(compaction::compaction_group_view& t);
@@ -601,9 +607,9 @@ protected:
     future<compaction_result> compact_sstables(compaction_descriptor descriptor, compaction_data& cdata, on_replacement&,
                                 compaction_manager::can_purge_tombstones can_purge = compaction_manager::can_purge_tombstones::yes,
                                 sstables::offstrategy offstrategy = sstables::offstrategy::no);
-    future<> update_history(::compaction::compaction_group_view& t, compaction_result&& res, const compaction_data& cdata);
-    bool should_update_history(compaction_type ct) {
-        return ct == compaction_type::Compaction || ct == compaction_type::Major;
+    // Delegates to compaction_manager::update_history
+    future<> update_history(::compaction::compaction_group_view& t, compaction_result&& res, const compaction_data& cdata) {
+        return _cm.update_history(t, std::move(res), cdata);
     }
 public:
     compaction_manager::compaction_stats_opt get_stats() const noexcept {

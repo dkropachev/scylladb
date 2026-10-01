@@ -401,10 +401,23 @@ def get_modes_to_run(config) -> list[str]:
 
 def scale_timeout_by_mode(mode: str, timeout: int | float) -> int | float:
     """Scale timeout according to test.py mode semantics.
-    Each mode has a different scale: debug and sanitize modes are multiplied by 3, dev by 2.
+    Each mode has a different scale: debug, coverage, and sanitize modes are multiplied by 3, dev by 2.
     Unknown modes are left unchanged.
     """
     return MODES_TIMEOUT_FACTOR.get(mode, 1) * timeout
+
+
+# Base timeout for stopping a Scylla server gracefully, before mode scaling.
+# A graceful stop flushes every memtable, and the flushes are serialized per
+# shard by the dirty memory manager's flush serializer. On a loaded CI machine
+# that takes minutes, against well under a second locally, so the timeout has
+# to be generous enough not to fire on slowness alone (SCYLLADB-3213).
+GRACEFUL_STOP_TIMEOUT_SECONDS = 300
+
+
+def graceful_stop_timeout(mode: str) -> int | float:
+    """Timeout for stopping a server gracefully in the given build mode."""
+    return scale_timeout_by_mode(mode, GRACEFUL_STOP_TIMEOUT_SECONDS)
 
 
 async def gather_safely(*awaitables: Awaitable):

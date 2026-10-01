@@ -14,8 +14,9 @@ namespace replica::logstor {
 
 // cached_mutation_entry
 
-cached_mutation_entry::cached_mutation_entry(schema_ptr schema, const mutation_partition& partition, cached_entry_slot& slot)
+cached_mutation_entry::cached_mutation_entry(schema_ptr schema, const partition_key& key, const mutation_partition& partition, cached_entry_slot& slot)
         : _schema(std::move(schema))
+        , _key(key)
         , _partition(*_schema, partition)
         , _slot_link(entangled::make_paired_with(slot._entry_link)) {
 }
@@ -53,17 +54,19 @@ void cache_tracker::evict(const primary_index_entry& pie) {
     });
 }
 
-std::optional<mutation> cache_tracker::lookup(const primary_index_entry& pie, schema_ptr target_schema) {
+std::optional<mutation> cache_tracker::lookup(const primary_index_entry& pie, const schema& target_schema) {
     std::optional<mutation> cached_mut;
     _read_section(region(), [&] {
         if (pie._cached_entry) {
             get_lru().touch(*pie._cached_entry);
-            if (pie._cached_entry->schema() != target_schema) {
+            if (pie._cached_entry->schema().get() != &target_schema) {
                 with_allocator(allocator(), [&] {
-                    pie._cached_entry->upgrade(target_schema);
+                    pie._cached_entry->upgrade(target_schema.shared_from_this());
                 });
             }
-            cached_mut = mutation(target_schema, dht::decorated_key(pie.key()), pie._cached_entry->partition());
+            dht::decorated_key dk(pie.key().token(), pie._cached_entry->key());
+            cached_mut.emplace(target_schema.shared_from_this(), std::move(dk),
+                    mutation_partition(target_schema, pie._cached_entry->partition()));
         }
     });
 
@@ -76,6 +79,22 @@ std::optional<mutation> cache_tracker::lookup(const primary_index_entry& pie, sc
     return cached_mut;
 }
 
+std::optional<mutation> cache_tracker::peek(const primary_index_entry& pie, schema_ptr target_schema) {
+    std::optional<mutation> cached_mut;
+    _read_section(region(), [&] {
+        if (pie._cached_entry) {
+            dht::decorated_key dk(pie.key().token(), pie._cached_entry->key());
+            cached_mut.emplace(pie._cached_entry->schema(), std::move(dk), pie._cached_entry->partition());
+        }
+    });
+
+    if (cached_mut && cached_mut->schema() != target_schema) {
+        cached_mut->upgrade(target_schema);
+    }
+
+    return cached_mut;
+}
+
 void cache_tracker::populate(const primary_index_entry& pie, const mutation& m) {
     _populate_section(region(), [&] {
         with_allocator(allocator(), [&] {
@@ -83,7 +102,7 @@ void cache_tracker::populate(const primary_index_entry& pie, const mutation& m) 
                 _shared_tracker.on_miss_already_populated();
                 return;
             }
-            auto* e = current_allocator().construct<cached_mutation_entry>(m.schema(), m.partition(), pie._cached_entry);
+            auto* e = current_allocator().construct<cached_mutation_entry>(m.schema(), m.decorated_key().key(), m.partition(), pie._cached_entry);
             get_lru().add(*e);
             _shared_tracker.on_partition_insert();
         });

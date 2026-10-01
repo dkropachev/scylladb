@@ -204,6 +204,7 @@ public:
             auto logname = log_name(schema.cf_name());
             check_that_cdc_log_table_does_not_exist(db, schema, logname);
             ensure_that_table_has_no_counter_columns(schema);
+            ensure_that_keyspace_is_not_strongly_consistent(ksm, schema);
             if (!db.features().cdc_with_tablets) {
                 ensure_that_table_uses_vnodes(ksm, schema, db.get_token_metadata().get_topology());
             }
@@ -248,6 +249,7 @@ public:
 
             check_for_attempt_to_create_nested_cdc_log(db, new_schema);
             ensure_that_table_has_no_counter_columns(new_schema);
+            ensure_that_keyspace_is_not_strongly_consistent(*keyspace.metadata(), new_schema);
             if (!db.features().cdc_with_tablets) {
                 ensure_that_table_uses_vnodes(*keyspace.metadata(), new_schema, db.get_token_metadata().get_topology());
             }
@@ -263,7 +265,7 @@ public:
             mutations.insert(mutations.end(), std::make_move_iterator(log_mut.begin()), std::make_move_iterator(log_mut.end()));
 
             if (!log_schema) {
-                db.get_notifier().before_create_column_family(*keyspace.metadata(), *new_log_schema, mutations, timestamp);
+                db.get_notifier().before_create_column_family_in_notification(*keyspace.metadata(), *new_log_schema, mutations, timestamp);
             }
         }
     }
@@ -279,7 +281,7 @@ public:
                 auto log_mut = db::schema_tables::make_drop_table_mutations(keyspace.metadata(), log_schema, timestamp);
                 mutations.insert(mutations.end(), std::make_move_iterator(log_mut.begin()), std::make_move_iterator(log_mut.end()));
 
-                db.get_notifier().before_drop_column_family(*log_schema, mutations, timestamp);
+                db.get_notifier().before_drop_column_family_in_notification(*log_schema, mutations, timestamp);
             }
         }
 
@@ -344,6 +346,14 @@ private:
     static void ensure_that_table_has_no_counter_columns(const schema& schema) {
         if (schema.is_counter()) {
             throw exceptions::invalid_request_exception(format("Cannot create CDC log for table {}.{}. Counter support not implemented",
+                    schema.ks_name(), schema.cf_name()));
+        }
+    }
+
+    static void ensure_that_keyspace_is_not_strongly_consistent(const keyspace_metadata& ksm, const schema& schema) {
+        using data_dictionary::consistency_config_option;
+        if (ksm.consistency_option().value_or(consistency_config_option::eventual) != consistency_config_option::eventual) {
+            throw exceptions::invalid_request_exception(format("Cannot create CDC log for table {}.{}: CDC is not supported in strongly consistent keyspaces",
                     schema.ks_name(), schema.cf_name()));
         }
     }

@@ -119,32 +119,44 @@ bool is_eligible_for_compaction(const sstables::shared_sstable& sst) noexcept {
     return !sst->requires_view_building() && !sst->is_quarantined();
 }
 
+bool is_eligible_for_compaction(const sstables::frozen_sstable_run& run) noexcept {
+    return std::ranges::all_of(run->all(), [] (const sstables::shared_sstable& sst) {
+        return is_eligible_for_compaction(sst);
+    });
+}
+
 logging::logger clogger("compaction");
 
-static const std::unordered_map<compaction_type, sstring> compaction_types = {
-    { compaction_type::Compaction, "COMPACTION" },
-    { compaction_type::Cleanup, "CLEANUP" },
-    { compaction_type::Validation, "VALIDATION" },
-    { compaction_type::Scrub, "SCRUB" },
-    { compaction_type::Index_build, "INDEX_BUILD" },
-    { compaction_type::Reshard, "RESHARD" },
-    { compaction_type::Upgrade, "UPGRADE" },
-    { compaction_type::Reshape, "RESHAPE" },
-    { compaction_type::Split, "SPLIT" },
-    { compaction_type::Major, "MAJOR" },
+struct compaction_names {
+    sstring legacy_name; // used by origin and rest API
+    sstring name;
+};
+
+static const std::unordered_map<compaction_type, compaction_names> compaction_types = {
+    { compaction_type::Compaction, {"COMPACTION", "Compact"} },
+    { compaction_type::Cleanup, {"CLEANUP", "Cleanup"} },
+    { compaction_type::Validation, {"VALIDATION", "Validate"} },
+    { compaction_type::Scrub, {"SCRUB", "Scrub"} },
+    { compaction_type::Index_build, {"INDEX_BUILD", "Index_build"} },
+    { compaction_type::Reshard, {"RESHARD", "Reshard"} },
+    { compaction_type::Upgrade, {"UPGRADE", "Upgrade"} },
+    { compaction_type::Reshape, {"RESHAPE", "Reshape"} },
+    { compaction_type::Split, {"SPLIT", "Split"} },
+    { compaction_type::Major, {"MAJOR", "Major"} },
+    { compaction_type::RewriteComponent, {"REWRITE_COMPONENT", "RewriteComponent"} },
 };
 
 sstring compaction_name(compaction_type type) {
     auto ret = compaction_types.find(type);
     if (ret != compaction_types.end()) {
-        return ret->second;
+        return ret->second.legacy_name;
     }
     throw std::runtime_error("Invalid Compaction Type");
 }
 
 compaction_type to_compaction_type(sstring type_name) {
     for (auto& it : compaction_types) {
-        if (it.second == type_name) {
+        if (it.second.legacy_name == type_name) {
             return it.first;
         }
     }
@@ -152,18 +164,9 @@ compaction_type to_compaction_type(sstring type_name) {
 }
 
 std::string_view to_string(compaction_type type) {
-    switch (type) {
-    case compaction_type::Compaction: return "Compact";
-    case compaction_type::Cleanup: return "Cleanup";
-    case compaction_type::Validation: return "Validate";
-    case compaction_type::Scrub: return "Scrub";
-    case compaction_type::Index_build: return "Index_build";
-    case compaction_type::Reshard: return "Reshard";
-    case compaction_type::Upgrade: return "Upgrade";
-    case compaction_type::Reshape: return "Reshape";
-    case compaction_type::Split: return "Split";
-    case compaction_type::Major: return "Major";
-    case compaction_type::RewriteComponent: return "RewriteComponent";
+    auto ret = compaction_types.find(type);
+    if (ret != compaction_types.end()) {
+        return ret->second.name;
     }
     on_internal_error_noexcept(clogger, format("Invalid compaction type {}", int(type)));
     return "(invalid)";
@@ -1405,17 +1408,6 @@ private:
     }
 
     void replace_remaining_exhausted_sstables() {
-        if (!_sstables.empty() || !used_garbage_collected_sstables().empty()) {
-            std::vector<sstables::shared_sstable> old_sstables;
-            std::move(_sstables.begin(), _sstables.end(), std::back_inserter(old_sstables));
-
-            // Remove Garbage Collected SSTables from the SSTable set if any was previously added.
-            auto& used_gc_sstables = used_garbage_collected_sstables();
-            old_sstables.insert(old_sstables.end(), used_gc_sstables.begin(), used_gc_sstables.end());
-
-            _replacer(get_compaction_completion_desc(std::move(old_sstables), std::move(_new_unused_sstables)));
-         }
-
         // A GC sstable can still be unused at this point: mutation_compactor seals
         // the GC writer *before* the regular one at end of stream, so if the
         // regular writer had already rotated shut (e.g. the tail of the stream is
@@ -1431,14 +1423,40 @@ private:
         // deleted, and invisible until the next restart rescans the data
         // directory.
         //
-        // Done after the replacement above so the GC sstable, which guards against
+        // Marked on the way out rather than inline, because the replacement below
+        // can throw, and this is the last chance to do it: compaction::run() calls
+        // finish(), and with it on_end_of_compaction(), outside the try/catch that
+        // invokes on_interrupt(), so delete_sstables_for_interrupted_compaction()
+        // -- the only other place that marks them -- would not run either.
+        //
+        // Done after the replacement below so the GC sstable, which guards against
         // data resurrection, outlives the atomic swap of inputs for outputs.
-        for (auto& sst : _unused_garbage_collected_sstables) {
-            log_debug("Deleting unused garbage collected sstable {} for {}.{}",
-                      sst->get_filename(), _schema->ks_name(), _schema->cf_name());
-            sst->mark_for_deletion();
+        auto mark_unused_gc_sstables = defer([this] () noexcept {
+            for (auto& sst : _unused_garbage_collected_sstables) {
+                // Kept clear of the marking below, which is what must not be
+                // skipped: this allocates, and the guard is noexcept, so letting
+                // a formatting failure escape would abort the node with the
+                // sstables still unmarked.
+                try {
+                    log_debug("Deleting unused garbage collected sstable {} for {}.{}",
+                              sst->get_filename(), _schema->ks_name(), _schema->cf_name());
+                } catch (...) {
+                }
+                sst->mark_for_deletion();
+            }
+            _unused_garbage_collected_sstables.clear();
+        });
+
+        if (!_sstables.empty() || !used_garbage_collected_sstables().empty()) {
+            std::vector<sstables::shared_sstable> old_sstables;
+            std::move(_sstables.begin(), _sstables.end(), std::back_inserter(old_sstables));
+
+            // Remove Garbage Collected SSTables from the SSTable set if any was previously added.
+            auto& used_gc_sstables = used_garbage_collected_sstables();
+            old_sstables.insert(old_sstables.end(), used_gc_sstables.begin(), used_gc_sstables.end());
+
+            _replacer(get_compaction_completion_desc(std::move(old_sstables), std::move(_new_unused_sstables)));
         }
-        _unused_garbage_collected_sstables.clear();
     }
 
     void update_pending_ranges() {
@@ -1476,7 +1494,7 @@ public:
     }
 
     virtual sstables::sstable_set make_sstable_set_for_input() const override {
-        return sstables::make_partitioned_sstable_set(_schema, _table_s.token_range());
+        return sstables::make_partitioned_sstable_set(_schema);
     }
 
     // Unconditionally enable incremental compaction if the strategy specifies a max output size, e.g. LCS.
@@ -1737,7 +1755,7 @@ private:
                 throw compaction_aborted_exception(
                         _schema->ks_name(),
                         _schema->cf_name(),
-                        format("scrub compaction failed due to unrecoverable error: {}", e));
+                        format("scrub compaction failed due to unrecoverable error: {:t}", e));
             }
             if (_drop_unfixable_sstables) {
                 _failed_to_fix_sstable = true;
@@ -1855,7 +1873,7 @@ private:
                     throw compaction_aborted_exception(
                             _schema->ks_name(),
                             _schema->cf_name(),
-                            format("scrub compaction failed due to unrecoverable error: {}", std::current_exception()));
+                            format("scrub compaction failed due to unrecoverable error: {:t}", std::current_exception()));
                 }
             });
         }
@@ -2219,7 +2237,7 @@ static future<compaction_result> scrub_sstables_validate_mode(compaction_descrip
             try {
                 co_await sst->change_state(sstables::sstable_state::quarantine);
             } catch (...) {
-                clogger.error("Moving {} to quarantine failed due to {}, continuing.", sst->get_filename(), std::current_exception());
+                clogger.error("Moving {} to quarantine failed due to {:t}, continuing.", sst->get_filename(), std::current_exception());
             }
         }
     }

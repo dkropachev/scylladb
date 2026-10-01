@@ -9,9 +9,11 @@
  */
 
 #include "gms/endpoint_state.hh"
+#include "utils/assert.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
 #include <seastar/core/on_internal_error.hh>
 #include <boost/lexical_cast.hpp>
+#include "utils/error_injection.hh"
 #include "utils/log.hh"
 
 namespace gms {
@@ -82,6 +84,29 @@ future<> i_endpoint_state_change_subscriber::on_application_state_change(inet_ad
         return func(endpoint, id, it->second, pid);
     }
     return make_ready_future<>();
+}
+
+void merge_endpoint_state(endpoint_state& into, const endpoint_state& from) {
+    // Versions are only comparable within one generation; merging across
+    // generations would prefer stale facts from the older incarnation.
+    SCYLLA_ASSERT(into.get_heart_beat_state().get_generation() == from.get_heart_beat_state().get_generation());
+    if (from.get_heart_beat_state().get_heart_beat_version() > into.get_heart_beat_state().get_heart_beat_version()) {
+        into.set_heart_beat_state_and_update_timestamp(from.get_heart_beat_state());
+    }
+    for (const auto& [key, value] : from.get_application_state_map()) {
+        const auto* mine = into.get_application_state_ptr(key);
+        if (!mine || mine->version() < value.version()) {
+            // The copy below allocates, so this loop can tear `into`.
+            // Injecting inside the branch drops a value that really was
+            // newer. SCHEMA only: SCHEMA changes just on DDL, so a test can
+            // observe the loss.
+            if (key == application_state::SCHEMA) {
+                utils::get_local_injector().inject("merge_endpoint_state_fail",
+                        [] { throw std::runtime_error("injected merge failure"); });
+            }
+            into.add_application_state(key, value);
+        }
+    }
 }
 
 }

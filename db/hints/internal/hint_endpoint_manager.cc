@@ -99,8 +99,8 @@ bool hint_endpoint_manager::store_hint(schema_ptr s, lw_shared_ptr<const frozen_
             return do_store_hint(std::move(s), std::move(fm), tr_state);
         });
     } catch (...) {
-        manager_logger.trace("hint_endpoint_manager[{}]:store_hint: Failed to store a hint: {}", end_point_key(), std::current_exception());
-        tracing::trace(tr_state, "Failed to store a hint to {}: {}", end_point_key(), std::current_exception());
+        manager_logger.trace("hint_endpoint_manager[{}]:store_hint: Failed to store a hint: {:t}", end_point_key(), std::current_exception());
+        tracing::trace(tr_state, "Failed to store a hint to {}: {:t}", end_point_key(), std::current_exception());
 
         ++shard_stats().dropped;
         return false;
@@ -215,9 +215,13 @@ future<db::commitlog> hint_endpoint_manager::add_store() noexcept {
         return io_check([name = _hints_dir.c_str()] { return recursive_touch_directory(name); }).then([this] () {
             commitlog::config cfg;
 
+            const auto segment_size_in_mb = utils::get_local_injector().enter("decrease_hint_segment_size")
+                    ? 1
+                    : resource_manager::hint_segment_size_in_mb;
+
             cfg.sched_group = _shard_manager.local_db().commitlog()->active_config().sched_group;
             cfg.commit_log_location = _hints_dir.c_str();
-            cfg.commitlog_segment_size_in_mb = resource_manager::hint_segment_size_in_mb;
+            cfg.commitlog_segment_size_in_mb = segment_size_in_mb;
             cfg.commitlog_total_space_in_mb = resource_manager::max_hints_per_ep_size_mb;
             cfg.fname_prefix = manager::FILENAME_PREFIX;
             cfg.extensions = &_shard_manager.local_db().extensions();

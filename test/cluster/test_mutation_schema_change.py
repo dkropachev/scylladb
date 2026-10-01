@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 pytestmark = pytest.mark.prepare_3_racks_cluster
 
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_mutation_schema_change(manager, random_tables):
     """
         Cluster A, B, C
@@ -34,7 +35,6 @@ async def test_mutation_schema_change(manager, random_tables):
     t = await random_tables.add_table(ncolumns=5, pks=1)
     manager.driver_close()
     # Reduce the snapshot thresholds
-    await manager.mark_dirty()
     errs = [inject_error_one_shot(manager.api, s.ip_addr, "raft_server_set_snapshot_thresholds",
                                   parameters={'snapshot_threshold': '3', 'snapshot_trailing': '1'})
             for s in [server_a, server_b, server_c]]
@@ -44,6 +44,7 @@ async def test_mutation_schema_change(manager, random_tables):
     logger.info("Stopping C %s", server_c)
     await manager.server_stop_gracefully(server_c.server_id)
     await manager.driver_connect()
+    await wait_for_cql_and_get_hosts(manager.cql, [server_a, server_b], time.time() + 60)
 
     async with inject_error(manager.api, server_b.ip_addr, 'paxos_error_before_learn'):
         await t.add_column()
@@ -80,6 +81,7 @@ async def test_mutation_schema_change(manager, random_tables):
                                     execution_profile='whitelist')
 
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_mutation_schema_change_restart(manager, random_tables):
     """
         Cluster A, B, C
@@ -95,7 +97,6 @@ async def test_mutation_schema_change_restart(manager, random_tables):
     t = await random_tables.add_table(ncolumns=5, pks=1)
     manager.driver_close()
     # Reduce the snapshot thresholds
-    await manager.mark_dirty()
     errs = [inject_error_one_shot(manager.api, s.ip_addr, "raft_server_set_snapshot_thresholds",
                                   parameters={'snapshot_threshold': '3', 'snapshot_trailing': '1'})
             for s in [server_a, server_b, server_c]]
@@ -104,6 +105,7 @@ async def test_mutation_schema_change_restart(manager, random_tables):
     logger.info("Stopping C %s", server_c)
     await manager.server_stop_gracefully(server_c.server_id)
     await manager.driver_connect()
+    await wait_for_cql_and_get_hosts(manager.cql, [server_a, server_b], time.time() + 60)
 
     await inject_error_one_shot(manager.api, server_a.ip_addr,
                                 'raft_server_reduce_threshold')

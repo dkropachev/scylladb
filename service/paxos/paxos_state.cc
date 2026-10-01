@@ -167,7 +167,7 @@ future<prepare_response> paxos_state::prepare(storage_proxy& sp, paxos_store& pa
                         co_return make_foreign(std::move(result));
                     }
                 } catch(...) {
-                    logger.debug("Failed to get data or digest: {}. Ignored.", std::current_exception());
+                    logger.debug("Failed to get data or digest: {:t}. Ignored.", std::current_exception());
                     co_return std::nullopt;
                 }
             }
@@ -467,7 +467,8 @@ void paxos_store::on_before_drop_column_family(const schema& schema, utils::chun
             state_schema->ks_name(),
             state_schema->cf_name(),
             timestamp,
-            drop_views::yes).get();
+            drop_views::yes,
+            true).get();
         mutations.insert(mutations.end(), std::make_move_iterator(muts.begin()), std::make_move_iterator(muts.end()));
     }
 }

@@ -69,8 +69,6 @@ public:
 
     virtual ~segment() = default;
 
-    future<log_record> read(log_location);
-
     log_segment_id id() const noexcept { return _id; }
     seastar::file& get_file() noexcept { return _file; }
 
@@ -146,17 +144,6 @@ segment::segment(log_segment_id id, seastar::file file, uint64_t file_offset, ui
     , _file(std::move(file))
     , _file_offset(file_offset)
     , _max_size(max_size) {
-}
-
-future<log_record> segment::read(log_location loc) {
-    if (loc.offset + loc.size > _max_size) [[unlikely]] {
-        throw std::runtime_error(fmt::format("Read beyond end of segment {}: offset {} + size {} > max_size {}",
-                                             _id, loc.offset, loc.size, _max_size));
-    }
-
-    return _file.dma_read_exactly<char>(absolute_offset(loc.offset), loc.size).then([] (temporary_buffer<char> buf) {
-        return deserialize_log_record(simple_memory_input_stream(buf.begin(), buf.size()));
-    });
 }
 
 void writeable_segment::start(segment_ref seg_ref, segment_sequence seq_num) {
@@ -262,6 +249,11 @@ future<> writeable_segment::do_write(log_location loc, bytes_view data) {
 
 using seg_ptr = lw_shared_ptr<writeable_segment>;
 
+// The most a single write of the zero fill may ask the disk for. Larger requests keep saturating
+// the disk with less of the queue, but a format that runs while the shard is serving shares the
+// disk with the reads of that traffic, which wait behind whatever request is in flight.
+static constexpr uint64_t max_format_write_size = 1024 * 1024;
+
 class file_manager {
     uint64_t _segments_per_file;
 
@@ -288,7 +280,10 @@ class file_manager {
     seastar::gate _async_gate;
     shared_future<> _next_file_formatter{make_ready_future<>()};
 
-    std::vector<seastar::file> _open_read_files;
+    // One handle per file, opened read-write, kept open for the life of the shard and shared by
+    // the read and the write paths. Both go through it, so it is always opened for writing: a file
+    // first touched by a read would otherwise hold a read-only handle the write path cannot use.
+    std::vector<seastar::file> _open_files;
 
     std::unique_ptr<char[], seastar::free_deleter> _zero_buf;
     size_t _zero_buf_size{0};
@@ -302,17 +297,36 @@ public:
         , _sched_group(cfg.compaction_sg)
         , _format_on_startup(cfg.format_on_startup)
         , _sparse_files(cfg.sparse_files)
-        , _open_read_files(static_cast<size_t>(_max_files.actual))
+        , _open_files(static_cast<size_t>(_max_files.actual))
     {}
 
     future<> start();
     future<> stop();
 
-    future<seastar::file> get_file_for_write(file_id_t);
-    future<seastar::file> get_file_for_read(file_id_t);
+    // Allocates the file if it is the next one, which waits for it to be formatted and starts
+    // formatting the one after it in the background. Only the first segment taken out of a file
+    // needs this; every later one finds the file already allocated and open.
+    future<> allocate_file(file_id_t);
+
+    future<seastar::file> get_file(file_id_t);
+
+    // Opens the file and puts it in the cache. The caller must have checked that it is not open.
+    future<seastar::file> do_open_file(file_id_t);
+
+    // The file, if it is already open, which after startup it always is. A caller that finds it here
+    // gets at it without the call and the future that get_file() costs even when it waits for
+    // nothing. Returns an unset file otherwise, which is what tells a caller that has something to
+    // do about it - allocate the file, or refuse - that get_file() would have to open it.
+    seastar::file opened_file(file_id_t file_id) const {
+        if (file_id >= _open_files.size()) [[unlikely]] {
+            on_internal_error(logstor_logger, "Attempted to access file beyond actual disk capacity");
+        }
+        return _open_files[file_id];
+    }
 
     future<> format_file_region(seastar::file file, uint64_t offset, uint64_t size);
     future<> format_file(file_id_t);
+    future<> open_allocated_files();
     future<> recover_next_file(file_id_t);
     future<> remove_file(file_id_t);
     void set_actual_max_files(uint64_t actual_max_files);
@@ -344,10 +358,24 @@ future<> file_manager::start() {
 }
 
 future<> file_manager::stop() {
-    if (_async_gate.is_closed()) {
-        co_return;
+    if (!_async_gate.is_closed()) {
+        co_await _async_gate.close();
     }
-    co_await _async_gate.close();
+
+    // Closing a file opened for writing goes through the syscall thread pool, and a shard configured
+    // for a large disk holds thousands of them, so they are not closed one after the other. A close
+    // that fails is only reported: the store is going away and there is nothing left to do about it.
+    co_await max_concurrent_for_each(std::views::iota(size_t(0), _open_files.size()), 32,
+            [this] (size_t file_id) -> future<> {
+        auto file = std::exchange(_open_files[file_id], seastar::file());
+        if (!file) {
+            co_return;
+        }
+        auto result = co_await coroutine::as_future(file.close());
+        if (result.failed()) {
+            logstor_logger.warn("Failed to close logstor file {}: {}", get_file_path(file_id).string(), result.get_exception());
+        }
+    });
 }
 
 // Formatting a new file grows the store, so its I/O deliberately does not go through
@@ -357,10 +385,18 @@ future<> file_manager::format_file(file_id_t file_id) {
     auto file_path = get_file_path(file_id).string();
     bool file_exists = co_await seastar::file_exists(file_path);
     if (!file_exists) {
-        // Create and format a temporary file, then move it to the final location
+        // Create and format a temporary file, then move it to the final location.
+        //
+        // The temporary file is deliberately not opened with O_DSYNC, unlike the file the segments
+        // are then written through: a segment write is acknowledged when it completes and has to be
+        // durable by then, while formatting only has to be durable before the rename publishes the
+        // file. Flushing once at the end rather than on every one of the writes below is worth more
+        // than an order of magnitude, and the durability of the published file is the same either
+        // way. The commitlog re-opens its segments without O_DSYNC to pre-write them for the same
+        // reason, see segment_manager::allocate_segment_ex().
         auto tmp_path = file_path + ".tmp";
         auto tmp_file = co_await seastar::open_file_dma(tmp_path,
-                seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate | seastar::open_flags::dsync);
+                seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate);
         if (_sparse_files) {
             // Reading a hole yields zeros, so the file is already formatted as
             // far as the reader is concerned.
@@ -369,11 +405,29 @@ future<> file_manager::format_file(file_id_t file_id) {
             co_await tmp_file.allocate(0, _file_size);
             co_await format_file_region(tmp_file, 0, _file_size);
         }
+        co_await tmp_file.flush();
         co_await tmp_file.close();
 
         // move the temp file to the final location
         co_await seastar::rename_file(tmp_path, file_path);
     }
+
+    // A file is opened where it comes into existence, so that allocating a segment out of it later
+    // never has to. This also covers the file formatted in the background while the shard runs.
+    if (!_open_files[file_id]) {
+        co_await do_open_file(file_id);
+    }
+}
+
+// Opens every file that has been allocated, so that no read and no segment allocation opens one
+// during normal operation. Files are formatted before they are allocated, so they all exist here.
+future<> file_manager::open_allocated_files() {
+    return max_concurrent_for_each(std::views::iota(file_id_t(0), _next_file_id), 32,
+            [this] (file_id_t file_id) -> future<> {
+        if (!_open_files[file_id]) {
+            co_await do_open_file(file_id);
+        }
+    });
 }
 
 future<> file_manager::recover_next_file(file_id_t next_file_id) {
@@ -390,8 +444,11 @@ future<> file_manager::recover_next_file(file_id_t next_file_id) {
             }
         });
         _next_file_formatter = make_ready_future<>();
+        co_await open_allocated_files();
         co_return;
     }
+
+    co_await open_allocated_files();
 
     if (_next_file_id < _max_files.configured) {
         _next_file_formatter = with_gate(_async_gate, [this] {
@@ -409,14 +466,14 @@ future<> file_manager::remove_file(file_id_t file_id) {
     if (_max_files.actual <= _max_files.configured) {
         on_internal_error(logstor_logger, fmt::format("Attempted to remove file {} while actual max files {} is not above configured max files {}", file_id, _max_files.actual, _max_files.configured));
     }
-    if (file_id < _open_read_files.size()) {
-        if (file_id + 1 != _open_read_files.size()) {
+    if (file_id < _open_files.size()) {
+        if (file_id + 1 != _open_files.size()) {
             on_internal_error(logstor_logger, fmt::format("Attempted to remove file {} while higher file {} is still allocated", file_id, file_id + 1));
         }
-        if (_open_read_files[file_id]) {
-            co_await _open_read_files[file_id].close();
+        if (_open_files[file_id]) {
+            co_await _open_files[file_id].close();
         }
-        _open_read_files.pop_back();
+        _open_files.pop_back();
     }
     co_await do_io_check(logstor_error_handler, [this, file_id] {
         return seastar::remove_file(get_file_path(file_id).string());
@@ -432,10 +489,10 @@ void file_manager::set_actual_max_files(uint64_t actual_max_files) {
         on_internal_error(logstor_logger, fmt::format("Attempted to reduce actual max files from {} to {}", _max_files.actual, actual_max_files));
     }
     _max_files.actual = actual_max_files;
-    _open_read_files.resize(static_cast<size_t>(_max_files.actual));
+    _open_files.resize(static_cast<size_t>(_max_files.actual));
 }
 
-future<seastar::file> file_manager::get_file_for_write(file_id_t file_id) {
+future<> file_manager::allocate_file(file_id_t file_id) {
     if (file_id >= _max_files.actual) {
         on_internal_error(logstor_logger, "Attempted to access file beyond actual disk capacity");
     }
@@ -461,46 +518,66 @@ future<seastar::file> file_manager::get_file_for_write(file_id_t file_id) {
     } else if (file_id > _next_file_id) {
         on_internal_error(logstor_logger, "files must be allocated in sequential order");
     }
+}
 
-    auto file_path = get_file_path(file_id).string();
-    auto file = co_await open_checked_file_dma(logstor_error_handler, file_path,
-            seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::dsync);
-
-    if (!_open_read_files[file_id]) {
-        _open_read_files[file_id] = file;
+// Not a coroutine: every file is opened at startup and held for the life of the shard, so this ends
+// in a value it already has, and in continuation style it hands that value back without allocating
+// a frame for a wait that does not happen.
+future<seastar::file> file_manager::get_file(file_id_t file_id) {
+    if (file_id >= _open_files.size()) [[unlikely]] {
+        on_internal_error(logstor_logger, "Attempted to access file beyond actual disk capacity");
     }
+
+    if (auto& cached_file = _open_files[file_id]) {
+        return make_ready_future<seastar::file>(cached_file);
+    }
+
+    return do_open_file(file_id);
+}
+
+// The handle is shared by the read and the write paths, so it is opened read-write even when a read
+// is what asked for it, and with O_DSYNC, which is what makes a completed segment write durable.
+// It is not opened with O_CREAT: files are created by format_file() alone, and a read of a file that
+// is missing must fail rather than quietly create an empty one.
+future<seastar::file> file_manager::do_open_file(file_id_t file_id) {
+    auto file = co_await open_checked_file_dma(logstor_error_handler,
+        get_file_path(file_id).string(),
+        seastar::open_flags::rw | seastar::open_flags::dsync
+    );
+
+    _open_files[file_id] = file;
 
     co_return file;
 }
 
-future<seastar::file> file_manager::get_file_for_read(file_id_t file_id) {
-    if (file_id >= _open_read_files.size()) {
-        on_internal_error(logstor_logger, "Attempted to access file beyond actual disk capacity");
-    }
-
-    auto& cached_file = _open_read_files[file_id];
-    if (cached_file) {
-        co_return cached_file;
-    }
-
-    auto file = co_await open_checked_file_dma(logstor_error_handler,
-        get_file_path(file_id).string(),
-        seastar::open_flags::ro
-    );
-
-    _open_read_files[file_id] = file;
-
-    co_return std::move(file);
-}
-
 future<> file_manager::format_file_region(seastar::file file, uint64_t offset, uint64_t size) {
-    // Write zeros to entire region using the pre-allocated zero buffer
+    // One request covers as much as the disk takes in one, up to max_format_write_size, which the
+    // zero buffer is repeated across rather than held in memory: a request an order of magnitude
+    // larger than the buffer is worth most of the difference between a stream of small writes and
+    // one the device is saturated by, and the cap keeps a format that runs while the shard serves
+    // traffic - the background format of the next file - from putting a request in the disk's way
+    // that a read then waits behind.
+    const auto max_write_size = std::min<uint64_t>(file.disk_write_max_length(), max_format_write_size);
+
     uint64_t remaining = size;
     uint64_t current_offset = offset;
 
     while (remaining > 0) {
-        auto write_size = std::min<uint64_t>(remaining, _zero_buf_size);
-        auto written = co_await file.dma_write(current_offset, _zero_buf.get(), write_size);
+        auto write_size = std::min(remaining, max_write_size);
+
+        size_t written;
+        if (write_size <= _zero_buf_size) {
+            // A region smaller than the buffer needs no vector, which is every write of the block a
+            // discarded segment has its header invalidated with.
+            written = co_await file.dma_write(current_offset, _zero_buf.get(), write_size);
+        } else {
+            std::vector<iovec> iov;
+            iov.reserve(write_size / _zero_buf_size + 1);
+            for (uint64_t covered = 0; covered < write_size; covered += _zero_buf_size) {
+                iov.emplace_back(iovec{_zero_buf.get(), std::min<size_t>(_zero_buf_size, write_size - covered)});
+            }
+            written = co_await file.dma_write(current_offset, std::move(iov));
+        }
 
         current_offset += written;
         remaining -= written;
@@ -850,6 +927,9 @@ public:
 
 struct separator_task {
     std::vector<write_buffer::record_in_buffer> records;
+    // Where the buffer holding the records was written, which is what the records' own locations are
+    // relative to.
+    log_location buffer_location{};
     segment_ref seg_ref;
     segment_sequence seq_num{};
     utils::phased_barrier::operation write_op;
@@ -987,6 +1067,10 @@ public:
         return _cfg.segment_size;
     }
 
+    sstring get_segment_file_path(log_segment_id segment_id) const {
+        return sstring(_file_mgr.get_file_path(segment_id_to_file_location(segment_id).file_id).native());
+    }
+
     future<> discard_segments(logstor_group&);
 
     size_t get_memory_usage() const {
@@ -1040,7 +1124,7 @@ private:
     }
     future<> run_separator_fiber();
 
-    future<> write_to_separator(std::vector<write_buffer::record_in_buffer>&, segment_ref, segment_sequence);
+    future<> write_to_separator(std::vector<write_buffer::record_in_buffer>&, log_location buffer_location, segment_ref, segment_sequence);
 
     future<std::optional<segment_header>> read_segment_header(log_segment_id);
 
@@ -1170,8 +1254,18 @@ future<owned_write_buffer> compaction_manager_impl::allocate_separator_buffer() 
     return _sm.allocate_separator_buffer();
 }
 
+static const segment_manager_config& validated_geometry(const segment_manager_config& config) {
+    if (config.segment_size == 0) {
+        throw exceptions::configuration_exception("Segment size must not be zero");
+    }
+    if (config.file_size == 0) {
+        throw exceptions::configuration_exception("File size must not be zero");
+    }
+    return config;
+}
+
 segment_manager_impl::segment_manager_impl(segment_manager_config config)
-    : _file_mgr(config)
+    : _file_mgr(validated_geometry(config))
     , _compaction_mgr(*this, compaction_manager_impl::compaction_config{
             .compaction_enabled = config.compaction_enabled,
             .max_segments_per_compaction = config.max_segments_per_compaction,
@@ -1401,11 +1495,11 @@ future<> segment_manager_impl::run_separator_fiber() {
         });
 
         try {
-            co_await write_to_separator(task.records, std::move(task.seg_ref), task.seq_num);
+            co_await write_to_separator(task.records, task.buffer_location, std::move(task.seg_ref), task.seq_num);
             write_to_separator_failed.cancel();
         } catch (...) {
             ++_stats.separator_task_failures;
-            logstor_logger.debug("logstor separator task failure in separator fiber: {}", std::current_exception());
+            logstor_logger.debug("logstor separator task failure in separator fiber: {:t}", std::current_exception());
         }
     }
 }
@@ -1471,6 +1565,7 @@ future<> segment_manager_impl::write(write_buffer& wb) {
             co_await with_semaphore(_separator_enqueue_sem, 1, [&] {
                 return _separator_task_queue.push_eventually(separator_task{
                     .records = std::move(records),
+                    .buffer_location = loc,
                     .seg_ref = seg_ref,
                     .seq_num = seq_num,
                     .write_op = std::move(write_op),
@@ -1542,7 +1637,7 @@ void segment_manager_impl::on_free_record(log_location location) noexcept {
         try {
             desc.owner->update_segment(desc);
         } catch (...) {
-            logstor_logger.warn("Failed to update segments histogram: {}", std::current_exception());
+            logstor_logger.warn("Failed to update segments histogram: {:t}", std::current_exception());
         }
     }
     _stats.bytes_freed += location.size;
@@ -1550,12 +1645,33 @@ void segment_manager_impl::on_free_record(log_location location) noexcept {
 
 future<log_record> segment_manager_impl::read(log_location location) {
     auto holder = _async_gate.hold();
+
+    if (location.offset + location.size > _cfg.segment_size) [[unlikely]] {
+        co_return coroutine::exception(std::make_exception_ptr(std::runtime_error(fmt::format(
+            "Read beyond end of segment {}: offset {} + size {} > segment size {}",
+            location.segment, location.offset, location.size, _cfg.segment_size))));
+    }
+
     auto [file_id, file_offset] = segment_id_to_file_location(location.segment);
-    auto file = co_await _file_mgr.get_file_for_read(file_id);
-    segment seg(location.segment, file, file_offset, _cfg.segment_size);
-    auto record = co_await seg.read(location);
+    // The file it reads from outlives the read: it is held here, on the frame of this coroutine,
+    // because the read is issued on it and seastar keeps reading from it after the first suspension.
+    auto file = _file_mgr.opened_file(file_id);
+    if (!file) [[unlikely]] {
+        file = co_await _file_mgr.get_file(file_id);
+    }
+
+    // The bulk read is what dma_read_exactly() does underneath, over two coroutine frames of its
+    // own: one to trim the buffer the disk gave back to the size that was asked for, and one to
+    // reject a short read. This coroutine is already here to do both.
+    auto buf = co_await file.dma_read_bulk<char>(file_offset + location.offset, location.size);
+    if (buf.size() < location.size) [[unlikely]] {
+        co_return coroutine::exception(std::make_exception_ptr(std::runtime_error(fmt::format(
+            "Short read of segment {}: got {} bytes of the {} asked for at offset {}",
+            location.segment, buf.size(), location.size, location.offset))));
+    }
+    buf.trim(location.size);
     _stats.bytes_read += location.size;
-    co_return std::move(record);
+    co_return deserialize_log_record(simple_memory_input_stream(buf.begin(), buf.size()));
 }
 
 future<> segment_manager_impl::request_segment_switch() {
@@ -1602,7 +1718,7 @@ future<> segment_manager_impl::replenish_reserve() {
             break;
         } catch (...) {
             retry = true;
-            logstor_logger.warn("Exception in reserve replenisher: {}, will retry", std::current_exception());
+            logstor_logger.warn("Exception in reserve replenisher: {:t}, will retry", std::current_exception());
         }
 
         if (retry) {
@@ -1617,7 +1733,13 @@ future<seg_ptr> segment_manager_impl::allocate_segment() {
     auto make_segment = [this] (log_segment_id seg_id) -> future<seg_ptr> {
         try {
             auto seg_loc = segment_id_to_file_location(seg_id);
-            auto file = co_await _file_mgr.get_file_for_write(seg_loc.file_id);
+            // Only the first segment taken out of a file has to allocate it, and only a file that
+            // is formatted while the shard runs is not open yet.
+            auto file = _file_mgr.opened_file(seg_loc.file_id);
+            if (!file) [[unlikely]] {
+                co_await _file_mgr.allocate_file(seg_loc.file_id);
+                file = co_await _file_mgr.get_file(seg_loc.file_id);
+            }
             auto seg = make_lw_shared<writeable_segment>(seg_id, std::move(file), seg_loc.file_offset, _cfg.segment_size);
             get_segment_descriptor(seg_id).reset(_cfg.segment_size);
             _stats.segments_allocated++;
@@ -1729,8 +1851,12 @@ future<> segment_manager_impl::discard_segments(logstor_group& cg) {
     co_await max_concurrent_for_each(segments, 32, [this] (log_segment_id seg_id) -> future<> {
         logstor_logger.trace("Discard segment {}", seg_id);
         auto [file_id, file_offset] = segment_id_to_file_location(seg_id);
-        auto file = co_await _file_mgr.get_file_for_write(file_id);
-        co_await _file_mgr.format_file_region(file, file_offset, block_alignment);
+        // The segments being discarded were written, so their file is allocated and open.
+        auto file = _file_mgr.opened_file(file_id);
+        if (!file) [[unlikely]] {
+            on_internal_error(logstor_logger, format("Discarding segment {} of file {} that is not open", seg_id, file_id));
+        }
+        co_await _file_mgr.format_file_region(std::move(file), file_offset, block_alignment);
         free_segment(seg_id);
     });
 }
@@ -2101,7 +2227,7 @@ struct compaction_buffer {
     // to ensure all pending updates complete.
     future<> rewrite_record(primary_index& index, log_location read_location, const log_record_header& record_header, log_record_bytes_view record_bytes) {
         auto* index_ptr = &index;
-        auto key = record_header.key;
+        auto key = record_header.index_key();
 
         auto writer = log_record_bytes_writer(record_header, record_bytes);
 
@@ -2170,7 +2296,7 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, abort_source&
             [this, &index, &nonempty_segments] (compaction_buffer& cb) -> future<compaction_buffer_stats> {
         co_await _sm.for_each_record(nonempty_segments,
             [&index, &cb] (log_location read_location, const log_record_header& record_header) -> want_data {
-                if (!index.is_record_alive(record_header.key, read_location)) {
+                if (!index.is_record_alive(record_header.index_key(), read_location)) {
                     cb.stats.records_skipped++;
                     return want_data::no;
                 }
@@ -2284,13 +2410,13 @@ future<> compaction_manager_impl::do_split_compaction(logstor_group& src, mutati
                 [this, &index, &classifier, &nonempty_segments] (split_buffer_pair& bufs) -> future<compaction_buffer_stats> {
             co_await _sm.for_each_record(nonempty_segments,
                 [&index] (log_location read_location, const log_record_header& record_header) -> want_data {
-                    if (!index.is_record_alive(record_header.key, read_location)) {
+                    if (!index.is_record_alive(record_header.index_key(), read_location)) {
                         return want_data::no;
                     }
                     return want_data::yes;
                 },
                 [&index, &bufs, &classifier] (log_location read_location, const log_record_header& record_header, log_record_bytes_view record_bytes) -> future<> {
-                    auto& cb = bufs.bufs[classifier(record_header.key.dk.token())];
+                    auto& cb = bufs.bufs[classifier(record_header.key.token())];
                     co_await cb.rewrite_record(index, read_location, record_header, record_bytes);
                 }
             );
@@ -2325,7 +2451,12 @@ future<> compaction_manager_impl::flush_all_separator_buffers(std::optional<segm
     });
 }
 
-future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::record_in_buffer>& records, segment_ref seg_ref, segment_sequence segment_seq_num) {
+void separator_index_update::operator()(log_location new_location, seastar::gate::holder) const {
+    index->update_record_location(key, prev_location, new_location);
+}
+
+future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::record_in_buffer>& records, log_location buffer_location,
+        segment_ref seg_ref, segment_sequence segment_seq_num) {
     static constexpr size_t separator_group_write_concurrency = 4;
 
     struct separator_group_records {
@@ -2349,17 +2480,16 @@ future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::reco
         co_await coroutine::maybe_yield();
     }
 
-    co_await seastar::max_concurrent_for_each(groups, separator_group_write_concurrency, [seg_ref, segment_seq_num] (separator_group_records& group) -> future<> {
+    co_await seastar::max_concurrent_for_each(groups, separator_group_write_concurrency,
+            [buffer_location, seg_ref, segment_seq_num] (separator_group_records& group) -> future<> {
         for (auto* record : group.records) {
-            auto key = record->writer.record().header.key;
-            log_location prev_loc = co_await std::move(record->loc);
-            auto* index_ptr = &group.cg->logstor_index();
+            separator_index_update update {
+                .index = &group.cg->logstor_index(),
+                .key = record->writer.record().header.index_key(),
+                .prev_location = record->location(buffer_location),
+            };
 
-            co_await group.cg->write_to_separator(std::move(record->writer), seg_ref, segment_seq_num,
-                [index_ptr, key = std::move(key), prev_loc] (log_location new_loc, seastar::gate::holder op) {
-                    index_ptr->update_record_location(key, prev_loc, new_loc);
-                }
-            );
+            co_await group.cg->write_to_separator(std::move(record->writer), seg_ref, segment_seq_num, std::move(update));
         }
     });
 }
@@ -2460,7 +2590,7 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
     // Populate the index from all segments. Keep the latest record for each key.
     // For equal records, keep the one from the segment with the highest sequence number.
     auto cmp_with_seq = [&segment_seqs] (const index_entry& old_entry, const index_entry& candidate) -> std::strong_ordering {
-        if (auto c = primary_index::default_entry_cmp(old_entry, candidate); c != 0) {
+        if (auto c = primary_index::default_entry_cmp{}(old_entry, candidate); c != 0) {
             return c;
         }
         const auto old_seq = segment_seqs[old_entry.location.segment.value];
@@ -2492,8 +2622,11 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
             co_return;
         }
         logstor_logger.info("Table {}.{} has {} entries in logstor index", tp->schema()->ks_name(), tp->schema()->cf_name(), tp->logstor_index().get_key_count());
-        for (const auto& entry : tp->logstor_index()) {
-            used_segments.set(entry.entry().location.segment.value);
+        auto scan = tp->logstor_index().scan();
+        while (auto batch = scan.next_batch(1024)) {
+            for (const auto& entry : batch->entries) {
+                used_segments.set(entry.get().entry().location.segment.value);
+            }
             co_await coroutine::maybe_yield();
         }
     });
@@ -2579,7 +2712,7 @@ future<> segment_manager_impl::recover_segment(replica::database& db, log_segmen
                 if (!t.uses_logstor()) {
                     return want_data::no;
                 }
-                t.logstor_index().insert(header.key, new_entry, cmp);
+                t.logstor_index().insert(header.index_key(), new_entry, cmp);
             } catch (const replica::no_such_column_family&) {
                 // ignore record
             }
@@ -2636,7 +2769,7 @@ future<> segment_manager_impl::add_segment_to_compaction_group(replica::database
             [&db] (log_location prev_loc, const log_record_header& record_header) -> want_data {
                 try {
                     auto& t = db.find_column_family(record_header.table);
-                    return t.uses_logstor() && t.logstor_index().is_record_alive(record_header.key, prev_loc)
+                    return t.uses_logstor() && t.logstor_index().is_record_alive(record_header.index_key(), prev_loc)
                             ? want_data::yes : want_data::no;
                 } catch (const replica::no_such_column_family&) {
                     return want_data::no;
@@ -2645,14 +2778,15 @@ future<> segment_manager_impl::add_segment_to_compaction_group(replica::database
             [seg_ref, &db] (log_location prev_loc, const log_record_header& record_header, log_record_bytes_view record_bytes) -> future<> {
                 try {
                     auto& t = db.find_column_family(record_header.table);
-                    auto key = record_header.key;
-                    auto& cg = t.get_logstor_group(key.dk.token());
-                    auto* index_ptr = &cg.logstor_index();
+                    auto key = record_header.index_key();
+                    auto& cg = t.get_logstor_group(key.token());
                     auto writer = log_record_bytes_writer(record_header, record_bytes);
 
                     co_await cg.write_to_separator(std::move(writer), seg_ref, std::nullopt,
-                        [index_ptr, key = std::move(key), prev_loc] (log_location new_loc, seastar::gate::holder op) {
-                            index_ptr->update_record_location(key, prev_loc, new_loc);
+                        separator_index_update {
+                            .index = &cg.logstor_index(),
+                            .key = key,
+                            .prev_location = prev_loc,
                         }
                     );
                 } catch (const replica::no_such_column_family&) {
@@ -2740,6 +2874,10 @@ uint64_t segment_manager::get_segment_size() const noexcept {
     return _impl->get_segment_size();
 }
 
+sstring segment_manager::get_segment_file_path(log_segment_id segment_id) const {
+    return _impl->get_segment_file_path(segment_id);
+}
+
 future<> segment_manager::discard_segments(logstor_group& cg) {
     return _impl->discard_segments(cg);
 }
@@ -2778,7 +2916,7 @@ public:
 
 future<seastar::input_stream<char>> segment_manager_impl::create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts) {
     auto [file_id, file_offset] = segment_id_to_file_location(segment_id);
-    auto file = co_await _file_mgr.get_file_for_read(file_id);
+    auto file = co_await _file_mgr.get_file(file_id);
     auto stream = make_file_input_stream(std::move(file), file_offset, _cfg.segment_size, opts);
     co_return std::move(stream);
 }
@@ -2811,7 +2949,7 @@ public:
 
 future<> segment_manager_impl::load_segment(replica::database& db, log_segment_id seg_id) {
     // read the segment and populate the index
-    co_await recover_segment(db, seg_id, primary_index::default_entry_cmp, [] (const segment_header&) {});
+    co_await recover_segment(db, seg_id, primary_index::default_entry_cmp{}, [] (const segment_header&) {});
 
     auto& desc = get_segment_descriptor(seg_id);
     co_await add_segment_to_compaction_group(db, desc);
@@ -2893,7 +3031,7 @@ future<> logstor_group::allocate_active_separator_buffer() {
 }
 
 template <log_record_writer_concept Writer>
-future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_write_completion after_written) {
+future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_index_update after_written) {
     while (!_active_buffer.can_fit(writer)) {
         if (!_separator_enabled) {
             break;
@@ -2934,8 +3072,8 @@ future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, s
     _active_buffer.write(std::move(seg_ref), segment_seq_num, std::move(writer), std::move(after_written));
 }
 
-template future<> logstor_group::write_to_separator(log_record_writer, segment_ref, std::optional<segment_sequence>, separator_write_completion);
-template future<> logstor_group::write_to_separator(log_record_bytes_writer, segment_ref, std::optional<segment_sequence>, separator_write_completion);
+template future<> logstor_group::write_to_separator(log_record_writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+template future<> logstor_group::write_to_separator(log_record_bytes_writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
 
 future<> logstor_group::flush_separator(std::optional<segment_sequence> seq_num) {
     auto should_flush = [seq_num] (separator_buffer& buf) {

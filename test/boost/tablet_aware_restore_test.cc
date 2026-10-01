@@ -9,6 +9,7 @@
 
 
 #include "test/lib/cql_test_env.hh"
+#include "test/lib/s3_fixture.hh"
 #include "utils/assert.hh"
 #include <seastar/core/sstring.hh>
 #include <fmt/ranges.h>
@@ -17,12 +18,16 @@
 #include <seastar/core/future.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/test_fixture.hh>
+#include <seastar/util/closeable.hh>
+#include <seastar/util/short_streams.hh>
 
 #include "db/config.hh"
 #include "db/consistency_level_type.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "sstables/object_storage_client.hh"
 #include "sstables/storage.hh"
+#include "utils/memory_data_sink.hh"
+#include "utils/rjson.hh"
 #include "sstables_loader.hh"
 #include "replica/database_fwd.hh"
 #include "replica/tablets.hh"
@@ -320,7 +325,7 @@ future<sstring> backup(cql_test_env& env, sstring endpoint, sstring bucket) {
     co_return prefix;
 }
 
-future<> check_snapshot_sstables(cql_test_env& env) {
+future<> check_snapshot_sstables(cql_test_env& env, std::function<void(const db::snapshot_sstable_entry&)> check_entry = {}) {
     auto& topology = env.get_storage_proxy().local().get_token_metadata_ptr()->get_topology();
     auto dc = topology.get_datacenter();
     auto rack = topology.get_rack();
@@ -345,10 +350,14 @@ future<> check_snapshot_sstables(cql_test_env& env) {
 
     for (const auto& sstable : sstables) {
         BOOST_CHECK(expected_sstables.contains(sstable.toc_name));
+        if (check_entry) {
+            check_entry(sstable);
+        }
     }
 }
 
-SEASTAR_TEST_CASE(test_populate_snapshot_sstables_from_manifests, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+SEASTAR_TEST_CASE(test_populate_snapshot_sstables_from_manifests, *boost::unit_test::precondition(tests::has_scylla_test_env)
+        *seastar::testing::async_fixture<s3_fixture>()) {
     using namespace sstables;
 
     auto db_cfg_ptr = make_shared<db::config>();
@@ -364,12 +373,74 @@ SEASTAR_TEST_CASE(test_populate_snapshot_sstables_from_manifests, *boost::unit_t
             auto prefix = backup(env, ep, bucket).get();
             auto manifest_path = prefix + "/manifest.json";
 
-            BOOST_REQUIRE_THROW(populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), "ks", "cf", ep, bucket, "", "unexpected_snapshot", {manifest_path}, db::consistency_level::ONE).get(), std::runtime_error);;
+            auto dc = env.get_storage_proxy().local().get_token_metadata_ptr()->get_topology().get_datacenter();
+
+            BOOST_REQUIRE_THROW(populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), "ks", "cf", ep, bucket, "", "unexpected_snapshot", dc, {manifest_path}, db::consistency_level::ONE).get(), std::runtime_error);
+            BOOST_REQUIRE_THROW(populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), "ks", "cf", ep, bucket, "", "snapshot", "unexpected_dc", {manifest_path}, db::consistency_level::ONE).get(), std::runtime_error);
 
             // populate system_distributed.snapshot_sstables with the content of the snapshot manifest
-            populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), "ks", "cf", ep, bucket, "", "snapshot", {manifest_path}, db::consistency_level::ONE).get();
+            populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), "ks", "cf", ep, bucket, "", "snapshot", dc, {manifest_path}, db::consistency_level::ONE).get();
 
             check_snapshot_sstables(env).get();
+    }, false, db_cfg_ptr, 10);
+}
+
+future<sstring> download_object(cql_test_env& env, sstring endpoint, sstring bucket, sstring path) {
+    auto client = env.get_sstorage_manager().local().get_endpoint_client(endpoint);
+    auto source = client->make_download_source(object_name(bucket, path));
+    return seastar::with_closeable(input_stream<char>(std::move(source)), [] (input_stream<char>& is) {
+        return util::read_entire_stream_contiguous(is);
+    });
+}
+
+future<> upload_object(cql_test_env& env, sstring endpoint, sstring bucket, sstring path, sstring content) {
+    auto client = env.get_sstorage_manager().local().get_endpoint_client(endpoint);
+    memory_data_sink_buffers bufs;
+    bufs.push_back(temporary_buffer<char>(content.data(), content.size()));
+    return client->put_object(object_name(bucket, path), std::move(bufs), object_storage_attributes{});
+}
+
+// Manifests written by older Scylla versions lack the optional per-sstable metadata
+// fields. Restore must not fail on them.
+SEASTAR_TEST_CASE(test_restore_should_handle_missing_optional_fields, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+    using namespace sstables;
+
+    auto db_cfg_ptr = make_shared<db::config>();
+    db_cfg_ptr->tablets_mode_for_new_keyspaces(db::tablets_mode_t::mode::enabled);
+    auto storage_options = make_test_object_storage_options("S3");
+    db_cfg_ptr->object_storage_endpoints(make_storage_options_config(storage_options));
+
+    return do_with_some_data_in_thread({"cf"}, [storage_options = std::move(storage_options)] (cql_test_env& env) {
+            take_snapshot(env, "ks", "cf", "snapshot").get();
+
+            auto ep = storage_options.to_map()["endpoint"];
+            auto bucket = storage_options.to_map()["bucket"];
+            auto prefix = backup(env, ep, bucket).get();
+
+            auto dc = env.get_storage_proxy().local().get_token_metadata_ptr()->get_topology().get_datacenter();
+
+            // Download the manifest just written and strip the optional fields from every
+            // sstable entry, to emulate a manifest written before 2026.3, which had none.
+            auto manifest = rjson::parse(download_object(env, ep, bucket, prefix + "/manifest.json").get());
+            auto* sstables = rjson::find(manifest, "sstables");
+            BOOST_REQUIRE(sstables && sstables->IsArray() && sstables->Size() > 0);
+            for (auto& sstable_entry : sstables->GetArray()) {
+                for (auto field : {"repaired_at", "data_size", "index_size"}) {
+                    BOOST_REQUIRE(rjson::remove_member(sstable_entry, field));
+                }
+            }
+
+            auto manifest_path = prefix + "/manifest-without-optional-fields.json";
+            upload_object(env, ep, bucket, manifest_path, rjson::print(manifest)).get();
+
+            populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), "ks", "cf", ep, bucket, "", "snapshot", dc, {manifest_path}, db::consistency_level::ONE).get();
+
+            check_snapshot_sstables(env, [] (const db::snapshot_sstable_entry& e) {
+                // the fields dropped above default to 0
+                BOOST_CHECK_EQUAL(e.repaired_at, 0);
+                BOOST_CHECK_EQUAL(e.data_size, 0);
+                BOOST_CHECK_EQUAL(e.index_size, 0);
+            }).get();
     }, false, db_cfg_ptr, 10);
 }
 
@@ -403,5 +474,62 @@ SEASTAR_TEST_CASE(test_restore_alter_table_with_tablet_hints, *boost::unit_test:
         env.get_storage_service().local().alter_table_with_tablet_hints(tid, desired_count, desired_count).get();
 
         verify_tablet_options(env, tid, desired_count, true);
+    }, false, db_cfg_ptr, 10);
+}
+
+// The tablet restore task pins a table's tablet count with min_tablet_count == max_tablet_count
+// and puts the table's own hints back when it is done. A table which had no hint of its own
+// saves nullopt for both, and nullopt means "leave this hint alone" - so the pin used to stay,
+// leaving the table with min == max and unable to ever split or merge again. Passing
+// remove_unset makes a disengaged hint remove the key instead.
+SEASTAR_TEST_CASE(test_restore_alter_table_with_tablet_hints_removes_unset, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+    auto db_cfg_ptr = make_shared<db::config>();
+    db_cfg_ptr->tablets_mode_for_new_keyspaces(db::tablets_mode_t::mode::enabled);
+
+    return do_with_some_data_in_thread({"cf"}, [] (cql_test_env& env) {
+        table_id tid = env.local_db().find_uuid("ks", "cf");
+
+        auto token_metadata = env.local_db().get_token_metadata_ptr();
+        auto& tmap = token_metadata->tablets().get_tablet_map(tid);
+        auto desired_count = tmap.tablet_count();
+
+        auto& ss = env.get_storage_service().local();
+
+        // The table is created without tablet hints of its own.
+        verify_tablet_options(env, tid, desired_count, false);
+
+        // Pin the tablet count, the way the restore task does before it starts restoring.
+        ss.alter_table_with_tablet_hints(tid, desired_count, desired_count).get();
+        verify_tablet_options(env, tid, desired_count, true);
+
+        // Put the saved hints back - both disengaged, because the table had none. The pin has
+        // to go away, otherwise the table is left permanently pinned at min == max.
+        ss.alter_table_with_tablet_hints(tid, std::nullopt, std::nullopt,
+                                         service::wait_balancer::no, service::remove_unset::yes).get();
+        verify_tablet_options(env, tid, desired_count, false);
+    }, false, db_cfg_ptr, 10);
+}
+
+// wait_balancer needs a count to wait for. Two disengaged hints compare equal to each other, so
+// testing the two against each other is not enough - with remove_unset they also get past the
+// no-op return, and the wait would then dereference a disengaged max_tablet_count.
+SEASTAR_TEST_CASE(test_restore_alter_table_with_tablet_hints_rejects_waiting_without_hints, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+    auto db_cfg_ptr = make_shared<db::config>();
+    db_cfg_ptr->tablets_mode_for_new_keyspaces(db::tablets_mode_t::mode::enabled);
+
+    return do_with_some_data_in_thread({"cf"}, [] (cql_test_env& env) {
+        table_id tid = env.local_db().find_uuid("ks", "cf");
+        auto desired_count = env.local_db().get_token_metadata_ptr()->tablets().get_tablet_map(tid).tablet_count();
+        auto& ss = env.get_storage_service().local();
+
+        BOOST_REQUIRE_THROW(ss.alter_table_with_tablet_hints(tid, std::nullopt, std::nullopt,
+                                                             service::wait_balancer::yes, service::remove_unset::yes).get(),
+                            std::invalid_argument);
+        BOOST_REQUIRE_THROW(ss.alter_table_with_tablet_hints(tid, std::nullopt, desired_count,
+                                                             service::wait_balancer::yes, service::remove_unset::yes).get(),
+                            std::invalid_argument);
+
+        // Rejected before anything was announced.
+        verify_tablet_options(env, tid, desired_count, false);
     }, false, db_cfg_ptr, 10);
 }

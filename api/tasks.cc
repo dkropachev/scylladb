@@ -11,7 +11,6 @@
 
 #include "api/api.hh"
 #include "api/storage_service.hh"
-#include "api/validate.hh"
 #include "api/api-doc/tasks.json.hh"
 #include "api/api-doc/storage_service.json.hh"
 #include "compaction/compaction_manager.hh"
@@ -38,10 +37,10 @@ static auto wrap_ks_cf(http_context &ctx, ks_cf_func f) {
     };
 }
 
-static future<shared_ptr<compaction::major_keyspace_compaction_task_impl>> force_keyspace_compaction(http_context& ctx, sharded<replica::database>& db, std::unique_ptr<http::request> req) {
+static future<tasks::task_manager::task_ptr> force_keyspace_compaction(http_context& ctx, sharded<replica::database>& db, std::unique_ptr<http::request> req) {
     auto [ keyspace, table_infos ] = parse_table_infos(ctx, *req, "cf");
-    auto flush = validate_bool_x(req->get_query_param("flush_memtables"), true);
-    auto consider_only_existing_data = validate_bool_x(req->get_query_param("consider_only_existing_data"), false);
+    auto flush = get_query_param<bool>(*req, "flush_memtables", true);
+    auto consider_only_existing_data = get_query_param<bool>(*req, "consider_only_existing_data");
     apilog.info("force_keyspace_compaction: keyspace={} tables={}, flush={} consider_only_existing_data={}", keyspace, table_infos, flush, consider_only_existing_data);
 
     auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
@@ -49,16 +48,16 @@ static future<shared_ptr<compaction::major_keyspace_compaction_task_impl>> force
     if (!flush && !consider_only_existing_data) {
         fmopt = compaction::flush_mode::skip;
     }
-    return compaction_module.make_and_start_task<compaction::major_keyspace_compaction_task_impl>({}, std::move(keyspace), tasks::task_id::create_null_id(), db, table_infos, fmopt, consider_only_existing_data);
+    return compaction_module.start_major_keyspace_compaction(db, std::move(keyspace), table_infos, fmopt, consider_only_existing_data);
 }
 
-static future<shared_ptr<compaction::upgrade_sstables_compaction_task_impl>> upgrade_sstables(sharded<replica::database>& db, std::unique_ptr<http::request> req, sstring keyspace, std::vector<table_info> table_infos) {
-    bool exclude_current_version = req_param<bool>(*req, "exclude_current_version", false);
+static future<tasks::task_manager::task_ptr> upgrade_sstables(sharded<replica::database>& db, std::unique_ptr<http::request> req, sstring keyspace, std::vector<table_info> table_infos) {
+    bool exclude_current_version = get_query_param<bool>(*req, "exclude_current_version");
 
     apilog.info("upgrade_sstables: keyspace={} tables={} exclude_current_version={}", keyspace, table_infos, exclude_current_version);
 
     auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-    return compaction_module.make_and_start_task<compaction::upgrade_sstables_compaction_task_impl>({}, std::move(keyspace), db, table_infos, exclude_current_version);
+    return compaction_module.start_upgrade_sstables_keyspace_compaction(db, std::move(keyspace), std::move(table_infos), exclude_current_version);
 }
 
 void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<replica::database>& db, sharded<db::snapshot_ctl>& snap_ctl) {
@@ -76,7 +75,7 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<replica::
     t::perform_keyspace_offstrategy_compaction_async.set(r, wrap_ks_cf(ctx, [&db] (http_context& ctx, std::unique_ptr<http::request> req, sstring keyspace, std::vector<table_info> table_infos) -> future<json::json_return_type> {
         apilog.info("perform_keyspace_offstrategy_compaction: keyspace={} tables={}", keyspace, table_infos);
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-        auto task = co_await compaction_module.make_and_start_task<compaction::offstrategy_keyspace_compaction_task_impl>({}, std::move(keyspace), db, table_infos, nullptr);
+        auto task = co_await compaction_module.start_offstrategy_keyspace_compaction(db, std::move(keyspace), std::move(table_infos), nullptr);
 
         co_return json::json_return_type(task->get_status().id.to_sstring());
     }));
@@ -85,7 +84,7 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<replica::
         apilog.info("perform_keyspace_offstrategy_compaction: keyspace={} tables={}", keyspace, table_infos);
         bool res = false;
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-        auto task = co_await compaction_module.make_and_start_task<compaction::offstrategy_keyspace_compaction_task_impl>({}, std::move(keyspace), db, table_infos, &res);
+        auto task = co_await compaction_module.start_offstrategy_keyspace_compaction(db, std::move(keyspace), std::move(table_infos), &res);
         co_await task->done();
         co_return json::json_return_type(res);
     }));
@@ -110,14 +109,14 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<replica::
         }
 
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-        auto task = co_await compaction_module.make_and_start_task<compaction::scrub_sstables_compaction_task_impl>({}, std::move(info.keyspace), db, std::move(info.column_families), info.opts, nullptr);
+        auto task = co_await compaction_module.start_scrub_sstables_keyspace_compaction(db, std::move(info.keyspace), std::move(info.column_families), info.opts, nullptr);
 
         co_return json::json_return_type(task->get_status().id.to_sstring());
     });
 
     ss::force_compaction.set(r, [&db] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
-        auto flush = validate_bool_x(req->get_query_param("flush_memtables"), true);
-        auto consider_only_existing_data = validate_bool_x(req->get_query_param("consider_only_existing_data"), false);
+        auto flush = get_query_param<bool>(*req, "flush_memtables", true);
+        auto consider_only_existing_data = get_query_param<bool>(*req, "consider_only_existing_data");
         apilog.info("force_compaction: flush={} consider_only_existing_data={}", flush, consider_only_existing_data);
 
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
@@ -125,7 +124,7 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<replica::
         if (!flush && !consider_only_existing_data) {
             fmopt = compaction::flush_mode::skip;
         }
-        auto task = co_await compaction_module.make_and_start_task<compaction::global_major_compaction_task_impl>({}, db, fmopt, consider_only_existing_data);
+        auto task = co_await compaction_module.start_global_major_compaction(db, fmopt, consider_only_existing_data);
         co_await task->done();
         co_return json_void();
     });

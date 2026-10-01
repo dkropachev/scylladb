@@ -112,6 +112,8 @@ functions::init() noexcept {
     declare(error_injection::make_enabled_injections_function());
 
     declare(make_bm25_function());
+    declare(make_bm25_score_function());
+    declare(make_bm25_rank_function());
 
     // also needed for smp:
 #if 0
@@ -208,8 +210,12 @@ inline
 shared_ptr<function>
 make_to_json_function(data_type t) {
     return make_native_scalar_function<true>("tojson", utf8_type, {t},
-            [t](std::span<const bytes_opt> parameters) -> bytes_opt {
-        return utf8_type->decompose(to_json_string(*t, parameters[0]));
+            [t](std::span<const managed_bytes_opt> parameters) -> managed_bytes_opt {
+        // FIXME: to_json_string() linearizes its input
+        auto json = parameters[0]
+                ? to_json_string(*t, managed_bytes_view(*parameters[0]))
+                : sstring("null");
+        return managed_bytes(utf8_type->decompose(json));
     });
 }
 
@@ -217,10 +223,12 @@ inline
 shared_ptr<function>
 make_from_json_function(data_dictionary::database db, const sstring& keyspace, data_type t) {
     return make_native_scalar_function<true>("fromjson", t, {utf8_type},
-            [keyspace, t](std::span<const bytes_opt> parameters) -> bytes_opt {
+            [keyspace, t](std::span<const managed_bytes_opt> parameters) -> managed_bytes_opt {
         try {
-            rjson::value json_value = rjson::parse(utf8_type->to_string(parameters[0].value_or("null")));
-            bytes_opt parsed_json_value;
+            // FIXME: avoid linearization of the parameter
+            auto raw_json = parameters[0] ? to_bytes(*parameters[0]) : to_bytes("null");
+            rjson::value json_value = rjson::parse(utf8_type->to_string(raw_json));
+            managed_bytes_opt parsed_json_value;
             if (!json_value.IsNull()) {
                 parsed_json_value.emplace(from_json_object(*t, json_value));
             }
@@ -354,11 +362,11 @@ get_set_intersection_function(data_dictionary::database db,
     auto element_type = set_type->get_elements_type();
 
     return make_native_scalar_function<true>("set_intersection", set_type, {set_type, set_type},
-            [set_type, element_type] (std::span<const bytes_opt> parameters) -> bytes_opt {
+            [set_type, element_type] (std::span<const managed_bytes_opt> parameters) -> managed_bytes_opt {
         if (!parameters[0].has_value() || !parameters[1].has_value()) {
             return {};
         }
-        auto set_as_range = [&] (const bytes_opt& serialized_set, managed_bytes_view& buffer) {
+        auto set_as_range = [&] (const managed_bytes_opt& serialized_set, managed_bytes_view& buffer) {
             buffer = managed_bytes_view(*serialized_set);
             return std::ranges::subrange<listlike_partial_deserializing_iterator>(
                     listlike_partial_deserializing_iterator::begin(buffer),
@@ -377,7 +385,7 @@ get_set_intersection_function(data_dictionary::database db,
                 set_as_range(parameters[1], buffer2),
                 std::back_inserter(result_vector),
                 element_less);
-        return to_bytes(set_type->pack_fragmented(result_vector.begin(), result_vector.end(), result_vector.size()));
+        return set_type->pack_fragmented(result_vector.begin(), result_vector.end(), result_vector.size());
     });
 }
 
@@ -419,10 +427,10 @@ functions::try_get(data_dictionary::database db,
     });
 
     const auto func_name = name.has_keyspace() ? name : name.as_native_function();
-    if (SIMILARITY_FUNCTIONS.contains(func_name) || func_name == ANN_FUNCTION_NAME) {
+    if (SIMILARITY_FUNCTIONS.contains(func_name) || is_ann_function_name(func_name)) {
         auto arg_types = retrieve_vector_arg_types(func_name, provided_args);
-        shared_ptr<function> fun = func_name == ANN_FUNCTION_NAME
-                ? make_ann_function(arg_types)
+        shared_ptr<function> fun = is_ann_function_name(func_name)
+                ? make_ann_function(func_name, arg_types)
                 : ::make_shared<vector_similarity_fct>(func_name.name, arg_types);
         if (auto err = check_types(db, keyspace, schema.get(), fun, provided_args, receiver_ks, receiver_cf)) {
             return resolution_failed(std::move(*err));

@@ -601,6 +601,27 @@ struct convert<db::object_storage_endpoint_param> {
 };
 
 template<>
+struct convert<std::vector<db::object_storage_endpoint_param>> {
+    // Decode each entry on its own, so a malformed entry costs its own
+    // endpoint rather than the whole option.
+    static bool decode(const Node& node, std::vector<db::object_storage_endpoint_param>& endpoints) {
+        if (!node.IsSequence()) {
+            return false;
+        }
+
+        endpoints.clear();
+        for (size_t i = 0; i < node.size(); ++i) {
+            try {
+                endpoints.push_back(db::object_storage_endpoint_param::decode(node[i]));
+            } catch (const std::exception& e) {
+                cfglogger.error("Ignoring object_storage_endpoints entry {}: {}", i, e.what());
+            }
+        }
+        return true;
+    }
+};
+
+template<>
 struct convert<audit::audit_rule> {
     static bool decode(const Node& node, audit::audit_rule& rule) {
         if (!node.IsMap()) {
@@ -1375,7 +1396,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Maximum cached permission entries. Must have a non-zero value if permissions caching is enabled (see a permissions_validity_in_ms description).")
     , server_encryption_options(this, "server_encryption_options", value_status::Used, {/*none*/},
         "Enable or disable inter-node encryption. You must also generate keys and provide the appropriate key and trust store locations and passwords. The available options are:\n"
-        "* internode_encryption: (Default: none) Enable or disable encryption of inter-node communication using the TLS_RSA_WITH_AES_128_CBC_SHA cipher suite for authentication, key exchange, and encryption of data transfers. The available inter-node options are:\n"
+        "* internode_encryption: (Default: none) Enable or disable encryption of inter-node communication using TLS. The available inter-node options are:\n"
         "   * all: Encrypt all inter-node communications.\n"
         "   * none: No encryption.\n"
         "   * dc: Encrypt the traffic between the data centers (server only).\n"
@@ -1640,6 +1661,14 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "If enabled, Alternator compares the existing item with the new one during "
         "data-modifying operations to determine which event type should be emitted. "
         "This penalty is incurred only for tables with Alternator Streams enabled.")
+    , alternator_vector_search_extra_operators(this, "alternator_vector_search_extra_operators", liveness::LiveUpdate, value_status::Used, false,
+        "Allow comparison, range and set-membership operators (<, <=, >, >=, IN, BETWEEN) "
+        "in SearchVectors' SearchConditionExpression, on the vector index's INLINE_FILTER "
+        "attributes. DynamoDB currently supports only the equality operator (=) there, and "
+        "documents the others as \"not yet available\", so this option is disabled by default: "
+        "enabling it makes Alternator accept requests which DynamoDB would reject. The "
+        "SearchSchema's HASH attribute remains equality-only regardless of this option, "
+        "because it partitions the vector index.")
     , alternator_timeout_in_ms(this, "alternator_timeout_in_ms", liveness::LiveUpdate, value_status::Used, 10000,
         "The server-side timeout for completing Alternator API requests.")
     , alternator_ttl_period_in_seconds(this, "alternator_ttl_period_in_seconds", value_status::Used,
@@ -1684,6 +1713,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , restrict_replication_simplestrategy(this, "restrict_replication_simplestrategy", liveness::LiveUpdate, value_status::Deprecated, db::tri_mode_restriction_t::mode::FALSE, "Controls whether to disable SimpleStrategy replication. Can be true, false, or warn.")
     , restrict_dtcs(this, "restrict_dtcs", liveness::LiveUpdate, value_status::Unused, db::tri_mode_restriction_t::mode::TRUE, "Controls whether to prevent setting DateTieredCompactionStrategy. Can be true, false, or warn.")
     , restrict_twcs_without_default_ttl(this, "restrict_twcs_without_default_ttl", liveness::LiveUpdate, value_status::Used, db::tri_mode_restriction_t::mode::WARN, "Controls whether to prevent creating TimeWindowCompactionStrategy tables without a default TTL. Can be true, false, or warn.")
+    , restrict_mixed_storage_clusters(this, "restrict_mixed_storage_clusters", liveness::LiveUpdate, value_status::Used, db::tri_mode_restriction_t::mode::TRUE, "Controls whether to prevent creating a keyspace whose storage differs from the storage the cluster's other user keyspaces use. Can be true, false, or warn.")
     , restrict_future_timestamp(this, "restrict_future_timestamp",liveness::LiveUpdate, value_status::Used, true, "Controls whether to detect and forbid unreasonable USING TIMESTAMP, more than 3 days into the future.")
     , ignore_truncation_record(this, "unsafe_ignore_truncation_record", value_status::Used, false,
         "Ignore truncation record stored in system tables as if tables were never truncated.")
@@ -1748,7 +1778,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , audit_tables(this, "audit_tables", liveness::LiveUpdate, value_status::Used, "", "Comma separated list of table names (<keyspace>.<table>) that will be audited.")
     , audit_keyspaces(this, "audit_keyspaces", liveness::LiveUpdate, value_status::Used, "", "Comma separated list of keyspaces that will be audited. All tables in those keyspaces will be audited")
     , audit_unix_socket_path(this, "audit_unix_socket_path", value_status::Used, "/dev/log", "The path to the unix socket used for writing to syslog. Only applicable when audit is set to syslog.")
-    , audit_syslog_write_buffer_size(this, "audit_syslog_write_buffer_size", value_status::Used, 1048576, "The size (in bytes) of a write buffer used when writing to syslog socket.")
+    , audit_syslog_write_buffer_size(this, "audit_syslog_write_buffer_size", value_status::Unused, 1048576, "The size (in bytes) of a write buffer used when writing to syslog socket.")
      , audit_rules(this, "audit_rules", liveness::LiveUpdate, value_status::Used, {},
         "List of granular audit rules. Each rule has: sinks, categories, qualified_table_names, roles. "
         "When non-empty, these rules extend audit_categories, audit_tables, and audit_keyspaces; "

@@ -9,6 +9,7 @@ Test consistency of schema changes with topology changes.
 import asyncio
 import logging
 import functools
+import math
 import operator
 import time
 import re
@@ -44,10 +45,13 @@ class FeatureConfig:
     - ``table_opts``: appended to the ``CREATE TABLE ...`` statement.
     - ``cluster_cfg``: merged into the per-server config dict passed to
       ``manager.server_add``.
+    - ``on_object_storage``: the keyspace lives on S3 or GCS rather than on the
+      local filesystem.
     """
     ks_opts: str = ""
     table_opts: str = ""
     cluster_cfg: dict = field(default_factory=dict)
+    on_object_storage: bool = False
 
     @property
     def strongly_consistent(self) -> bool:
@@ -57,7 +61,7 @@ class FeatureConfig:
         return "consistency = 'global'" in ' '.join(self.ks_opts.split())
 
 
-    def get_cluster_cfg(self, base: dict) -> dict:
+    def get_cluster_cfg(self, base: dict | None = None) -> dict:
         """Merge a FeatureConfig's cluster_cfg into a test's base config dict.
 
         List-valued keys (e.g. 'experimental_features', 'error_injections_at_startup')
@@ -65,7 +69,7 @@ class FeatureConfig:
         the test already relies on. Other keys overwrite the base value. The base
         dict is not modified; a new merged dict is returned.
         """
-        merged = deepcopy(base)
+        merged = deepcopy(base or {})
         for key, value in self.cluster_cfg.items():
             if isinstance(value, list) and isinstance(merged.get(key), list):
                 merged[key] = merged[key] + [v for v in value if v not in merged[key]]
@@ -294,7 +298,7 @@ async def wait_for_no_pending_topology_transition(manager: ScyllaClusterManager,
             return None
         return True
 
-    await wait_for(no_transition, deadline, period=.5)
+    await wait_for(no_transition, deadline)
 
 
 async def wait_for_no_running_compactions(manager: ScyllaClusterManager,
@@ -495,14 +499,24 @@ async def trigger_snapshot(manager, server: ServerInfo) -> None:
     host = cql.cluster.metadata.get_host(server.ip_addr)
     await manager.api.client.post(f"/raft/trigger_snapshot/{group0_id}", host=server.ip_addr)
 
-async def trigger_stepdown(manager, server: ServerInfo) -> None:
-    cql = manager.get_cql()
-    host = cql.cluster.metadata.get_host(server.ip_addr)
-    await manager.api.client.post("/raft/trigger_stepdown", host=server.ip_addr)
+async def trigger_stepdown(manager, server: ServerInfo, group_id: str | None = None,
+                           target_host_id: Optional[HostID] = None) -> None:
+    """Make `server` step down as the leader of `group_id`, or of group0 if not given.
+
+    Fails if `server` is not the leader of that group. If `target_host_id` is given,
+    leadership is handed to that node; it must be a voter of the group other than
+    `server`, otherwise the transfer cannot complete and the call fails after a timeout.
+    """
+    params = {}
+    if group_id is not None:
+        params["group_id"] = group_id
+    if target_host_id is not None:
+        params["target_host_id"] = target_host_id
+    await manager.api.client.post("/raft/trigger_stepdown", host=server.ip_addr, params=params or None)
 
 
 
-async def get_coordinator_host_ids(manager: ScyllaClusterManager) -> list[str]:
+async def get_coordinator_host_ids(manager: ScyllaClusterManager) -> list[HostID]:
     """ Get coordinator host id from history
 
     Select all records with elected coordinator
@@ -515,11 +529,11 @@ async def get_coordinator_host_ids(manager: ScyllaClusterManager) -> list[str]:
 
     cql = manager.get_cql()
     result = await cql.run_async(stm)
-    coordinators_ids = []
+    coordinators_ids: list[HostID] = []
     for row in result:
         coordinator_host_id = get_uuid_from_str(row.description)
         if coordinator_host_id:
-            coordinators_ids.append(coordinator_host_id)
+            coordinators_ids.append(HostID(coordinator_host_id))
     assert len(coordinators_ids) > 0, f"No coordinator ids {coordinators_ids} were found"
     return coordinators_ids
 
@@ -553,17 +567,26 @@ async def ensure_group0_leader_on(manager: ScyllaClusterManager, server: ServerI
     Ensure that raft group0 leader runs on a given server, triggering stepdowns if necessary.
     Assumes that servers are not added concurrently.
     """
+    await ensure_raft_group_leader_on(manager, server, None, timeout_seconds)
 
+async def ensure_raft_group_leader_on(manager: ScyllaClusterManager, server: ServerInfo, group_id: Optional[str], timeout_seconds = 60):
+    """
+    Ensure that the leader of given raft group runs on a given server, triggering stepdowns if necessary.
+    If group_id is None, then group0 is assumed as the given group.
+    The given server must remain a voter throughout the duration of the call of the function.
+    """
     deadline = time.time() + timeout_seconds
     servers_by_host = await manager.all_servers_by_host_id()
     desired_host_id = await manager.get_host_id(server.server_id)
+
+    group_name = "group0" if group_id is None else f"raft group {group_id}"
 
     while True:
         if time.time() > deadline:
             raise RuntimeError(f"timed out")
 
-        await read_barrier(manager.api, server.ip_addr)
-        coord = await manager.api.get_raft_leader(server.ip_addr)
+        await read_barrier(manager.api, server.ip_addr, group_id, timeout=max(1, math.ceil(deadline - time.time())))
+        coord = await manager.api.get_raft_leader(server.ip_addr, group_id)
         if coord == desired_host_id:
             break
 
@@ -571,10 +594,11 @@ async def ensure_group0_leader_on(manager: ScyllaClusterManager, server: ServerI
             logger.info("no leader")
             continue
 
-        logger.info(f"group0 leader is {coord}, want {desired_host_id}")
+        logger.info(f"{group_name} leader is {coord}, want {desired_host_id}")
         coord_host = servers_by_host[coord]
-        logger.info(f"triggering stepdown of {coord}/{coord_host.ip_addr}")
-        await manager.api.client.post("/raft/trigger_stepdown", host=coord_host.ip_addr)
+        logger.info(
+            f"{group_name}, triggering stepdown of {coord}/{coord_host.ip_addr} in favor of {desired_host_id}")
+        await trigger_stepdown(manager, coord_host, group_id=group_id, target_host_id=desired_host_id)
 
 async def get_non_coordinator_host(manager: ScyllaClusterManager) -> ServerInfo | None:
     """Get first non-coordinator ServerInfo."""
@@ -591,20 +615,19 @@ def get_uuid_from_str(string: str) -> str:
     return uuid
 
 
-async def wait_new_coordinator_elected(manager: ScyllaClusterManager, expected_num_of_elections: int, deadline: float) -> None:
-    """Wait new coordinator to be elected
+async def wait_new_coordinator_elected(manager: ScyllaClusterManager, previous_coordinator_id: HostID, deadline: float) -> None:
+    """Wait for a node other than previous_coordinator_id to become topology coordinator
 
-    Wait while the table 'system.group0_history' will have at least
-    expected_num_of_elections lines with 'new topology coordinator',
-    and the latest host_id coordinator differs from the previous one.
+    previous_coordinator_id is the host id of the node which held the coordinator
+    role and then stopped or crashed, taken from that node itself.
     """
     async def new_coordinator_elected():
         coordinators_ids = await get_coordinator_host_ids(manager)
         logger.debug(f"Coordinators ids in history: {coordinators_ids}")
-        if len(coordinators_ids) >= expected_num_of_elections \
-            and coordinators_ids[0] != coordinators_ids[1]:
+        if coordinators_ids[0] != previous_coordinator_id:
             return True
-        logger.warning("New coordinator was not elected %s", coordinators_ids)
+        logger.warning("New coordinator was not elected, still %s, history %s",
+                       previous_coordinator_id, coordinators_ids)
 
     await wait_for(new_coordinator_elected, deadline=deadline)
 

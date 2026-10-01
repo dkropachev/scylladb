@@ -76,6 +76,7 @@ target_sources(cql3
     statements/cas_request.cc
     statements/raw/parsed_statement.cc
     statements/property_definitions.cc
+    statements/insert_statement.cc
     statements/update_statement.cc
     statements/delete_statement.cc
     statements/prune_materialized_view_statement.cc
@@ -84,8 +85,9 @@ target_sources(cql3
     statements/external_search/external_index_select_statement.cc
     statements/external_search/fulltext_indexed_table_select_statement.cc
     statements/external_search/vector_indexed_table_select_statement.cc
-    statements/external_search/external_score_provider.cc
+    statements/external_search/values_provider.cc
     statements/external_search/filter.cc
+    statements/external_search/external_function.cc
     statements/use_statement.cc
     statements/index_prop_defs.cc
     statements/index_target.cc
@@ -100,6 +102,7 @@ target_sources(cql3
     statements/grant_statement.cc
     statements/revoke_statement.cc
     statements/alter_type_statement.cc
+    statements/alter_cluster_config_statement.cc
     statements/alter_keyspace_statement.cc
     statements/role-management-statements.cc
     statements/service_level_statement.cc

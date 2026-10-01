@@ -77,7 +77,7 @@ future<> atomic_deletion::execute() noexcept {
         co_await _impl->finalize();
     } catch (...) {
         // After commit(), the SSTables will be deleted even after a crash.
-        smlogger.warn("SSTables deletion failed after commit: {}. Will be retried on restart.", std::current_exception());
+        smlogger.warn("SSTables deletion failed after commit: {:t}. Will be retried on restart.", std::current_exception());
     }
 }
 
@@ -121,10 +121,10 @@ sstables_manager::~sstables_manager() {
 void sstables_manager::subscribe(sstables_manager_event_handler& handler) {
     handler.subscribe(_signal_source.connect([this, &handler] (sstables::generation_type gen, notification_event_type event) mutable -> future<> {
         if (auto gh = _signal_gate.try_hold()) {
-            switch (event) {
-            case notification_event_type::deleted:
-                co_await handler.deleted_sstable(gen);
-            }
+            // Note: the slot must not touch its captures after suspending.
+            // The connection, and with it this closure, may be gone by the
+            // time it is resumed.
+            co_await handler.notify(gen, event);
         }
     }));
 }
@@ -404,7 +404,7 @@ future<> sstables_manager::maybe_reload_components() {
             co_await sstable_ptr->reload_reclaimed_components();
         } catch (...) {
             // reload failed due to some reason
-            sstlog.warn("Failed to reload reclaimed SSTable components : {}", std::current_exception());
+            sstlog.warn("Failed to reload reclaimed SSTable components : {:t}", std::current_exception());
             // revert back changes made before the reload
             _total_reclaimable_memory -= reclaimed_memory;
             _reclaimed.insert(*sstable_to_reload);
@@ -423,8 +423,14 @@ void sstables_manager::reclaim_memory_and_stop_tracking_sstable(sstable* sst) {
     // reclaim any remaining memory from the sstable
     sst->reclaim_memory_from_components();
     // disable further reload of components
-    _reclaimed.erase(*sst);
+    erase_from_reclaimed(sst);
     sst->disable_component_memory_reload();
+}
+
+void sstables_manager::erase_from_reclaimed(sstable* sst) noexcept {
+    if (sst->_manager_set_link.is_linked()) {
+        _reclaimed.erase(_reclaimed.iterator_to(*sst));
+    }
 }
 
 void sstables_manager::add(sstable* sst) {

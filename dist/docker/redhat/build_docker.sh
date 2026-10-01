@@ -75,7 +75,6 @@ container="$(buildah from --pull=always docker.io/redhat/ubi9-minimal:latest)"
 packages=(
     "build/dist/$config/redhat/RPMS/$arch/$product-server-$version-$release.$arch.rpm"
     "build/dist/$config/redhat/RPMS/$arch/$product-conf-$version-$release.$arch.rpm"
-    "build/dist/$config/redhat/RPMS/$arch/$product-kernel-conf-$version-$release.$arch.rpm"
     "tools/cqlsh/build/redhat/RPMS/$arch/$product-cqlsh-$version-$release.$arch.rpm"
     "tools/python3/build/redhat/RPMS/$arch/$product-python3-$version-$release.$arch.rpm"
 )
@@ -83,7 +82,6 @@ packages=(
 bcp "${packages[@]}" packages/
 
 bcp dist/docker/etc etc/
-bcp dist/docker/scylla-housekeeping-service.sh /scylla-housekeeping-service.sh
 
 bcp dist/docker/scyllasetup.py /scyllasetup.py
 bcp dist/docker/commandlineparser.py /commandlineparser.py
@@ -95,7 +93,7 @@ bcp LICENSE-ScyllaDB-Source-Available.md /licenses/
 
 run microdnf clean all
 run microdnf --setopt=tsflags=nodocs -y --nobest update
-run microdnf --setopt=tsflags=nodocs -y install hostname kmod procps-ng python3 python3-pip systemd
+run microdnf --setopt=tsflags=nodocs -y install hostname procps-ng python3 python3-pip systemd
 run curl -L --output /etc/yum.repos.d/scylla.repo ${repo_file_url}
 run pip3 install --no-cache-dir --prefix /usr supervisor
 run bash -ec "echo LANG=C.UTF-8 > /etc/locale.conf"

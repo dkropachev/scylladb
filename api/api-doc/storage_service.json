@@ -1012,7 +1012,7 @@
                   },
                   {
                      "name":"backup_source_location",
-                     "description":"Array of backup location objects. Currently, the array must contain exactly one entry.",
+                     "description":"Array of backup location objects, exactly one entry per datacenter the keyspace replicates to.",
                      "required":true,
                      "allowMultiple":false,
                      "type":"array",
@@ -3692,6 +3692,14 @@
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"
+                  },
+                  {
+                     "name":"accept_data_resurrection_risk",
+                     "description":"The drop quarantined SSTables operation is unsafe. Accept the risk of data resurrection. Required for the operation to execute.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
                   }
                ]
             }
@@ -3745,6 +3753,14 @@
                   "type":"string"
                },
                "description":"Reference object paths relative to the refs prefix"
+            },
+            "version":{
+               "type":"string",
+               "description":"SSTable version, from the TOC object attributes. Absent if the TOC object carries no version attribute"
+            },
+            "format":{
+               "type":"string",
+               "description":"SSTable format, from the TOC object attributes. Absent if the TOC object carries no format attribute"
             }
          }
       },
@@ -4051,6 +4067,10 @@
             "host_id":{
                "type":"string",
                "description":"The host ID"
+            },
+            "endpoint":{
+               "type":"string",
+               "description":"The node IP address. Empty if the address is not known."
             },
             "current_mode":{
                "type":"string",

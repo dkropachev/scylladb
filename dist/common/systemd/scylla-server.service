@@ -1,7 +1,5 @@
 [Unit]
 Description=Scylla Server
-Wants=scylla-housekeeping-restart.timer
-Wants=scylla-housekeeping-daily.timer
 # This will only requires for abrt < 2.14
 Conflicts=abrt-ccpp.service
 
@@ -9,7 +7,8 @@ Conflicts=abrt-ccpp.service
 Type=notify
 LimitCORE=infinity
 LimitMEMLOCK=infinity
-LimitNOFILE=800000
+# resolved by systemd to the fs.nr_open sysctl
+LimitNOFILE=infinity
 LimitAS=infinity
 LimitNPROC=8096
 # Intel Golden Cove branches > 2GB occupy more slots in the branch target buffer,

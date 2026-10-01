@@ -24,7 +24,8 @@
 #include "cql3/statements/create_type_statement.hh"
 #include "cql3/statements/create_view_statement.hh"
 #include "cql3/statements/create_index_statement.hh"
-#include "cql3/statements/update_statement.hh"
+#include "cql3/statements/alter_table_statement.hh"
+#include "cql3/statements/modification_statement.hh"
 #include "db/cql_type_parser.hh"
 #include "db/config.hh"
 #include "db/extensions.hh"
@@ -293,7 +294,7 @@ std::vector<schema_ptr> do_load_schemas(const db::config& cfg, std::string_view 
     try {
         raw_statements = cql3::query_processor::parse_statements(schema_str, cql3::internal_dialect());
     } catch (...) {
-        throw std::runtime_error(format("tools:do_load_schemas(): failed to parse CQL statements: {}", std::current_exception()));
+        throw std::runtime_error(format("tools:do_load_schemas(): failed to parse CQL statements: {:t}", std::current_exception()));
     }
     for (auto& raw_statement : raw_statements) {
         if (raw_statement->get_prepare_context().bound_variables_size()) {
@@ -345,7 +346,8 @@ std::vector<schema_ptr> do_load_schemas(const db::config& cfg, std::string_view 
             it->secondary_idx_man.reload();
             auto view = p->create_view_for_index(it->schema, index, db);
             real_db.tables.emplace_back(dd_impl, dd_impl.unwrap(ks), view, true);
-        } else if (auto p = dynamic_cast<cql3::statements::update_statement*>(statement)) {
+        } else if (auto p = dynamic_cast<cql3::statements::modification_statement*>(statement);
+                p && (p->type.is_insert() || p->type.is_update())) {
             if (p->keyspace() != db::schema_tables::NAME && p->column_family() != db::schema_tables::DROPPED_COLUMNS) {
                 throw std::runtime_error(fmt::format("tools::do_load_schemas(): expected modification statement to be against {}.{}, but it is against {}.{}",
                             db::schema_tables::NAME, db::schema_tables::DROPPED_COLUMNS, p->keyspace(), p->column_family()));
@@ -382,8 +384,22 @@ std::vector<schema_ptr> do_load_schemas(const db::config& cfg, std::string_view 
                 auto time = row.get_nonnull<db_clock::time_point>("dropped_time");
                 it->schema = schema_builder(std::move(it->schema)).without_column(std::move(name), std::move(type), time.time_since_epoch().count()).build();
             }
+        } else if (auto p = dynamic_cast<cql3::statements::alter_table_statement*>(statement)) {
+            // A schema.cql (e.g. the one written next to a snapshot) may contain ALTER TABLE
+            // statements: a dropped column is described as ALTER TABLE ... DROP ... USING TIMESTAMP
+            // (followed by ALTER TABLE ... ADD when the column was re-added). Apply them here so the
+            // reconstructed schema matches the sstables, keeping data of dropped columns readable.
+            auto [new_schema, _] = p->prepare_schema_update(db, cql3::query_options::DEFAULT);
+            auto it = std::find_if(real_db.tables.begin(), real_db.tables.end(), [&] (const table& t) {
+                return t.schema->ks_name() == new_schema->ks_name() && t.schema->cf_name() == new_schema->cf_name();
+            });
+            if (it == real_db.tables.end()) {
+                throw std::runtime_error(fmt::format("tools::do_load_schemas(): ALTER TABLE statement refers to an unknown table: {}.{}",
+                            new_schema->ks_name(), new_schema->cf_name()));
+            }
+            it->schema = std::move(new_schema);
         } else {
-            throw std::runtime_error(fmt::format("tools::do_load_schemas(): expected statement to be one of (create keyspace, create type, create table), got: {}",
+            throw std::runtime_error(fmt::format("tools::do_load_schemas(): expected statement to be one of (create keyspace, create type, create table, create view, create index, insert/update, alter table), got: {}",
                         typeid(statement).name()));
         }
     }

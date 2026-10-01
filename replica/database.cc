@@ -32,6 +32,7 @@
 #include "db/system_distributed_keyspace.hh"
 #include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
+#include "audit/audit.hh"
 #include "db/extensions.hh"
 #include "cql3/functions/functions.hh"
 #include "cql3/functions/user_function.hh"
@@ -599,8 +600,8 @@ database::sum_read_concurrency_sem_stat(std::invocable<reader_concurrency_semaph
 
 void
 database::setup_metrics() {
-    _dirty_memory_manager.setup_collectd("regular");
-    _system_dirty_memory_manager.setup_collectd("system");
+    _dirty_memory_manager.setup_metrics("regular");
+    _system_dirty_memory_manager.setup_metrics("system");
 
     namespace sm = seastar::metrics;
 
@@ -821,7 +822,7 @@ do_parse_schema_tables(sharded<service::storage_proxy>& proxy, const sstring cf_
         try {
             co_await func(v);
         } catch (...) {
-            dblog.error("Skipping: {}. Exception occurred when loading system table {}: {}", v.first, cf_name, std::current_exception());
+            dblog.error("Skipping: {}. Exception occurred when loading system table {}: {:t}", v.first, cf_name, std::current_exception());
         }
     });
 }
@@ -1038,7 +1039,7 @@ future<database::keyspace_change_per_shard> database::prepare_update_keyspace_on
     co_await modify_keyspace_on_all_shards(sharded_db, [&] (replica::database& db) -> future<> {
         auto& ks = db.find_keyspace(ksm.name());
         auto new_ksm = ::make_lw_shared<keyspace_metadata>(ksm.name(), ksm.strategy_name(), ksm.strategy_options(), ksm.initial_tablets(), ksm.consistency_option(), ksm.durable_writes(),
-                ks.metadata()->cf_meta_data() | std::views::values | std::ranges::to<std::vector>(), ks.metadata()->user_types(), ksm.get_storage_options(), ksm.next_strategy_options_opt());
+                ks.metadata()->cf_meta_data() | std::views::values | std::ranges::to<std::vector>(), ks.metadata()->user_types(), ksm.get_storage_options(), ksm.next_strategy_options_opt(), ksm.config_options());
 
         auto change = co_await db.prepare_update_keyspace(ks, new_ksm, pending_token_metadata.local());
         changes[this_shard_id()] = make_foreign(std::make_unique<keyspace_change>(std::move(change)));
@@ -1440,11 +1441,11 @@ future<> database::legacy_drop_table_on_all_shards(sharded<database>& sharded_db
 }
 
 table_id database::find_uuid(std::string_view ks, std::string_view cf) const {
-    try {
-        return _tables_metadata.get_table_id(std::make_pair(ks, cf));
-    } catch (std::out_of_range&) {
+    auto id = _tables_metadata.get_table_id_if_exists(std::make_pair(ks, cf));
+    if (!id) {
         throw no_such_column_family(ks, cf);
     }
+    return id;
 }
 
 table_id database::find_uuid(const schema_ptr& schema) const {
@@ -1489,6 +1490,40 @@ std::vector<sstring> database::get_user_keyspaces() const {
         }
     }
     return res;
+}
+
+// is_internal_keyspace() misses two keyspaces Scylla also creates itself:
+// "audit", which the table-based audit backend creates on demand, and
+// "system_distributed_everywhere", present only on an upgraded cluster.
+static bool is_always_local_keyspace(std::string_view name, bool audit_table_configured) {
+    return is_internal_keyspace(name) || (audit_table_configured && name == "audit") || name == "system_distributed_everywhere";
+}
+
+database::user_storage_kind database::get_user_storage_kind() const {
+    bool local = false;
+    bool object_storage = false;
+    // the "audit" keyspace exists only while the table sink is configured;
+    // otherwise the name is free for a user to take
+    const bool audit_table_configured = audit::table_sink_configured(_cfg);
+    for (auto const& i : _keyspaces) {
+        if (i.second.metadata()->get_storage_options().is_object_storage_type()) {
+            // Nothing but a user request ever asks for object storage, so there
+            // is no internal keyspace to filter out here.
+            object_storage = true;
+        } else if (!is_always_local_keyspace(i.first, audit_table_configured)) {
+            local = true;
+        }
+    }
+    if (local && object_storage) {
+        return user_storage_kind::mixed;
+    }
+    if (object_storage) {
+        return user_storage_kind::object_storage;
+    }
+    if (local) {
+        return user_storage_kind::local;
+    }
+    return user_storage_kind::none;
 }
 
 std::vector<sstring> database::get_all_keyspaces() const {
@@ -2189,13 +2224,17 @@ lw_shared_ptr<memtable> memtable_list::new_memtable() {
             _table_stats, this, _compaction_scheduling_group, _shared_gc_state);
 }
 
+std::vector<replica::shared_memtable> memtable_list::make_replacement() {
+    std::vector<replica::shared_memtable> new_memtables;
+    new_memtables.emplace_back(new_memtable());
+    return new_memtables;
+}
+
 // Synchronously swaps the active memtable with a new, empty one,
 // returning the old memtables list.
 // Exception safe.
 std::vector<replica::shared_memtable> memtable_list::clear_and_add() {
-    std::vector<replica::shared_memtable> new_memtables;
-    new_memtables.emplace_back(new_memtable());
-    return std::exchange(_memtables, std::move(new_memtables));
+    return clear_and_add(make_replacement());
 }
 
 future<> database::apply_in_memory(const frozen_mutation& m, schema_ptr m_schema, db::rp_handle&& h,
@@ -3146,13 +3185,7 @@ future<> database::truncate_table_on_all_shards(sharded<database>& sharded_db, s
                     st->cres.emplace_back(co_await cm.stop_and_disable_compaction("truncate", ts));
                 });
             });
-
-            if (cf.uses_logstor()) {
-                auto& logstor_cm = cf.get_logstor_compaction_manager();
-                co_await cf.parallel_foreach_logstor_compaction_group([&logstor_cm, &st] (replica::compaction_group& cg) -> future<> {
-                    st->logstor_cres.emplace_back(co_await logstor_cm.disable_compaction(cg.as_logstor_group()));
-                });
-            }
+            // for logstor tables, we disable compaction only after the flush. see below.
 
             co_return make_foreign(std::move(st));
         });
@@ -3186,7 +3219,15 @@ future<> database::truncate_table_on_all_shards(sharded<database>& sharded_db, s
         co_await coroutine::parallel_for_each(views, [&] (lw_shared_ptr<replica::table> v) -> future<> {
             co_await flush_or_clear(*v);
         });
-        co_await cf.flush_separator();
+        if (cf.uses_logstor()) {
+            // flush and only then disable the compaction. flush writes to new segments, and the compaction
+            // is what generates free segments for new writes.
+            co_await cf.flush_separator();
+            auto& logstor_cm = cf.get_logstor_compaction_manager();
+            co_await cf.parallel_foreach_logstor_compaction_group([&logstor_cm, &st] (replica::compaction_group& cg) -> future<> {
+                st.logstor_cres.emplace_back(co_await logstor_cm.disable_compaction(cg.as_logstor_group()));
+            });
+        }
         // Since writes could be appended to active memtable between getting low_mark above
         // and flush, the low_mark has to be adjusted to account for those writes, where
         // memtable was flushed with a higher replay position than the one obtained above.
@@ -3603,16 +3644,12 @@ void database::tables_metadata::remove_table(database& db, table& cf) noexcept {
         auto& ks = db.find_keyspace(s->ks_name());
         remove_table_helper(db, ks, cf, s);
     } catch (...) {
-        on_fatal_internal_error(dblog, format("tables_metadata::remove_cf: {}", std::current_exception()));
+        on_fatal_internal_error(dblog, format("tables_metadata::remove_cf: {:t}", std::current_exception()));
     }
 }
 
 table& database::tables_metadata::get_table(table_id id) const {
     return *_column_families.at(id);
-}
-
-table_id database::tables_metadata::get_table_id(const std::pair<std::string_view, std::string_view>& kscf) const {
-    return _ks_cf_to_uuid.at(ks_cf_t{kscf});
 }
 
 lw_shared_ptr<table> database::tables_metadata::get_table_if_exists(table_id id) const {

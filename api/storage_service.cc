@@ -28,7 +28,6 @@
 #include <boost/regex.hpp>
 #include <string>
 #include <boost/algorithm/string/trim_all.hpp>
-#include <boost/algorithm/string/case_conv.hpp>
 #include <boost/functional/hash.hpp>
 #include <fmt/ranges.h>
 #include "service/raft/raft_group0_client.hh"
@@ -66,7 +65,6 @@
 #include "utils/rjson.hh"
 #include "utils/user_provided_param.hh"
 #include "sstable_dict_autotrainer.hh"
-#include "api/validate.hh"
 
 using namespace seastar::httpd;
 using namespace std::chrono_literals;
@@ -163,12 +161,7 @@ std::optional<std::chrono::seconds> validate_ttl(const std::string& value) {
         throw bad_param_exception(fmt::format("TTL value '{}' is not valid, expected a non-negative integer with an optional suffix [smhd]", value));
     }
 
-    int res;
-    try {
-        res = std::stoi(match[1].str());
-    } catch (...) {
-        throw bad_param_exception(fmt::format("Parsing TTL value '{}' failed: {}", value, std::current_exception()));
-    }
+    int res = parse_number_param<int>("ttl", match[1].str());
 
     auto suffix = match[2].str();
     auto c = suffix.empty() ? 's' : std::tolower(suffix[0]);
@@ -239,7 +232,7 @@ scrub_info parse_scrub_options(const http_context& ctx, std::unique_ptr<http::re
     auto scrub_mode = compaction::compaction_type_options::scrub::mode::validate;
 
     if (scrub_mode_str.empty()) {
-        const auto skip_corrupted = validate_bool_x(req->get_query_param("skip_corrupted"), false);
+        const auto skip_corrupted = get_query_param<bool>(*req, "skip_corrupted");
 
         if (skip_corrupted) {
             scrub_mode = compaction::compaction_type_options::scrub::mode::skip;
@@ -258,14 +251,14 @@ scrub_info parse_scrub_options(const http_context& ctx, std::unique_ptr<http::re
         }
     }
 
-    if (!req_param<bool>(*req, "disable_snapshot", false) && !info.column_families.empty()) {
+    if (!get_query_param<bool>(*req, "disable_snapshot") && !info.column_families.empty()) {
         info.snapshot_tag = format("pre-scrub-{:d}", db_clock::now().time_since_epoch().count());
     }
 
     info.opts = {
         .operation_mode = scrub_mode,
     };
-    const sstring quarantine_mode_str = req_param<sstring>(*req, "quarantine_mode", "INCLUDE");
+    const sstring quarantine_mode_str = get_query_param<sstring>(*req, "quarantine_mode", "INCLUDE");
     if (quarantine_mode_str == "INCLUDE") {
         info.opts.quarantine_operation_mode = compaction::compaction_type_options::scrub::quarantine_mode::include;
     } else if (quarantine_mode_str == "EXCLUDE") {
@@ -276,7 +269,7 @@ scrub_info parse_scrub_options(const http_context& ctx, std::unique_ptr<http::re
         throw httpd::bad_param_exception(fmt::format("Unknown argument for 'quarantine_mode' parameter: {}", quarantine_mode_str));
     }
 
-    if(req_param<bool>(*req, "drop_unfixable_sstables", false)) {
+    if (get_query_param<bool>(*req, "drop_unfixable_sstables")) {
         if(scrub_mode != compaction::compaction_type_options::scrub::mode::segregate) {
             throw httpd::bad_param_exception("The 'drop_unfixable_sstables' parameter is only valid when 'scrub_mode' is 'SEGREGATE'");
         }
@@ -287,7 +280,7 @@ scrub_info parse_scrub_options(const http_context& ctx, std::unique_ptr<http::re
         if (scrub_mode != compaction::compaction_type_options::scrub::mode::validate) {
             throw httpd::bad_param_exception("The 'quarantine_invalid_sstables' parameter is only valid when 'scrub_mode' is 'VALIDATE'");
         }
-        info.opts.quarantine_sstables = compaction::compaction_type_options::scrub::quarantine_invalid_sstables(req_param<bool>(*req, "quarantine_invalid_sstables", true));
+        info.opts.quarantine_sstables = compaction::compaction_type_options::scrub::quarantine_invalid_sstables(get_query_param<bool>(*req, "quarantine_invalid_sstables", true));
     }
 
     return info;
@@ -387,7 +380,7 @@ void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair, s
     });
 
     ss::repair_async_status.set(r, [&repair] (std::unique_ptr<http::request> req) {
-        return repair.local().get_status(boost::lexical_cast<int>( req->get_query_param("id")))
+        return repair.local().get_status(require_query_param<int>(*req, "id"))
                 .then_wrapped([] (future<repair_status>&& fut) {
             ss::ns_repair_async_status::return_type_wrapper res;
             try {
@@ -400,26 +393,14 @@ void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair, s
     });
 
     ss::repair_await_completion.set(r, [&repair] (std::unique_ptr<http::request> req) {
-        int id;
         using clock = std::chrono::steady_clock;
-        clock::time_point expire;
-        try {
-            id = boost::lexical_cast<int>(req->get_query_param("id"));
-            // If timeout is not provided, it means no timeout.
-            sstring s = req->get_query_param("timeout");
-            int64_t timeout = s.empty() ? int64_t(-1) : boost::lexical_cast<int64_t>(s);
-            if (timeout < 0 && timeout != -1) {
-                return make_exception_future<json::json_return_type>(
-                        httpd::bad_param_exception("timeout can only be -1 (means no timeout) or non negative integer"));
-            }
-            if (timeout < 0) {
-                expire = clock::time_point::max();
-            } else {
-                expire = clock::now() + std::chrono::seconds(timeout);
-            }
-        } catch (std::exception& e) {
-            return make_exception_future<json::json_return_type>(httpd::bad_param_exception(e.what()));
+        const auto id = require_query_param<int>(*req, "id");
+        // If timeout is not provided, it means no timeout.
+        const auto timeout = get_query_param<std::chrono::seconds>(*req, "timeout", -1s);
+        if (timeout < -1s) {
+            throw httpd::bad_param_exception("timeout can only be -1 (means no timeout) or non negative integer");
         }
+        const clock::time_point expire = timeout < 0s ? clock::time_point::max() : clock::now() + timeout;
         return repair.local().await_completion(id, expire)
                 .then_wrapped([] (future<repair_status>&& fut) {
             ss::ns_repair_async_status::return_type_wrapper res;
@@ -475,17 +456,11 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
     ss::load_new_ss_tables.set(r, [&ctx, &sst_loader](std::unique_ptr<http::request> req) {
         auto ks = validate_keyspace(ctx, req);
         auto cf = req->get_query_param("cf");
-        auto stream = req->get_query_param("load_and_stream");
-        auto primary_replica = req->get_query_param("primary_replica_only");
-        auto skip_cleanup_p = req->get_query_param("skip_cleanup");
-        boost::algorithm::to_lower(stream);
-        boost::algorithm::to_lower(primary_replica);
-        bool load_and_stream = stream == "true" || stream == "1";
-        bool primary_replica_only = primary_replica == "true" || primary_replica == "1";
-        bool skip_cleanup = skip_cleanup_p == "true" || skip_cleanup_p == "1";
+        bool load_and_stream = get_query_param<bool>(*req, "load_and_stream");
+        bool primary_replica_only = get_query_param<bool>(*req, "primary_replica_only");
+        bool skip_cleanup = get_query_param<bool>(*req, "skip_cleanup");
         auto scope = parse_stream_scope(req->get_query_param("scope"));
-        auto skip_reshape_p = req->get_query_param("skip_reshape");
-        auto skip_reshape = skip_reshape_p == "true" || skip_reshape_p == "1";
+        bool skip_reshape = get_query_param<bool>(*req, "skip_reshape");
 
         if (scope != sstables_loader::stream_scope::all && !load_and_stream) {
             throw httpd::bad_param_exception("scope takes no effect without load-and-stream");
@@ -514,7 +489,7 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         auto bucket = req->get_query_param("bucket");
         auto prefix = req->get_query_param("prefix");
         auto scope = parse_stream_scope(req->get_query_param("scope"));
-        auto primary_replica_only = validate_bool_x(req->get_query_param("primary_replica_only"), false);
+        auto primary_replica_only = get_query_param<bool>(*req, "primary_replica_only");
 
         rjson::chunked_content content = co_await util::read_entire_stream(*req->content_stream);
         rjson::value parsed = rjson::parse(std::move(content));
@@ -548,38 +523,54 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
             throw httpd::bad_param_exception("backup locations (in body) must be a JSON array");
         }
 
-        const auto& locations = parsed.GetArray();
-        if (locations.Size() != 1) {
-            throw httpd::bad_param_exception("backup locations array (in body) must contain exactly one entry");
+        if (parsed.Empty()) {
+            throw httpd::bad_param_exception("backup locations array (in body) must not be empty");
         }
 
-        const auto& location = locations[0];
-        if (!location.IsObject()) {
-            throw httpd::bad_param_exception("backup location (in body) must be a JSON object");
+        auto get_member = [] (const auto& location, const char* name) {
+            if (!location.HasMember(name) || !location[name].IsString()) {
+                throw httpd::bad_param_exception(fmt::format("backup location entry must have '{}' string member", name));
+            }
+            return sstring(rjson::to_string_view(location[name]));
+        };
+
+        std::vector<tablet_restore_location> restore_locations;
+        for (const auto& location : parsed.GetArray()) {
+            if (!location.IsObject()) {
+                throw httpd::bad_param_exception("backup location (in body) must be a JSON object");
+            }
+
+            auto endpoint = get_member(location, "endpoint");
+            auto bucket = get_member(location, "bucket");
+            auto dc = get_member(location, "datacenter");
+            auto prefix = location.HasMember("prefix") ? rjson::to_string_view(location["prefix"]) : std::string_view{};
+
+            if (!location.HasMember("manifests") || !location["manifests"].IsArray()) {
+                throw httpd::bad_param_exception("backup location entry must have 'manifests' array");
+            }
+
+            auto manifests = location["manifests"].GetArray() |
+                std::views::transform([] (const auto& m) { return sstring(rjson::to_string_view(m)); }) |
+                std::ranges::to<utils::chunked_vector<sstring>>();
+
+            if (manifests.empty()) {
+                throw httpd::bad_param_exception("backup location 'manifests' array must not be empty");
+            }
+
+            apilog.info("Tablet restore for {}:{} called. Parameters: snapshot={} datacenter={} endpoint={} bucket={} prefix={} manifests_count={}",
+                        keyspace, table, snapshot, dc, endpoint, bucket, prefix, manifests.size());
+
+            restore_locations.push_back(tablet_restore_location{
+                .datacenter = std::move(dc),
+                .endpoint = std::move(endpoint),
+                .bucket = std::move(bucket),
+                .prefix = sstring(prefix),
+                .manifests = std::move(manifests),
+            });
         }
-
-        auto endpoint = rjson::to_string_view(location["endpoint"]);
-        auto bucket = rjson::to_string_view(location["bucket"]);
-        auto dc = rjson::to_string_view(location["datacenter"]);
-        auto prefix = location.HasMember("prefix") ? rjson::to_string_view(location["prefix"]) : std::string_view{};
-
-        if (!location.HasMember("manifests") || !location["manifests"].IsArray()) {
-            throw httpd::bad_param_exception("backup location entry must have 'manifests' array");
-        }
-
-        auto manifests = location["manifests"].GetArray() |
-            std::views::transform([] (const auto& m) { return sstring(rjson::to_string_view(m)); }) |
-            std::ranges::to<utils::chunked_vector<sstring>>();
-
-        if (manifests.empty()) {
-            throw httpd::bad_param_exception("backup location 'manifests' array must not be empty");
-        }
-
-        apilog.info("Tablet restore for {}:{} called. Parameters: snapshot={} datacenter={} endpoint={} bucket={} prefix={} manifests_count={}",
-                    keyspace, table, snapshot, dc, endpoint, bucket, prefix, manifests.size());
 
         auto table_id = validate_table(ctx.db.local(), keyspace, table);
-        auto task_id = co_await sst_loader.local().restore_tablets(table_id, keyspace, table, snapshot, sstring(endpoint), sstring(bucket), sstring(prefix), std::move(manifests));
+        auto task_id = co_await sst_loader.local().restore_tablets(table_id, keyspace, table, snapshot, std::move(restore_locations));
         co_return json::json_return_type(fmt::to_string(task_id));
     });
 }
@@ -776,10 +767,7 @@ rest_cdc_streams_check_and_repair(sharded<service::storage_service>& ss, std::un
 static
 future<json::json_return_type>
 rest_cleanup_all(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
-        bool global = true;
-        if (auto global_param = req->get_query_param("global"); !global_param.empty()) {
-            global = validate_bool(global_param);
-        }
+        bool global = get_query_param<bool>(*req, "global", true);
 
         apilog.info("cleanup_all global={}", global);
 
@@ -792,7 +780,7 @@ rest_cleanup_all(http_context& ctx, sharded<service::storage_service>& ss, std::
         // fall back to the local cleanup if local cleanup is requested
         auto& db = ctx.db;
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-        auto task = co_await compaction_module.make_and_start_task<compaction::global_cleanup_compaction_task_impl>({}, db);
+        auto task = co_await compaction_module.start_global_cleanup_compaction(db);
         co_await task->done();
 
         // Mark this node as clean
@@ -803,7 +791,7 @@ rest_cleanup_all(http_context& ctx, sharded<service::storage_service>& ss, std::
         co_return json::json_return_type(0);
 }
 
-static future<shared_ptr<compaction::cleanup_keyspace_compaction_task_impl>> force_keyspace_cleanup(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+static future<tasks::task_manager::task_ptr> force_keyspace_cleanup(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
         auto& db = ctx.db;
         auto [keyspace, table_infos] = parse_table_infos(ctx, *req);
         const auto& rs = db.local().find_keyspace(keyspace).get_replication_strategy();
@@ -820,8 +808,7 @@ static future<shared_ptr<compaction::cleanup_keyspace_compaction_task_impl>> for
         }
 
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-        co_return co_await compaction_module.make_and_start_task<compaction::cleanup_keyspace_compaction_task_impl>(
-            {}, std::move(keyspace), db, table_infos, compaction::flush_mode::all_tables, tasks::is_user_task::yes);
+        co_return co_await compaction_module.start_cleanup_keyspace_compaction(db, std::move(keyspace), table_infos, compaction::flush_mode::all_tables, tasks::is_user_task::yes);
 }
 
 static
@@ -837,10 +824,7 @@ rest_reset_cleanup_needed(http_context& ctx, sharded<service::storage_service>& 
 static
 future<json::json_return_type>
 rest_logstor_compaction(http_context& ctx, std::unique_ptr<http::request> req) {
-        bool major = false;
-        if (auto major_param = req->get_query_param("major"); !major_param.empty()) {
-            major = validate_bool(major_param);
-        }
+        bool major = get_query_param<bool>(*req, "major");
         apilog.info("logstor_compaction: major={}", major);
         auto& db = ctx.db;
         co_await replica::database::trigger_logstor_compaction_on_all_shards(db, major);
@@ -877,7 +861,7 @@ rest_move(sharded<service::storage_service>& ss, std::unique_ptr<http::request> 
 static
 future<json::json_return_type>
 rest_remove_node(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
-        auto host_id = validate_host_id(req->get_query_param("host_id"));
+        auto host_id = require_query_param<locator::host_id>(*req, "host_id");
         std::vector<sstring> ignore_nodes_strs = utils::split_comma_separated_list(req->get_query_param("ignore_nodes"));
         apilog.info("remove_node: host_id={} ignore_nodes={}", host_id, ignore_nodes_strs);
         locator::host_id_or_endpoint_list ignore_nodes;
@@ -890,7 +874,7 @@ rest_remove_node(sharded<service::storage_service>& ss, std::unique_ptr<http::re
                 }
                 ignore_nodes.push_back(std::move(hoep));
             } catch (...) {
-                throw std::runtime_error(fmt::format("Failed to parse ignore_nodes parameter: ignore_nodes={}, node={}: {}", ignore_nodes_strs, n, std::current_exception()));
+                throw std::runtime_error(fmt::format("Failed to parse ignore_nodes parameter: ignore_nodes={}, node={}: {:t}", ignore_nodes_strs, n, std::current_exception()));
             }
         }
         return ss.local().removenode(host_id, std::move(ignore_nodes)).then([] {
@@ -902,7 +886,7 @@ static
 future<json::json_return_type>
 rest_exclude_node(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
     auto hosts = utils::split_comma_separated_list(req->get_query_param("hosts"))
-        | std::views::transform([] (const sstring& s) { return locator::host_id(utils::UUID(s)); })
+        | std::views::transform([] (const sstring& s) { return locator::host_id(parse_uuid_param("hosts", s)); })
         | std::ranges::to<std::vector<locator::host_id>>();
 
     auto& topo = ss.local().get_token_metadata().get_topology();
@@ -1062,7 +1046,7 @@ rest_rebuild(sharded<service::storage_service>& ss, std::unique_ptr<http::reques
         if (auto source_dc_str = req->get_query_param("source_dc"); !source_dc_str.empty()) {
             source_dc.emplace(std::move(source_dc_str)).set_user_provided();
         }
-        if (auto force_str = req->get_query_param("force"); !force_str.empty() && service::loosen_constraints(validate_bool(force_str))) {
+        if (get_query_param<bool>(*req, "force")) {
             if (!source_dc) {
                 throw bad_param_exception("The `source_dc` option must be provided for using the `force` option");
             }
@@ -1118,25 +1102,16 @@ rest_reset_local_schema(sharded<service::storage_service>& ss, std::unique_ptr<h
 static
 future<json::json_return_type>
 rest_set_trace_probability(std::unique_ptr<http::request> req) {
-        auto probability = req->get_query_param("probability");
-        apilog.info("set_trace_probability: probability={}", probability);
-        return futurize_invoke([probability] {
-            double real_prob = std::stod(probability.c_str());
-            return tracing::tracing::tracing_instance().invoke_on_all([real_prob] (auto& local_tracing) {
+        const auto real_prob = require_query_param<double>(*req, "probability");
+        apilog.info("set_trace_probability: probability={}", real_prob);
+        try {
+            co_await tracing::tracing::tracing_instance().invoke_on_all([real_prob] (auto& local_tracing) {
                 local_tracing.set_trace_probability(real_prob);
-            }).then([] {
-                return make_ready_future<json::json_return_type>(json_void());
             });
-        }).then_wrapped([probability] (auto&& f) {
-            try {
-                f.get();
-                return make_ready_future<json::json_return_type>(json_void());
-            } catch (std::out_of_range& e) {
-                throw httpd::bad_param_exception(e.what());
-            } catch (std::invalid_argument&){
-                throw httpd::bad_param_exception(format("Bad format in a probability value: \"{}\"", probability.c_str()));
-            }
-        });
+        } catch (std::out_of_range& e) {
+            throw httpd::bad_param_exception(e.what());
+        }
+        co_return json_void();
 }
 
 static
@@ -1159,31 +1134,27 @@ rest_get_slow_query_info(const_req req) {
 static
 future<json::json_return_type>
 rest_set_slow_query(std::unique_ptr<http::request> req) {
-        auto enable = req->get_query_param("enable");
-        auto ttl = req->get_query_param("ttl");
-        auto threshold = req->get_query_param("threshold");
-        auto fast = req->get_query_param("fast");
-        apilog.info("set_slow_query: enable={} ttl={} threshold={} fast={}", enable, ttl, threshold, fast);
-        try {
-            return tracing::tracing::tracing_instance().invoke_on_all([enable, ttl, threshold, fast] (auto& local_tracing) {
-                if (threshold != "") {
-                    local_tracing.set_slow_query_threshold(std::chrono::microseconds(std::stol(threshold.c_str())));
-                }
-                if (ttl != "") {
-                    local_tracing.set_slow_query_record_ttl(std::chrono::seconds(std::stol(ttl.c_str())));
-                }
-                if (enable != "") {
-                    local_tracing.set_slow_query_enabled(strcasecmp(enable.c_str(), "true") == 0);
-                }
-                if (fast != "") {
-                    local_tracing.set_ignore_trace_events(strcasecmp(fast.c_str(), "true") == 0);
-                }
-            }).then([] {
-                return make_ready_future<json::json_return_type>(json_void());
-            });
-        } catch (...) {
-            throw httpd::bad_param_exception(format("Bad format value: "));
-        }
+        apilog.info("set_slow_query: {}", req->get_query_params());
+        const auto enable = try_get_query_param<bool>(*req, "enable");
+        const auto ttl = try_get_query_param<std::chrono::seconds>(*req, "ttl");
+        const auto threshold = try_get_query_param<std::chrono::microseconds>(*req, "threshold");
+        const auto fast = try_get_query_param<bool>(*req, "fast");
+        return tracing::tracing::tracing_instance().invoke_on_all([enable, ttl, threshold, fast] (auto& local_tracing) {
+            if (threshold) {
+                local_tracing.set_slow_query_threshold(*threshold);
+            }
+            if (ttl) {
+                local_tracing.set_slow_query_record_ttl(*ttl);
+            }
+            if (enable) {
+                local_tracing.set_slow_query_enabled(*enable);
+            }
+            if (fast) {
+                local_tracing.set_ignore_trace_events(*fast);
+            }
+        }).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
 }
 
 static
@@ -1324,8 +1295,8 @@ rest_estimate_compression_ratios(http_context& ctx, sharded<service::storage_ser
         throw std::runtime_error("estimate_compression_ratios requires all nodes to support the SSTABLE_COMPRESSION_DICTS cluster feature");
     }
     auto ticket = co_await get_units(ss.local().get_do_sample_sstables_concurrency_limiter(), 1);
-    auto ks = api::req_param<sstring>(*req, "keyspace", {}).value;
-    auto cf = api::req_param<sstring>(*req, "cf", {}).value;
+    auto ks = get_query_param<sstring>(*req, "keyspace");
+    auto cf = get_query_param<sstring>(*req, "cf");
     apilog.debug("estimate_compression_ratios: called with ks={} cf={}", ks, cf);
 
     auto s = ctx.db.local().find_column_family(ks, cf).schema();
@@ -1390,8 +1361,8 @@ rest_retrain_dict(http_context& ctx, sharded<service::storage_service>& ss, serv
         throw std::runtime_error("retrain_dict requires all nodes to support the SSTABLE_COMPRESSION_DICTS cluster feature");
     }
     auto ticket = co_await get_units(ss.local().get_do_sample_sstables_concurrency_limiter(), 1);
-    auto ks = api::req_param<sstring>(*req, "keyspace", {}).value;
-    auto cf = api::req_param<sstring>(*req, "cf", {}).value;
+    auto ks = get_query_param<sstring>(*req, "keyspace");
+    auto cf = get_query_param<sstring>(*req, "cf");
     apilog.debug("retrain_dict: called with ks={} cf={}", ks, cf);
     const auto t_id = ctx.db.local().find_column_family(ks, cf).schema()->id();
     constexpr uint64_t chunk_size = 4096;
@@ -1408,8 +1379,8 @@ rest_retrain_dict(http_context& ctx, sharded<service::storage_service>& ss, serv
 static
 future<json::json_return_type>
 rest_sstable_info(http_context& ctx, std::unique_ptr<http::request> req) {
-        auto ks = api::req_param<sstring>(*req, "keyspace", {}).value;
-        auto cf = api::req_param<sstring>(*req, "cf", {}).value;
+        auto ks = get_query_param<sstring>(*req, "keyspace");
+        auto cf = get_query_param<sstring>(*req, "cf");
 
         // The size of this vector is bound by ks::cf. I.e. it is as most Nks + Ncf long
         // which is not small, but not huge either. 
@@ -1538,10 +1509,10 @@ rest_sstable_info(http_context& ctx, std::unique_ptr<http::request> req) {
 static
 future<json::json_return_type>
 rest_logstor_info(http_context& ctx, std::unique_ptr<http::request> req) {
-        auto keyspace = api::req_param<sstring>(*req, "keyspace", {}).value;
-        auto table = api::req_param<sstring>(*req, "table", {}).value;
+        auto keyspace = get_query_param<sstring>(*req, "keyspace");
+        auto table = get_query_param<sstring>(*req, "table");
         if (table.empty()) {
-            table = api::req_param<sstring>(*req, "cf", {}).value;
+            table = get_query_param<sstring>(*req, "cf");
         }
 
         if (keyspace.empty()) {
@@ -1620,16 +1591,15 @@ rest_raft_topology_get_cmd_status(sharded<service::storage_service>& ss, std::un
 static
 future<json::json_return_type>
 rest_move_tablet(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
-        auto src_host_id = validate_host_id(req->get_query_param("src_host"));
-        shard_id src_shard_id = validate_int(req->get_query_param("src_shard"));
-        auto dst_host_id = validate_host_id(req->get_query_param("dst_host"));
-        shard_id dst_shard_id = validate_int(req->get_query_param("dst_shard"));
-        auto token = dht::token::from_int64(validate_int(req->get_query_param("token")));
+        auto src_host_id = require_query_param<locator::host_id>(*req, "src_host");
+        auto src_shard_id = require_query_param<shard_id>(*req, "src_shard");
+        auto dst_host_id = require_query_param<locator::host_id>(*req, "dst_host");
+        auto dst_shard_id = require_query_param<shard_id>(*req, "dst_shard");
+        auto token = dht::token::from_int64(require_query_param<int64_t>(*req, "token"));
         auto ks = req->get_query_param("ks");
         auto table = req->get_query_param("table");
         auto table_id = validate_table(ctx.db.local(), ks, table);
-        auto force_str = req->get_query_param("force");
-        auto force = service::loosen_constraints(force_str == "" ? false : validate_bool(force_str));
+        auto force = get_query_param<service::loosen_constraints>(*req, "force");
 
         co_await ss.local().move_tablet(table_id, token,
             locator::tablet_replica{src_host_id, src_shard_id},
@@ -1642,14 +1612,13 @@ rest_move_tablet(http_context& ctx, sharded<service::storage_service>& ss, std::
 static
 future<json::json_return_type>
 rest_add_tablet_replica(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
-        auto dst_host_id = validate_host_id(req->get_query_param("dst_host"));
-        shard_id dst_shard_id = validate_int(req->get_query_param("dst_shard"));
-        auto token = dht::token::from_int64(validate_int(req->get_query_param("token")));
+        auto dst_host_id = require_query_param<locator::host_id>(*req, "dst_host");
+        auto dst_shard_id = require_query_param<shard_id>(*req, "dst_shard");
+        auto token = dht::token::from_int64(require_query_param<int64_t>(*req, "token"));
         auto ks = req->get_query_param("ks");
         auto table = req->get_query_param("table");
         auto table_id = validate_table(ctx.db.local(), ks, table);
-        auto force_str = req->get_query_param("force");
-        auto force = service::loosen_constraints(force_str == "" ? false : validate_bool(force_str));
+        auto force = get_query_param<service::loosen_constraints>(*req, "force");
 
         co_await ss.local().add_tablet_replica(table_id, token,
             locator::tablet_replica{dst_host_id, dst_shard_id},
@@ -1661,14 +1630,13 @@ rest_add_tablet_replica(http_context& ctx, sharded<service::storage_service>& ss
 static
 future<json::json_return_type>
 rest_del_tablet_replica(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
-        auto dst_host_id = validate_host_id(req->get_query_param("host"));
-        shard_id dst_shard_id = validate_int(req->get_query_param("shard"));
-        auto token = dht::token::from_int64(validate_int(req->get_query_param("token")));
+        auto dst_host_id = require_query_param<locator::host_id>(*req, "host");
+        auto dst_shard_id = require_query_param<shard_id>(*req, "shard");
+        auto token = dht::token::from_int64(require_query_param<int64_t>(*req, "token"));
         auto ks = req->get_query_param("ks");
         auto table = req->get_query_param("table");
         auto table_id = validate_table(ctx.db.local(), ks, table);
-        auto force_str = req->get_query_param("force");
-        auto force = service::loosen_constraints(force_str == "" ? false : validate_bool(force_str));
+        auto force = get_query_param<service::loosen_constraints>(*req, "force");
 
         co_await ss.local().del_tablet_replica(table_id, token,
             locator::tablet_replica{dst_host_id, dst_shard_id},
@@ -1686,17 +1654,13 @@ rest_repair_tablet(http_context& ctx, sharded<service::storage_service>& ss, std
         if (!all_tokens) {
             tokens.reserve(tokens_param.size());
             for (auto& t : tokens_param) {
-                auto token = dht::token::from_int64(validate_int(t));
+                auto token = dht::token::from_int64(parse_number_param<int64_t>("tokens", t));
                 tokens.push_back(token);
             }
         }
         auto ks = req->get_query_param("ks");
         auto table = req->get_query_param("table");
-        bool await_completion = false;
-        auto await = req->get_query_param("await_completion");
-        if (!await.empty()) {
-            await_completion = validate_bool(await);
-        }
+        bool await_completion = get_query_param<bool>(*req, "await_completion");
 
         // Use regular mode if the incremental_mode option is not provided by user.
         auto incremental = req->get_query_param("incremental_mode");
@@ -1715,11 +1679,7 @@ rest_repair_tablet(http_context& ctx, sharded<service::storage_service>& ss, std
         if (!hosts.empty()) {
             std::string delim = ",";
             hosts_filter = std::ranges::views::split(hosts, delim) | std::views::transform([](auto&& h) {
-                try {
-                    return locator::host_id(utils::UUID(std::string_view{h}));
-                } catch (...) {
-                    throw httpd::bad_param_exception(fmt::format("Wrong host_id format {}", h));
-                }
+                return locator::host_id(parse_uuid_param("hosts_filter", std::string_view{h}));
             }) | std::ranges::to<std::unordered_set>();
         }
         auto dcs_filter = locator::tablet_task_info::deserialize_repair_dcs_filter(dcs);
@@ -1734,7 +1694,7 @@ rest_repair_tablet(http_context& ctx, sharded<service::storage_service>& ss, std
 static
 future<json::json_return_type>
 rest_tablet_balancing_enable(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
-        auto enabled = validate_bool(req->get_query_param("enabled"));
+        auto enabled = require_query_param<bool>(*req, "enabled");
         co_await ss.local().set_tablet_balancing_enabled(enabled);
         co_return json_void();
 }
@@ -1774,6 +1734,7 @@ rest_get_vnode_tablet_migration(http_context& ctx, sharded<service::storage_serv
     for (const auto& node : status.nodes) {
         ss::vnode_tablet_migration_node_status n;
         n.host_id = fmt::to_string(node.host_id);
+        n.endpoint = node.endpoint;
         n.current_mode = node.current_mode;
         n.intended_mode = node.intended_mode;
         result.nodes.push(n);
@@ -1861,6 +1822,16 @@ rest_get_schema_versions(sharded<service::storage_service>& ss, std::unique_ptr<
 static
 future<json::json_return_type>
 rest_drop_quarantined_sstables(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+    auto accept_risk = get_query_param<bool>(*req, "accept_data_resurrection_risk");
+    if (!accept_risk) {
+        co_await coroutine::return_exception(bad_request_exception(
+            "Dropping quarantined SSTables can resurrect deleted data. "
+            "This can happen regardless of the consistency level and of the \"repair\" tombstone GC mode. "
+            "Its usage is highly discouraged. "
+            "The only supported way to rid a node of corrupt data is to replace it. Anything else risks data resurrection or data loss. "
+            "This operation should only be used with full understanding of the risks when no viable alternatives remain. "
+            "To accept the risk and carry out the operation, provide the \"accept_data_resurrection_risk\" parameter."));
+    }
     auto keyspace = req->get_query_param("keyspace");
     try {
         if (!keyspace.empty()) {
@@ -1881,7 +1852,7 @@ rest_drop_quarantined_sstables(http_context& ctx, sharded<service::storage_servi
             });
         }
     } catch (...) {
-        apilog.error("drop_quarantined_sstables: failed with exception: {}", std::current_exception());
+        apilog.error("drop_quarantined_sstables: failed with exception: {:t}", std::current_exception());
         throw;
     }
 
@@ -2166,15 +2137,14 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
         apilog.info("take_snapshot: {}", req->get_query_params());
         auto tag = req->get_query_param("tag");
         auto column_families = split(req->get_query_param("cf"), ",");
-        auto sfopt = req->get_query_param("sf");
         auto tcopt = req->get_query_param("tc");
 
         db::snapshot_options opts = {
-            .skip_flush = strcasecmp(sfopt.c_str(), "true") == 0,
+            .skip_flush = get_query_param<bool>(*req, "sf"),
         };
         auto ttl = validate_ttl(req->get_query_param("ttl"));
         if (ttl && *ttl > 0s) {
-            opts.expires_at = opts.created_at + std::chrono::seconds(*ttl);
+            opts.expires_at = opts.created_at + *ttl;
         }
 
         std::vector<sstring> keynames = split(req->get_query_param("kn"), ",");
@@ -2194,7 +2164,7 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
         } catch (const data_dictionary::no_such_column_family& e) {
             throw httpd::bad_param_exception(e.what());
         } catch (...) {
-            apilog.error("take_snapshot failed: {}", std::current_exception());
+            apilog.error("take_snapshot failed: {:t}", std::current_exception());
             throw;
         }
     });
@@ -2203,11 +2173,9 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
         apilog.info("take_cluster_snapshot: {}", req->get_query_params());
         auto tag = req->get_query_param("tag");
         auto column_families = split(req->get_query_param("table"), ",");
-        // Note: not published/active. Retain as internal option, but...
-        auto sfopt = req->get_query_param("skip_flush");
-
         db::snapshot_options opts = {
-            .skip_flush = strcasecmp(sfopt.c_str(), "true") == 0,
+            // Note: not published/active. Retain as internal option, but...
+            .skip_flush = get_query_param<bool>(*req, "skip_flush"),
         };
 
         std::vector<sstring> keynames = split(req->get_query_param("keyspace"), ",");
@@ -2215,7 +2183,7 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
             co_await snap_ctl.local().take_cluster_column_family_snapshot(keynames, column_families, tag, opts);
             co_return json_void();
         } catch (...) {
-            apilog.error("take_cluster_snapshot failed: {}", std::current_exception());
+            apilog.error("take_cluster_snapshot failed: {:t}", std::current_exception());
             throw;
         }
     });
@@ -2232,7 +2200,7 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
         } catch (const data_dictionary::no_such_column_family& e) {
             throw httpd::bad_param_exception(e.what());
         } catch (...) {
-            apilog.error("del_snapshot failed: {}", std::current_exception());
+            apilog.error("del_snapshot failed: {:t}", std::current_exception());
             throw;
         }
     });
@@ -2254,7 +2222,7 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
 
         compaction::compaction_stats stats;
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-        auto task = co_await compaction_module.make_and_start_task<compaction::scrub_sstables_compaction_task_impl>({}, info.keyspace, db, info.column_families, info.opts, &stats);
+        auto task = co_await compaction_module.start_scrub_sstables_keyspace_compaction(db, info.keyspace, info.column_families, info.opts, &stats);
         try {
             co_await task->done();
             if (stats.validation_errors) {
@@ -2263,7 +2231,7 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
         } catch (const compaction::compaction_aborted_exception&) {
             co_return json::json_return_type(static_cast<int>(scrub_status::aborted));
         } catch (...) {
-            apilog.error("scrub keyspace={} tables={} failed: {}", info.keyspace, info.column_families, std::current_exception());
+            apilog.error("scrub keyspace={} tables={} failed: {:t}", info.keyspace, info.column_families, std::current_exception());
             throw;
         }
 
@@ -2277,7 +2245,7 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
         auto bucket = req->get_query_param("bucket");
         auto prefix = req->get_query_param("prefix");
         auto snapshot_name = req->get_query_param("snapshot");
-        auto move_files = req_param<bool>(*req, "move_files", false);
+        auto move_files = get_query_param<bool>(*req, "move_files");
         if (snapshot_name.empty()) {
             // TODO: If missing, snapshot should be taken by scylla, then removed
             throw httpd::bad_param_exception("The snapshot name must be specified");
@@ -2292,7 +2260,7 @@ void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_
         auto column_families = split(req->get_query_param("table"), ",");
         std::vector<sstring> keynames = split(req->get_query_param("keyspace"), ",");
         auto snapshot_name = req->get_query_param("snapshot");
-        auto move_files = req_param<bool>(*req, "move_files", false);
+        auto move_files = get_query_param<bool>(*req, "move_files");
 
         rjson::chunked_content content = co_await util::read_entire_stream(*req->content_stream);
         rjson::value parsed = rjson::parse(std::move(content));

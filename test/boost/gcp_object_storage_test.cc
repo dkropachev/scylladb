@@ -10,6 +10,8 @@
 #include "utils/gcp/gcp_credentials.hh"
 
 #include <ranges>
+#include <map>
+#include <sstream>
 #include <unordered_set>
 #include <filesystem>
 #include <boost/test/unit_test.hpp>
@@ -22,6 +24,11 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/with_timeout.hh>
+#include <seastar/http/client.hh>
+#include <seastar/http/reply.hh>
+#include <seastar/http/request.hh>
+#include <seastar/util/short_streams.hh>
+#include <seastar/util/log.hh>
 
 #include "ent/encryption/symmetric_key.hh"
 #include "ent/encryption/encrypted_file_impl.hh"
@@ -31,12 +38,17 @@
 #include "test/lib/test_utils.hh"
 #include "test/lib/tmpdir.hh"
 #include "test/lib/gcs_fixture.hh"
+#include "db/object_storage_endpoint_param.hh"
+#include "sstables/object_storage_client.hh"
 #include "test/lib/test_utils.hh"
 #include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/io-wrappers.hh"
+#include "utils/http.hh"
 #include "utils/error_injection.hh"
+#include "utils/rjson.hh"
 
+#include <seastar/core/metrics_api.hh>
 #include <seastar/testing/test_fixture.hh>
 
 using namespace std::string_view_literals;
@@ -153,6 +165,70 @@ static std::string make_name() {
     return fmt::format("{}{}", prefix, utils::UUID_gen::get_time_UUID());
 }
 
+using fault_counts = std::map<sstring, unsigned>;
+
+// Talk to the control path of the validator sitting in front of the mock, and return
+// the faults still armed afterwards. Only reachable when the validator is running -
+// see local_gcs_wrapper::validating_uploads().
+// See test/pylib/gcs_upload_validator.py for the fault names.
+static future<fault_counts> control(const local_gcs_wrapper& env, std::vector<std::pair<sstring, sstring>> params) {
+    auto url = utils::http::parse_simple_url(env.endpoint);
+    auto cln = seastar::http::client(socket_address(net::inet_address(url.host), url.port));
+
+    fault_counts left;
+    std::exception_ptr ex;
+    try {
+        auto req = seastar::http::request::make("PUT", url.host, "/__inject");
+        req._headers["Content-Length"] = "0";
+        for (auto& [name, value] : params) {
+            req.set_query_param(name, value);
+        }
+        co_await cln.make_request(std::move(req), [&left](const seastar::http::reply&, seastar::input_stream<char>&& in) -> future<> {
+            auto body = std::move(in);
+            auto text = co_await util::read_entire_stream_contiguous(body);
+            auto counts = rjson::parse(std::string_view(text));
+            for (auto it = counts.MemberBegin(); it != counts.MemberEnd(); ++it) {
+                left.emplace(sstring(rjson::to_string_view(it->name)), it->value.GetUint());
+            }
+        }, seastar::http::reply::status_type::ok);
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await cln.close();
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+    co_return left;
+}
+
+static future<> inject(const local_gcs_wrapper& env, std::string_view fault, unsigned count) {
+    co_await control(env, {{sstring(fault), std::to_string(count)}});
+}
+
+// What is still armed. A fault the test expected to fire must be back to zero: an
+// injection that never took effect otherwise leaves the test green over an upload it
+// did not fault at all.
+static future<fault_counts> faults_left(const local_gcs_wrapper& env) {
+    return control(env, {});
+}
+
+// Faults are process-global in the validator and it serves the whole suite, so a test
+// that arms more than it consumes has to take the rest back down.
+static future<> disarm_faults(const local_gcs_wrapper& env) {
+    co_await control(env, {{"reset", "1"}});
+}
+
+// The faults are armed over the validator's control path, so there is nothing to
+// exercise when uploads are not going through it: GCP_STORAGE_SKIP_UPLOAD_VALIDATOR
+// is set, or the test is pointed at a real GCS endpoint.
+static bool needs_upload_validator(const local_gcs_wrapper& env) {
+    if (env.validating_uploads()) {
+        return true;
+    }
+    BOOST_TEST_MESSAGE("Skipping: uploads are not going through the validator");
+    return false;
+}
+
 static future<> test_read_write_helper(const local_gcs_wrapper& env, size_t dest_size, std::optional<size_t> specific_buffer_size = std::nullopt) {
     auto& c = env.client();
     auto name = make_name();
@@ -162,6 +238,26 @@ static future<> test_read_write_helper(const local_gcs_wrapper& env, size_t dest
     env.objects_to_delete.emplace_back(name);
     co_await create_object_of_size(c, env.bucket, name, dest_size, &written, specific_buffer_size);
     co_await compare_object_data(env, name, std::move(written));
+}
+
+// Sums an object_storage metric across the metrics registered for the GCS backend.
+static uint64_t gs_metric(std::string_view name) {
+    auto all_metrics = seastar::metrics::impl::get_values();
+    const auto& all_metadata = *all_metrics->metadata;
+    auto family_name = seastar::sstring(fmt::format("object_storage_{}", name));
+    auto family = std::ranges::find_if(all_metadata, [&](const auto& x) { return x.mf.name == family_name; });
+    BOOST_REQUIRE(family != all_metadata.end());
+    const auto& values = all_metrics->values[std::distance(all_metadata.begin(), family)];
+    uint64_t total = 0;
+    for (size_t i = 0; i < family->metrics.size(); ++i) {
+        const auto& labels = family->metrics[i].labels();
+        auto type = labels.find("type");
+        BOOST_REQUIRE(type != labels.end());
+        if (type->second.value() == "gs") {
+            total += values[i].ui();
+        }
+    }
+    return total;
 }
 
 BOOST_AUTO_TEST_SUITE(gcs_tests, *seastar::testing::async_fixture<gcs_fixture>())
@@ -198,6 +294,196 @@ SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_create_small_object_64kbuf, local_gcs
 
 SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_create_large_object_64kbuf, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
     co_await test_read_write_helper(*this, 32*1024*1024 + 357 + 1022*67, 64*1024);
+}
+
+// A 308 with no Range header does not describe the chunk, so the client asks the session
+// where it stands; here it holds nothing, and the chunk goes again. Treating the reply as
+// an acknowledgement instead skips those bytes and the object ends up short of what was
+// written.
+//
+// https://scylladb.atlassian.net/browse/SCYLLADB-4027
+SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_resend_unacknowledged_chunk, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
+    // Big enough that the flush in create_object_of_size() writes a whole 256k chunk
+    // and leaves a tail for the final one - only a non-final chunk can be answered
+    // with a 308.
+    constexpr size_t dest_size = 300*1024;
+
+    if (!needs_upload_validator(*this)) {
+        co_return;
+    }
+
+    co_await inject(*this, "unacknowledged_chunks", 1);
+
+    auto name = make_name();
+    objects_to_delete.emplace_back(name);
+
+    std::vector<temporary_buffer<char>> written;
+    co_await create_object_of_size(client(), bucket, name, dest_size, &written);
+    co_await compare_object_data(*this, name, std::move(written));
+
+    // without this the upload simply succeeds and the comparison passes, so the test
+    // would report nothing whether the 308 was ever answered or not
+    auto left = co_await faults_left(*this);
+    BOOST_REQUIRE_EQUAL(left["unacknowledged_chunks"], 0u);
+}
+
+// Cancelling a failed upload is best effort, and its reply - 499 when it works, an
+// error when it does not - must never take the place of the reason the upload failed.
+//
+// https://scylladb.atlassian.net/browse/SCYLLADB-4027
+SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_failed_upload_error_survives_cancel, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
+    if (!needs_upload_validator(*this)) {
+        co_return;
+    }
+
+    auto name = make_name();
+    objects_to_delete.emplace_back(name);
+
+    co_await inject(*this, "failed_chunks", 1);
+    // more cancel failures than the sink can issue, so none of them is the last word
+    co_await inject(*this, "failed_cancels", 8);
+
+    std::string what;
+    try {
+        co_await create_object_of_size(client(), bucket, name, 300*1024);
+        BOOST_FAIL("upload of a rejected chunk should have thrown");
+    } catch (const storage_io_error& e) {
+        what = e.what();
+    }
+
+    auto left = co_await faults_left(*this);
+    co_await disarm_faults(*this);
+
+    BOOST_TEST_MESSAGE(fmt::format("upload failed with: {}", what));
+    // the chunk's own 400, not 403 from the cancel and not 499 from a cancel that worked
+    BOOST_REQUIRE(what.contains("400"));
+    BOOST_REQUIRE(!what.contains("403"));
+    BOOST_REQUIRE(!what.contains("499"));
+    BOOST_REQUIRE_EQUAL(left["failed_chunks"], 0u);
+}
+
+// The other half of the same rule: 499 is how GCS reports a cancel that worked, so the
+// cancel must be treated as done rather than failed. Only the validator can produce it -
+// fake-gcs-server answers the DELETE with a 2xx.
+//
+// The caller cannot see the difference: close() swallows whatever the cancel raises, so
+// the chunk's 400 comes out either way. What does change is the log - a recognized 499
+// reaches "Upload ... removed", an unrecognized one throws and is reported as a cancel
+// that failed - so that is what this asserts. Verified to fail with the 499 handling
+// reverted: the debug line is absent and the warning is present.
+//
+// https://scylladb.atlassian.net/browse/SCYLLADB-4027
+SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_cancelled_upload_is_not_an_error, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
+    if (!needs_upload_validator(*this)) {
+        co_return;
+    }
+
+    auto name = make_name();
+    objects_to_delete.emplace_back(name);
+
+    co_await inject(*this, "failed_chunks", 1);
+    co_await inject(*this, "cancelled_uploads", 1);
+
+    // The line this test reads is a debug one; the level comes from custom_args in
+    // test/boost/test_config.yaml.
+    std::ostringstream captured;
+    seastar::logger::set_ostream(captured);
+    // The logger keeps a raw pointer to the stream, and it is process-wide. Put it
+    // back before `captured` dies, whatever happens in between, or every later test
+    // in this binary logs into a destroyed object.
+    auto restore_ostream = defer([] () noexcept {
+        seastar::logger::set_ostream(std::cerr);
+    });
+
+    std::string what;
+    try {
+        co_await create_object_of_size(client(), bucket, name, 300*1024);
+    } catch (const storage_io_error& e) {
+        what = e.what();
+    }
+
+    auto log = captured.str();
+    auto left = co_await faults_left(*this);
+    co_await disarm_faults(*this);
+
+    BOOST_TEST_MESSAGE(fmt::format("upload failed with: {}", what));
+    BOOST_REQUIRE(!what.empty());
+    // the chunk's own 400 still reaches the caller, not the 499 from the cancel
+    BOOST_REQUIRE(what.contains("400"));
+    BOOST_REQUIRE(!what.contains("499"));
+    // the cancel was accepted...
+    BOOST_REQUIRE(log.contains(fmt::format("Upload of {}:{} removed", bucket, name)));
+    // ...and never reported as one that failed
+    BOOST_REQUIRE(!log.contains("Could not cancel upload"));
+    BOOST_REQUIRE_EQUAL(left["failed_chunks"], 0u);
+    BOOST_REQUIRE_EQUAL(left["cancelled_uploads"], 0u);
+}
+
+// A server that keeps reporting no progress must fail the upload rather than spin. The
+// bound covers the whole retry loop, so it also catches the partial-progress path, where
+// a non-final chunk rounded down to a 256k boundary can advance by nothing.
+//
+// https://scylladb.atlassian.net/browse/SCYLLADB-4027
+SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_stalled_upload_gives_up, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
+    if (!needs_upload_validator(*this)) {
+        co_return;
+    }
+
+    auto name = make_name();
+    objects_to_delete.emplace_back(name);
+
+    // more than the loop will attempt, so it is the bound that ends the upload
+    co_await inject(*this, "unacknowledged_chunks", 12);
+
+    std::string what;
+    try {
+        co_await create_object_of_size(client(), bucket, name, 300*1024);
+    } catch (const storage::failed_upload_error& e) {
+        what = e.what();
+    }
+
+    co_await disarm_faults(*this);
+
+    BOOST_TEST_MESSAGE(fmt::format("upload failed with: {}", what));
+    BOOST_REQUIRE(what.contains("made no progress at offset 0"));
+}
+
+// A session reporting fewer bytes than the chunk already sent has lost data the sink no
+// longer holds - maybe_do_upload() released those buffers - so no amount of resending can
+// make the upload contiguous again. Fail at once, naming both numbers.
+//
+// https://scylladb.atlassian.net/browse/SCYLLADB-4027
+SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_upload_fails_when_session_falls_behind, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
+    if (!needs_upload_validator(*this)) {
+        co_return;
+    }
+
+    auto name = make_name();
+    objects_to_delete.emplace_back(name);
+
+    // Uploads are serialized, and a chunk goes out once 8M has accumulated, so a 9M
+    // object sends one at 0 and one at 8M. Drop the second and answer the query that
+    // follows with a session that is behind it.
+    constexpr size_t second_chunk = 8*1024*1024;
+    co_await control(*this, {{"unacknowledged_at", std::to_string(second_chunk)}});
+    co_await control(*this, {{"status_answers", std::to_string(second_chunk / 2)}});
+
+    std::string what;
+    try {
+        co_await create_object_of_size(client(), bucket, name, 9*1024*1024, nullptr, 256*1024);
+    } catch (const storage::failed_upload_error& e) {
+        what = e.what();
+    }
+
+    auto left = co_await faults_left(*this);
+    co_await disarm_faults(*this);
+
+    BOOST_TEST_MESSAGE(fmt::format("upload failed with: {}", what));
+    BOOST_REQUIRE(what.contains(fmt::format("session holds {} bytes", second_chunk / 2)));
+    BOOST_REQUIRE(what.contains(fmt::format("behind the chunk at offset {}", second_chunk)));
+    // both the drop and the scripted answer were used
+    BOOST_REQUIRE_EQUAL(left["unacknowledged_at"], 0u);
+    BOOST_REQUIRE_EQUAL(left["status_answers"], 0u);
 }
 
 SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_list_objects, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
@@ -518,6 +804,77 @@ SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_read_chunked_partial_encrypted, local
 
 SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_read_chunked_partial_encrypted_with_skip, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
     co_await chunked_read_helper(*this, true, true, true);
+}
+
+// The client reports its http metrics only under labels an owner supplies. In
+// production that owner is the sstables object storage client, which also reports
+// the bytes; the fixture's client is created directly, so the test names it.
+SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_metrics, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
+    auto& env = *this;
+    auto& c = env.client();
+    c.register_metrics({.type = "gs", .endpoint = "test", .class_name = "all"});
+
+    auto puts = gs_metric("total_put_requests");
+    auto gets = gs_metric("total_get_requests");
+    auto bytes_before = c.bytes();
+
+    constexpr size_t object_size = 1024 * 1024;
+    co_await test_read_write_helper(env, object_size);
+
+    BOOST_REQUIRE_GT(gs_metric("total_put_requests"), puts);
+    BOOST_REQUIRE_GT(gs_metric("total_get_requests"), gets);
+    auto bytes_after = c.bytes();
+    BOOST_REQUIRE_GE(bytes_after.written - bytes_before.written, object_size);
+    BOOST_REQUIRE_GE(bytes_after.read - bytes_before.read, object_size);
+}
+
+// A config update replaces the GCS client, and its counters start at zero, so
+// the wrapper carries what the replaced client moved. The replaced client is
+// closed in the background, and until that close completes the reported total
+// must not fall below what it already reported.
+SEASTAR_FIXTURE_TEST_CASE(test_gcp_storage_metrics_across_config_update, local_gcs_wrapper, *check_gcp_storage_test_enabled()) {
+    auto& env = *this;
+    auto ep = db::object_storage_endpoint_param(db::object_storage_endpoint_param::gs_storage{
+        .endpoint = env.endpoint,
+        .credentials_file = "none",
+    });
+
+    seastar::semaphore memory{16 * 1024 * 1024};
+    auto client = sstables::make_object_storage_client(ep, memory, [](std::string) {
+        return seastar::shared_ptr<sstables::object_storage_client>{};
+    });
+
+    auto name = make_name();
+    env.objects_to_delete.emplace_back(name);
+    constexpr size_t object_size = 1024 * 1024;
+    auto out = seastar::output_stream<char>(client->make_upload_sink(sstables::object_name(env.bucket, name), {}));
+    co_await out.write(seastar::temporary_buffer<char>(object_size).share());
+    co_await out.flush();
+    co_await out.close();
+
+    auto written = gs_metric("total_write_bytes");
+    BOOST_REQUIRE_GE(written, object_size);
+
+    // Hold a request in flight: the client's gate, which its close() waits on,
+    // cannot be closed while it runs, so the replaced client stays alive and
+    // the window this test is about stays open.
+    utils::get_local_injector().enable("gcp_storage_stall_requests", true);
+    auto stop_stalling = defer([]() noexcept {
+        utils::get_local_injector().disable("gcp_storage_stall_requests");
+    });
+    auto stalled = client->object_exists(sstables::object_name(env.bucket, name));
+    BOOST_REQUIRE(!stalled.available());
+
+    client->update_config_sync(ep);
+
+    // Sampled before the replaced client has drained, which is what makes this
+    // observable: nothing has yielded since update_config_sync() returned.
+    BOOST_REQUIRE_GE(gs_metric("total_write_bytes"), written);
+
+    BOOST_REQUIRE(co_await std::move(stalled));
+    BOOST_REQUIRE_GE(gs_metric("total_write_bytes"), written);
+
+    co_await client->close();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

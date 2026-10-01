@@ -26,6 +26,8 @@
 #include "test/lib/simple_schema.hh"
 #include "test/lib/key_utils.hh"
 #include "test/lib/test_utils.hh"
+#include "test/lib/eventually.hh"
+#include "test/lib/error_injection.hh"
 #include "test/lib/topology_builder.hh"
 #include "db/config.hh"
 #include "cql3/util.hh"
@@ -38,6 +40,7 @@
 #include "compaction/compaction_manager.hh"
 #include "replica/tablet_mutation_builder.hh"
 #include "locator/tablets.hh"
+#include "cql3/query_options.hh"
 #include "service/tablet_allocator.hh"
 #include "locator/tablet_replication_strategy.hh"
 #include "locator/tablet_sharder.hh"
@@ -49,6 +52,8 @@
 #include "service/topology_coordinator.hh"
 #include "service/topology_state_machine.hh"
 #include "service/migration_manager.hh"
+#include "service/strong_consistency/coordinator.hh"
+#include "service/strong_consistency/groups_manager.hh"
 
 #include <boost/regex.hpp>
 #include <atomic>
@@ -1653,7 +1658,7 @@ SEASTAR_TEST_CASE(test_sharder) {
 
         auto table1 = table_id(utils::UUID_gen::get_time_UUID());
 
-        token_metadata tokm(e.get_shared_token_metadata().local(), token_metadata::config{ .topo_cfg{ .this_host_id = h1, .local_dc_rack = locator::endpoint_dc_rack::default_location } });
+        token_metadata tokm(e.shared_token_metadata().local(), token_metadata::config{ .topo_cfg{ .this_host_id = h1, .local_dc_rack = locator::endpoint_dc_rack::default_location } });
         tokm.get_topology().add_or_update_endpoint(h1);
 
         std::vector<tablet_id> tablet_ids;
@@ -2015,8 +2020,7 @@ future<> apply_resize_plan(token_metadata& tm, const migration_plan& plan) {
 static
 future<group0_guard> save_token_metadata(cql_test_env& e, group0_guard guard,
         locator::tablet_metadata_change_hint hint = {}) {
-    auto& stm = e.local_db().get_shared_token_metadata();
-    auto tm = stm.get();
+    auto tm = e.local_token_metadata_ptr();
 
     e.get_topology_state_machine().local()._topology.version = tm->get_version();
 
@@ -2267,7 +2271,7 @@ void rebalance_tablets(cql_test_env& e,
     shared_load_stats local_stats;
     if (!load_stats) {
         // Provide default capacity for each node.
-        e.shared_token_metadata().local().get()->get_topology().for_each_node([&] (const auto& node) {
+        e.local_token_metadata_ptr()->get_topology().for_each_node([&] (const auto& node) {
             local_stats.set_capacity(node.host_id(), default_target_tablet_size * node.get_shard_count());
         });
         load_stats = &local_stats;
@@ -2279,8 +2283,7 @@ void rebalance_tablets(cql_test_env& e,
     // We should not introduce inconsistency between on-disk state and in-memory state
     // as that may violate invariants and cause failures in later operations
     // causing test flakiness.
-    auto& stm = e.shared_token_metadata().local();
-    save_tablet_metadata(e.local_db(), stm.get()->tablets(), guard.write_timestamp()).get();
+    save_tablet_metadata(e.local_db(), e.local_token_metadata_ptr()->tablets(), guard.write_timestamp()).get();
     e.get_storage_service().local().update_tablet_metadata({}).get();
 
     testlog.debug("rebalance_tablets(): done");
@@ -2289,7 +2292,7 @@ void rebalance_tablets(cql_test_env& e,
 static
 void rebalance_tablets_as_in_progress(cql_test_env& env, shared_load_stats& stats,
                                       std::function<bool(const migration_plan&)> stop = nullptr) {
-    auto& stm = env.local_db().get_shared_token_metadata();
+    auto& stm = env.shared_token_metadata().local();
     auto& talloc = env.get_tablet_allocator().local();
     auto& topology = env.get_topology_state_machine().local()._topology;
     auto& sys_ks = env.get_system_keyspace().local();
@@ -3119,8 +3122,7 @@ alter_result alter_replication(cql_test_env& e,
                                table_id table,
                                replication_strategy_config_options alter_options)
 {
-    auto& stm = e.shared_token_metadata().local();
-    auto tmptr = stm.get();
+    auto tmptr = e.local_token_metadata_ptr();
     auto& old_tablets = tmptr->tablets().get_tablet_map(table);
     auto& ks = e.local_db().find_keyspace(ks_name);
     auto& rs = ks.get_replication_strategy();
@@ -3128,7 +3130,7 @@ alter_result alter_replication(cql_test_env& e,
     alter_options["class"] = sstring("NetworkTopologyStrategy");
     cql3::statements::ks_prop_defs new_ks_props;
     new_ks_props.add_property("replication", alter_options);
-    new_ks_props.validate();
+    new_ks_props.validate(e.local_db().features());
     BOOST_REQUIRE(new_ks_props.get_replication_strategy_class().has_value());
     auto ks_md = new_ks_props.as_ks_metadata_update(ks.metadata(), *tmptr, e.local_db().features(), e.local_db().get_config());
     auto new_options = ks_md->strategy_options();
@@ -3182,8 +3184,7 @@ SEASTAR_THREAD_TEST_CASE(test_replica_allocation_with_rack_list_rf) {
 
             rebalance_tablets(e);
 
-            auto& stm = e.shared_token_metadata().local();
-            auto tmptr = stm.get();
+            auto tmptr = e.local_token_metadata_ptr();
             auto& tm_topo = tmptr->get_topology();
 
             check_rack_list(tm_topo, tmptr->tablets().get_tablet_map(table1), dc1, dc1_racks, bad_nodes);
@@ -3203,8 +3204,7 @@ SEASTAR_THREAD_TEST_CASE(test_replica_allocation_with_rack_list_rf) {
 
             rebalance_tablets(e);
 
-            auto& stm = e.shared_token_metadata().local();
-            auto tmptr = stm.get();
+            auto tmptr = e.local_token_metadata_ptr();
             auto& tm_topo = tmptr->get_topology();
 
             check_rack_list(tm_topo, tmptr->tablets().get_tablet_map(table1), dc1, rack_list{}, bad_nodes);
@@ -3225,8 +3225,7 @@ SEASTAR_THREAD_TEST_CASE(test_replica_allocation_with_rack_list_rf) {
 
             rebalance_tablets(e);
 
-            auto& stm = e.shared_token_metadata().local();
-            auto tmptr = stm.get();
+            auto tmptr = e.local_token_metadata_ptr();
             auto& tm_topo = tmptr->get_topology();
 
             check_rack_list(tm_topo, tmptr->tablets().get_tablet_map(table1), dc1, rack_list{rack1.rack}, bad_nodes);
@@ -3302,8 +3301,7 @@ SEASTAR_THREAD_TEST_CASE(test_per_shard_count_respected_with_rack_list) {
 
         rebalance_tablets(e);
 
-        auto& stm = e.shared_token_metadata().local();
-        auto tmptr = stm.get();
+        auto tmptr = e.local_token_metadata_ptr();
         auto& tm_topo = tmptr->get_topology();
 
         // Check that we respect the 10 tablets/shard goal when using a subset of racks.
@@ -3460,8 +3458,7 @@ SEASTAR_THREAD_TEST_CASE(test_per_shard_goal_size_scaling_is_not_order_dependent
 
             rebalance_tablets(e, &load_stats);
 
-            auto& stm = e.shared_token_metadata().local();
-            large_tablet_count = stm.get()->tablets().get_tablet_map(large_table).tablet_count();
+            large_tablet_count = e.local_token_metadata_ptr()->tablets().get_tablet_map(large_table).tablet_count();
         }, std::move(cfg)).get();
 
         return large_tablet_count;
@@ -3596,7 +3593,7 @@ SEASTAR_THREAD_TEST_CASE(test_load_sketch_uses_correct_disk_capacity) {
 
         auto& stm = e.shared_token_metadata().local();
 
-        locator::host_id local_host = e.shared_token_metadata().local().get()->get_my_id();
+        locator::host_id local_host = e.local_token_metadata_ptr()->get_my_id();
         locator::host_id host1 = topo.add_node(node_state::normal, 1);
 
         load_stats stats;
@@ -3960,8 +3957,7 @@ SEASTAR_THREAD_TEST_CASE(test_table_creation_during_decommission) {
         auto table1 = add_table(e, ks_name).get();
         auto s = e.local_db().find_schema(table1);
 
-        auto& stm = e.shared_token_metadata().local();
-        auto& tmap = stm.get()->tablets().get_tablet_map(table1);
+        auto& tmap = e.local_token_metadata_ptr()->tablets().get_tablet_map(table1);
 
         // Verify we do not treat leaving nodes as having capacity.
         BOOST_REQUIRE_EQUAL(tmap.tablet_count(), 2);
@@ -3993,8 +3989,7 @@ SEASTAR_THREAD_TEST_CASE(test_table_creation_during_rack_decommission) {
 
         rebalance_tablets(e);
 
-        auto& stm = e.shared_token_metadata().local();
-        auto& tmap = stm.get()->tablets().get_tablet_map(table1);
+        auto& tmap = e.local_token_metadata_ptr()->tablets().get_tablet_map(table1);
 
         tmap.for_each_tablet([&](auto tid, auto& tinfo) {
             for (auto& replica : tinfo.replicas) {
@@ -4141,8 +4136,7 @@ SEASTAR_THREAD_TEST_CASE(test_decommission_rack_load_failure) {
             co_return;
         });
 
-        auto& stm = e.shared_token_metadata().local();
-        topo.get_shared_load_stats().set_default_tablet_sizes(stm.get());
+        topo.get_shared_load_stats().set_default_tablet_sizes(e.local_token_metadata_ptr());
 
         BOOST_REQUIRE_THROW(rebalance_tablets(e, &topo.get_shared_load_stats()), std::runtime_error);
     }).get();
@@ -4174,8 +4168,7 @@ SEASTAR_THREAD_TEST_CASE(test_decommission_rf_not_met) {
             co_return;
         });
 
-        auto& stm = e.shared_token_metadata().local();
-        topo.get_shared_load_stats().set_default_tablet_sizes(stm.get());
+        topo.get_shared_load_stats().set_default_tablet_sizes(e.local_token_metadata_ptr());
 
         BOOST_REQUIRE_THROW(rebalance_tablets(e, &topo.get_shared_load_stats()), std::runtime_error);
     }).get();
@@ -4577,8 +4570,7 @@ SEASTAR_THREAD_TEST_CASE(test_plan_fails_when_removing_last_replica) {
         });
 
         std::unordered_set<host_id> skiplist = {host1};
-        auto& stm = e.shared_token_metadata().local();
-        topo.get_shared_load_stats().set_default_tablet_sizes(stm.get());
+        topo.get_shared_load_stats().set_default_tablet_sizes(e.local_token_metadata_ptr());
         BOOST_REQUIRE_THROW(rebalance_tablets(e, &topo.get_shared_load_stats(), skiplist), std::runtime_error);
     }).get();
 }
@@ -4975,8 +4967,7 @@ static table_id create_table_and_set_tablet_sizes(cql_test_env& e, topology_buil
     auto& load_stats = topo.get_shared_load_stats();
     load_stats.set_size(table, table_size_bytes);
 
-    auto& stm = e.shared_token_metadata().local();
-    auto& tmap = stm.get()->tablets().get_tablet_map(table);
+    auto& tmap = e.local_token_metadata_ptr()->tablets().get_tablet_map(table);
     tmap.for_each_tablet([&] (tablet_id tid, const tablet_info& tinfo) {
         auto replicas = tinfo.replicas;
         for (auto& r : tinfo.replicas) {
@@ -5023,7 +5014,7 @@ SEASTAR_THREAD_TEST_CASE(test_size_based_load_balancing_table_load) {
         std::vector<host_id> hosts;
 
         // Add disk capacity for the default node. Add all subsequent nodes to the same DC/rack
-        e.shared_token_metadata().local().get()->get_topology().for_each_node([&] (const auto& node) {
+        e.local_token_metadata_ptr()->get_topology().for_each_node([&] (const auto& node) {
             dc_rack = node.dc_rack();
             auto host = node.host_id();
             auto num_shards = node.get_shard_count();
@@ -5183,8 +5174,7 @@ SEASTAR_THREAD_TEST_CASE(test_per_shard_goal_mixed_dc_rf) {
         rebalance_tablets(e);
 
         {
-            auto& stm = e.shared_token_metadata().local();
-            auto tm = stm.get();
+            auto tm = e.local_token_metadata_ptr();
             // When pow2_count is switched to false, 256 should be changed to 200.
             BOOST_REQUIRE_EQUAL(tm->tablets().get_tablet_map(table1).tablet_count(), 256);
             BOOST_REQUIRE_EQUAL(tm->tablets().get_tablet_map(table2).tablet_count(), 64);
@@ -5928,7 +5918,7 @@ SEASTAR_THREAD_TEST_CASE(test_split_ready_groups_own_their_post_split_range) {
 
         e.db().invoke_on_all([] (replica::database& db) {
             auto& table = db.find_column_family("ks", "cf");
-            return table.split_all_storage_groups(tasks::task_info{});
+            return table.split_all_storage_groups(tasks::make_empty_task_info());
         }).get();
 
         e.db().invoke_on_all([] (replica::database& db) {
@@ -5983,7 +5973,7 @@ SEASTAR_THREAD_TEST_CASE(basic_tablet_storage_splitting_test) {
         e.db().invoke_on_all([] (replica::database& db) {
             auto& table = db.find_column_family("ks", "cf");
             testlog.info("sstable count: {}", table.sstables_count());
-            return table.split_all_storage_groups(tasks::task_info{});
+            return table.split_all_storage_groups(tasks::make_empty_task_info());
         }).get();
 
         testlog.info("Verifying sstables are split...");
@@ -6911,8 +6901,7 @@ SEASTAR_THREAD_TEST_CASE(test_ensure_node_for_load_sketch) {
         topo.set_node_state(host1, node_state::removing);
 
         auto& talloc = e.get_tablet_allocator().local();
-        auto& stm = e.shared_token_metadata().local();
-        talloc.balance_tablets(stm.get(), nullptr, nullptr, topo.get_shared_load_stats().get()).get();
+        talloc.balance_tablets(e.local_token_metadata_ptr(), nullptr, nullptr, topo.get_shared_load_stats().get()).get();
     }).get();
 }
 
@@ -7283,6 +7272,253 @@ SEASTAR_TEST_CASE(test_tablet_cleanup_stats_non_negative) {
             BOOST_REQUIRE_GE(stats.live_sstable_count, 0);
         }).get();
     }, cfg);
+}
+
+// The shard holding one tablet of ks.cf.
+static shard_id shard_of(cql_test_env& e, locator::tablet_id tid) {
+    auto s = e.local_db().find_schema("ks", "cf");
+    return e.local_db().get_token_metadata().tablets().get_tablet_map(s->id()).get_tablet_info(tid).replicas.front().shard;
+}
+
+// Truncates one tablet of ks.cf on the shard holding it.
+static future<> truncate_tablet_locally(cql_test_env& e, locator::tablet_id tid) {
+    return e.db().invoke_on(shard_of(e, tid), [tid] (replica::database& db) {
+        return db.find_column_family("ks", "cf").truncate_tablet_locally(db, tid);
+    });
+}
+
+// The tablet of ks.cf holding partition pk.
+static locator::tablet_id tablet_of(cql_test_env& e, int pk) {
+    auto s = e.local_db().find_schema("ks", "cf");
+    auto key = partition_key::from_single_value(*s, int32_type->decompose(pk));
+    return e.local_db().get_token_metadata().tablets().get_tablet_map(s->id()).get_tablet_id(dht::get_token(*s, key));
+}
+
+// Writes v into every step-th row below rows of partition pk of ks.cf.
+static void write_partition(cql_test_env& e, int pk, int rows, int v, int step = 1) {
+    for (int ck = 0; ck < rows; ck += step) {
+        e.execute_cql(format("insert into ks.cf (pk, ck, v) values ({}, {}, {})", pk, ck, v)).get();
+    }
+}
+
+// Reads one partition of ks.cf page by page the way a driver does: the paging state of
+// one page is handed to the next, so between pages the querier sits parked in the
+// querier cache as an inactive read.
+class paged_partition_read {
+    cql_test_env& _e;
+    sstring _query;
+    int32_t _page_size;
+    lw_shared_ptr<const service::pager::paging_state> _state;
+    bool _more = true;
+public:
+    using rows_type = std::vector<std::pair<int32_t, int32_t>>; // (ck, v)
+
+    paged_partition_read(cql_test_env& e, int pk, int32_t page_size)
+        : _e(e), _query(format("select ck, v from ks.cf where pk = {}", pk)), _page_size(page_size) {}
+
+    bool more() const { return _more; }
+
+    rows_type next_page() {
+        auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
+                cql3::query_options::specific_options{_page_size, _state, {}, api::new_timestamp()});
+        auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(_e.execute_cql(_query, std::move(qo)).get());
+        BOOST_REQUIRE(rows);
+        rows_type page;
+        for (auto& row : rows->rs().result_set().rows()) {
+            page.emplace_back(value_cast<int32_t>(int32_type->deserialize(*row[0])),
+                              value_cast<int32_t>(int32_type->deserialize(*row[1])));
+        }
+        _state = rows->rs().get_metadata().paging_state();
+        _more = rows->rs().get_metadata().flags().contains(cql3::metadata::flag::HAS_MORE_PAGES);
+        return page;
+    }
+
+    rows_type rest() {
+        rows_type all;
+        while (_more) {
+            auto page = next_page();
+            all.insert(all.end(), page.begin(), page.end());
+        }
+        return all;
+    }
+};
+
+// truncate_tablet_locally() has to drop the memtables, the sstables and the cached rows
+// of one tablet, leave the other tablets alone and keep the truncated tablet writable.
+SEASTAR_TEST_CASE(test_truncate_tablet_locally) {
+    auto cfg = tablet_cql_test_config();
+    cfg.initial_tablets = 2;
+
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("create table ks.cf (pk int, ck int, v text, primary key (pk, ck))").get();
+        auto s = e.local_db().find_schema("ks", "cf");
+        const auto tid = locator::tablet_id(0);
+        const auto& tmap = e.local_db().get_token_metadata().tablets().get_tablet_map(s->id());
+        const auto owner = tmap.get_tablet_info(tid).replicas.front().shard;
+        const auto range = tmap.get_token_range(tid);
+
+        auto in_tablet = [&] (int pk) {
+            auto key = partition_key::from_single_value(*s, int32_type->decompose(pk));
+            return range.contains(dht::get_token(*s, key), dht::token_comparator());
+        };
+        auto row_count = [&] {
+            auto res = e.execute_cql("select * from ks.cf").get();
+            auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
+            BOOST_REQUIRE(rows);
+            return rows->rs().result_set().size();
+        };
+        auto insert_all = [&] (const char* v) {
+            for (int i = 0; i < 100; i++) {
+                // Half of the rows land in sstables, the other half stays in the memtables.
+                if (i == 50) {
+                    replica::database::flush_table_on_all_shards(e.db(), "ks", "cf").get();
+                }
+                e.execute_cql(format("insert into ks.cf (pk, ck, v) values ({}, {}, '{}')", i, i, v)).get();
+            }
+        };
+        auto tablet_count = [&] {
+            return e.db().invoke_on(owner, [] (replica::database& db) {
+                return db.find_column_family("ks", "cf").get_stats().tablet_count;
+            }).get();
+        };
+        auto truncate = [&] {
+            truncate_tablet_locally(e, tid).get();
+        };
+        auto check_no_sstables_in_tablet = [&] {
+            e.db().invoke_on(owner, [&] (replica::database& db) {
+                auto& cf = db.find_column_family("ks", "cf");
+                BOOST_REQUIRE(!cf.tablet_has_compacted_undeleted_sstables(tid));
+                auto ssts = cf.get_sstables();
+                for (auto& sst : *ssts) {
+                    BOOST_REQUIRE(!range.contains(sst->get_first_decorated_key().token(), dht::token_comparator()));
+                }
+            }).get();
+        };
+
+        const auto tablets_on_owner = tablet_count();
+        insert_all("before");
+        size_t other_rows = 0;
+        for (int i = 0; i < 100; i++) {
+            other_rows += !in_tablet(i);
+        }
+        BOOST_REQUIRE(other_rows > 0 && other_rows < 100);
+        // Populates the row cache, so a stale entry would show up as a resurrected row below.
+        BOOST_REQUIRE_EQUAL(row_count(), 100);
+
+        truncate();
+        BOOST_REQUIRE_EQUAL(row_count(), other_rows);
+        BOOST_REQUIRE_EQUAL(tablet_count(), tablets_on_owner);
+        check_no_sstables_in_tablet();
+
+        // The storage group is still there and writable, and its fresh memtables flush fine.
+        insert_all("after");
+        BOOST_REQUIRE_EQUAL(row_count(), 100);
+        replica::database::flush_table_on_all_shards(e.db(), "ks", "cf").get();
+        BOOST_REQUIRE_EQUAL(row_count(), 100);
+
+        // Once with sstables only, then once more with nothing left to drop.
+        truncate();
+        truncate();
+        BOOST_REQUIRE_EQUAL(row_count(), other_rows);
+        BOOST_REQUIRE_EQUAL(tablet_count(), tablets_on_owner);
+        check_no_sstables_in_tablet();
+    }, cfg);
+}
+
+// A paged read parked between two pages must not go on reading the truncated data:
+// clear_inactive_reads_for_tablet() evicts it, so the next page starts a fresh reader
+// and finds the tablet empty.
+SEASTAR_TEST_CASE(test_truncate_tablet_locally_evicts_parked_paged_read) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("create table ks.cf (pk int, ck int, v int, primary key (pk, ck))").get();
+        write_partition(e, 0, 100, 1);
+
+        paged_partition_read read(e, 0, 10);
+        BOOST_REQUIRE_EQUAL(read.next_page().size(), 10);
+        BOOST_REQUIRE(read.more());
+        truncate_tablet_locally(e, tablet_of(e, 0)).get();
+        BOOST_REQUIRE(read.rest().empty());
+    }, tablet_cql_test_config());
+}
+
+// The truncate is paused at an injection point while a paged read fetches its first page
+// and parks its querier. Every row is in the sstable as v=1 and every even row again in the
+// memtables as v=2, so a read returning anything has to return the whole partition: an even
+// row with v=1 is the memtables' version lost from under the read, a missing odd row is a
+// partition torn between the swapped sstables and the live memtables.
+SEASTAR_TEST_CASE(test_truncate_tablet_locally_under_parked_paged_read) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+        fmt::print("Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n");
+        return;
+#endif
+        e.execute_cql("create table ks.cf (pk int, ck int, v int, primary key (pk, ck))").get();
+        const auto tid = tablet_of(e, 0);
+        const auto owner = shard_of(e, tid);
+        constexpr int rows = 100;
+        constexpr int page_size = 7;
+
+        auto check = [&] (const paged_partition_read::rows_type& got, size_t expected_rows) {
+            BOOST_REQUIRE_EQUAL(got.size(), expected_rows);
+            for (int i = 0; i < int(got.size()); i++) {
+                BOOST_REQUIRE_EQUAL(got[i].first, i);
+                BOOST_REQUIRE_EQUAL(got[i].second, i % 2 ? 1 : 2);
+            }
+        };
+
+        struct {
+            const char* pause;
+            size_t expected_rows;
+        } cases[] = {
+            // The first page completes on the pre-truncate sources and parks its querier. The
+            // truncate evicts it once the memtables are retired, so the next page starts a new
+            // querier and reads the emptied tablet.
+            {"truncate_tablet_locally_before_swap", page_size},
+            // The sstables are gone and the memtables still hold the even rows. A reader created
+            // now would return a torn partition, so wait_for_tablet_truncate() parks the read
+            // until the memtables are retired too, and it finds the tablet empty.
+            {"truncate_tablet_locally_before_retiring_memtables", 0},
+        };
+        for (const auto& [pause, expected_rows] : cases) {
+            testlog.info("pausing the truncate at {}", pause);
+            write_partition(e, 0, rows, 1);
+            replica::database::flush_table_on_all_shards(e.db(), "ks", "cf").get();
+            write_partition(e, 0, rows, 2, 2);
+            // Puts the sstable version of the partition into the cache.
+            check(paged_partition_read(e, 0, rows).rest(), rows);
+
+            smp::submit_to(owner, [pause] { utils::get_local_injector().enable(pause); }).get();
+            auto truncate = truncate_tablet_locally(e, tid);
+            BOOST_REQUIRE(eventually_true([&] {
+                return smp::submit_to(owner, [pause] { return utils::get_local_injector().waiters(pause) > 0; }).get();
+            }));
+
+            paged_partition_read read(e, 0, page_size);
+            auto first_page = seastar::async([&] { return read.next_page(); });
+            if (expected_rows == page_size) {
+                // Not gated before the swap: the page completes while the truncate is paused.
+                BOOST_REQUIRE(eventually_true([&] { return first_page.available(); }));
+            } else {
+                // Gated: the read has to be parked before the truncate goes on, or it would
+                // start after the retiring and find the tablet empty without ever waiting.
+                BOOST_REQUIRE(eventually_true([&] {
+                    return e.db().invoke_on(owner, [] (replica::database& db) {
+                        return column_family_test::has_reads_parked_for_tablet_truncate(db.find_column_family("ks", "cf"));
+                    }).get();
+                }));
+            }
+
+            smp::submit_to(owner, [pause] { utils::get_local_injector().receive_message(pause); }).get();
+            truncate.get();
+            smp::submit_to(owner, [pause] { utils::get_local_injector().disable(pause); }).get();
+
+            auto got = first_page.get();
+            auto rest = read.rest();
+            got.insert(got.end(), rest.begin(), rest.end());
+            check(got, expected_rows);
+            BOOST_REQUIRE(paged_partition_read(e, 0, page_size).rest().empty());
+        }
+    }, tablet_cql_test_config());
 }
 
 namespace {
@@ -8354,6 +8590,112 @@ SEASTAR_THREAD_TEST_CASE(test_tablet_version_changes_after_tablet_migration) {
         // However, that's a highly unlikely scenario.
         BOOST_REQUIRE_MESSAGE(tv1 != tv2, "Tablet version was supposed to change after tablet migration");
     }, std::move(cfg)).get();
+}
+
+// A tablet leaving a shard has its raft group deleted. If it returns before
+// the deletion finishes, the group's entry survives, pointing at the server
+// the deletion is about to destroy until the restart publishes a new one.
+// Whoever reaches the server through the entry in that window must notice
+// that it has no usable server, instead of touching the destroyed one.
+// stepdown_leaders() is the caller that walks every entry without waiting
+// for its server to be ready, so it is what probes the window here.
+//
+// Reproduces SCYLLADB-4378.
+SEASTAR_THREAD_TEST_CASE(test_stepdown_leaders_during_raft_group_restart) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    testlog.info("Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev,sanitize).");
+#else
+    cql_test_config cfg = tablet_cql_test_config();
+    cfg.db_config->experimental_features(
+        {db::experimental_features_t::feature::STRONGLY_CONSISTENT_TABLES},
+        db::config::config_source::CommandLine
+    );
+
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        topology_builder topo(e);
+        // Single-node cluster, so the tablet lands on this host. CREATE TABLE
+        // waits for its raft group to start.
+        e.execute_cql("create keyspace sc_ks with replication = {'class': 'NetworkTopologyStrategy',"
+                      " 'replication_factor': 1} and tablets = {'initial': 1} and consistency = 'global'").get();
+        e.execute_cql("create table sc_ks.tbl (pk int primary key, v int)").get();
+        // Same rack as this node, so the tablet can move away and back at RF=1.
+        topo.start_new_dc(e.local_db().get_token_metadata().get_topology().get_location());
+        const auto other_host = topo.add_node();
+
+        const auto table = e.local_db().find_schema("sc_ks", "tbl")->id();
+        const auto tm = e.shared_token_metadata().local().get(); // keeps tmap alive
+        const auto& tmap = tm->tablets().get_tablet_map(table);
+        const auto tablet = tmap.first_tablet();
+        const auto home = tmap.get_tablet_info(tablet).replicas[0];
+        const auto group_id = tmap.get_tablet_raft_info(tablet).group_id;
+
+        const auto move_tablet_to = [&] (tablet_replica replica) {
+            mutate_tablets(e, [&] (tablet_metadata& tmeta) -> future<> {
+                auto tmap = tmeta.get_tablet_map(table).clone();
+                tmap.set_tablet(tablet, tablet_info{tablet_replica_set{{replica}}});
+                tmeta.set_tablet_map(table, std::move(tmap));
+                co_return;
+            });
+            auto aoe = abort_on_expiry(lowres_clock::now() + std::chrono::seconds(60));
+            auto guard = e.get_raft_group0_client().start_operation(aoe.abort_source()).get();
+            save_token_metadata(e, std::move(guard)).get();
+        };
+
+        // A write is served by the group's server, and waits for its leader.
+        const auto write_on_home = [&] {
+            smp::submit_to(home.shard, [&e] {
+                return seastar::async([&e] {
+                    // Strongly consistent writes accept only QUORUM/LOCAL_QUORUM; the
+                    // text-only execute_cql() would send ONE.
+                    e.execute_cql("insert into sc_ks.tbl (pk, v) values (1, 1)",
+                            std::make_unique<cql3::query_options>(db::consistency_level::QUORUM,
+                                    std::vector<cql3::raw_value>{})).get();
+                });
+            }).get();
+        };
+        const auto stepdown_leaders_on_home = [&] {
+            smp::submit_to(home.shard, [&e] {
+                return seastar::async([&e] {
+                    const auto& [coordinator, holder] = e.local_qp().acquire_strongly_consistent_coordinator();
+                    coordinator.get().get_groups_manager().stepdown_leaders().get();
+                });
+            }).get();
+        };
+        const auto entered = [] (const char* injection) {
+            return eventually_true([&] { return utils::get_local_injector().enter_count_on_all(injection).get() > 0; });
+        };
+        // Disabling an injection releases whoever is paused on it, so a failed
+        // assertion releases both pauses when these go out of scope.
+        std::optional<scoped_error_injection> deletion_pause, start_pause;
+
+        write_on_home();
+
+        // Pause the deletion, then bring the tablet back: the restart queues
+        // behind the deletion, so the group keeps its entry.
+        deletion_pause.emplace("sc_raft_group_deletion_pause");
+        move_tablet_to(tablet_replica{other_host, 0});
+        BOOST_REQUIRE(entered("sc_raft_group_deletion_pause"));
+        start_pause.emplace("sc_start_raft_group_pause");
+        move_tablet_to(home);
+
+        // Let the deletion destroy the server and reach the paused restart.
+        deletion_pause.reset();
+        BOOST_REQUIRE(entered("sc_start_raft_group_pause"));
+
+        // Must skip the group rather than touch its destroyed server.
+        stepdown_leaders_on_home();
+
+        // Moving the tablet by rewriting its map leaves the group's commit
+        // index in system.raft_groups, while its log died with the server;
+        // raft::server::start() rejects a commit index ahead of the log.
+        // Drop it so the restart can finish.
+        e.execute_cql(format("delete from system.raft_groups where shard = {} and group_id = {}",
+                home.shard, group_id)).get();
+        start_pause.reset();
+
+        write_on_home();
+    }, std::move(cfg)).get();
+#endif
 }
 
 // Verifies that load_stats::operator+= correctly invalidates

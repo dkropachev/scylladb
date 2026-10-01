@@ -7,6 +7,7 @@
  */
 
 #include "test/lib/cql_test_env.hh"
+#include "test/lib/s3_fixture.hh"
 #include "test/lib/cql_assertions.hh"
 #include "streaming/stream_blob.hh"
 #include "message/messaging_service.hh"
@@ -84,6 +85,7 @@ static cql_test_config make_object_storage_test_config(const data_dictionary::st
     cql_test_config cfg;
     cfg.db_config = make_shared<db::config>();
     cfg.db_config->object_storage_endpoints(sstables::make_storage_options_config(so));
+    cfg.keyspace_storage_options = so;
     return cfg;
 }
 
@@ -95,7 +97,7 @@ static sstring make_storage_clause(const data_dictionary::storage_options& so) {
 }
 
 static future<bool>
-do_test_file_stream(replica::database& db, netw::messaging_service& ms, std::vector<sstring> filelist, const std::string& suffix, bool inject_error, bool unsupported_file_ops = false) {
+do_test_file_stream(replica::database& db, netw::messaging_service& ms, std::vector<sstring> filelist, const sstring& suffix, bool inject_error, bool unsupported_file_ops = false) {
     bool ret = false;
     bool verb_register = false;
     auto ops_id = file_stream_id::create_random_id();
@@ -321,7 +323,7 @@ void do_test_file_stream(bool inject_error) {
     std::vector<sstring> hash_rx;
     size_t nr_files = 10;
     size_t file_size = 0;
-    static const std::string suffix = ".rx";
+    static const sstring suffix = ".rx";
 
     while (files.size() != nr_files) {
         auto name = generate_random_filename();
@@ -631,7 +633,8 @@ SEASTAR_TEST_CASE(test_stream_sink_write_local) {
     return test_stream_sink_write(sstables::test_env_config{});
 }
 
-SEASTAR_TEST_CASE(test_stream_sink_write_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+SEASTAR_TEST_CASE(test_stream_sink_write_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)
+        *seastar::testing::async_fixture<s3_fixture>()) {
     return test_stream_sink_write(sstables::test_env_config{ .storage = make_test_object_storage_options("S3") });
 }
 
@@ -641,12 +644,14 @@ SEASTAR_FIXTURE_TEST_CASE(test_stream_sink_write_gs, gcs_fixture, *tests::check_
 
 // S3 variants: exercise reading SSTables from object storage.  Corruption
 // tests are omitted because the corruption helpers use local-filesystem I/O.
-SEASTAR_THREAD_TEST_CASE(test_sstable_stream_compressed_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+SEASTAR_THREAD_TEST_CASE(test_sstable_stream_compressed_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)
+        *seastar::testing::async_fixture<s3_fixture>()) {
     auto so = make_test_object_storage_options("S3");
     test_sstable_stream(compress_sstable::yes, nullptr, "", make_object_storage_test_config(so), make_storage_clause(so));
 }
 
-SEASTAR_THREAD_TEST_CASE(test_sstable_stream_uncompressed_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+SEASTAR_THREAD_TEST_CASE(test_sstable_stream_uncompressed_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)
+        *seastar::testing::async_fixture<s3_fixture>()) {
     auto so = make_test_object_storage_options("S3");
     test_sstable_stream(compress_sstable::no, nullptr, "", make_object_storage_test_config(so), make_storage_clause(so));
 }
@@ -739,7 +744,8 @@ do_test_clone_path_stream(cql_test_env& env, compress_sstable compress, sstring 
 }
 
 // S3 clone-path test (compressed)
-SEASTAR_THREAD_TEST_CASE(test_clone_path_stream_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+SEASTAR_THREAD_TEST_CASE(test_clone_path_stream_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)
+        *seastar::testing::async_fixture<s3_fixture>()) {
     auto so = make_test_object_storage_options("S3");
     auto cfg = make_object_storage_test_config(so);
     cfg.ms_listen = true;
@@ -750,7 +756,8 @@ SEASTAR_THREAD_TEST_CASE(test_clone_path_stream_s3, *boost::unit_test::precondit
 }
 
 // S3 clone-path test (uncompressed)
-SEASTAR_THREAD_TEST_CASE(test_clone_path_stream_uncompressed_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+SEASTAR_THREAD_TEST_CASE(test_clone_path_stream_uncompressed_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)
+        *seastar::testing::async_fixture<s3_fixture>()) {
     auto so = make_test_object_storage_options("S3");
     auto cfg = make_object_storage_test_config(so);
     cfg.ms_listen = true;

@@ -12,6 +12,7 @@
 #include "storage_service.hh"
 #include "db/view/view_building_worker.hh"
 #include "utils/chunked_vector.hh"
+#include "utils/chain_abort_source.hh"
 #include <seastar/core/shard_id.hh>
 #include "db/view/view_building_coordinator.hh"
 #include "utils/disk_space_monitor.hh"
@@ -158,7 +159,7 @@ namespace {
         try {
             resulting_node_list.emplace_back(n);
         } catch (...) {
-            throw std::runtime_error(::format("Failed to parse node list: {}: invalid node={}: {}", src_node_strings, n, std::current_exception()));
+            throw std::runtime_error(::format("Failed to parse node list: {}: invalid node={}: {:t}", src_node_strings, n, std::current_exception()));
         }
     }
     return resulting_node_list;
@@ -1088,14 +1089,13 @@ future<> storage_service::sstable_vnodes_cleanup_fiber(raft::server& server, gat
                     auto& [ks_name, table_infos] = item;
                     auto& compaction_module = _db.local().get_compaction_manager().get_task_manager_module();
                     // we flush all tables before cleanup the keyspaces individually, so skip the flush-tables step here
-                    auto task = co_await compaction_module.make_and_start_task<compaction::cleanup_keyspace_compaction_task_impl>(
-                        {}, ks_name, _db, table_infos, compaction::flush_mode::skip, tasks::is_user_task::no);
+                    auto task = co_await compaction_module.start_cleanup_keyspace_compaction(_db, ks_name, table_infos, compaction::flush_mode::skip, tasks::is_user_task::no);
                     try {
                         rtlogger.info("vnodes_cleanup {} started", ks_name);
                         co_await task->done();
                         rtlogger.info("vnodes_cleanup {} finished", ks_name);
                     } catch (...) {
-                        rtlogger.error("vnodes_cleanup failed keyspace={} tables={} failed: {}", task->get_status().keyspace, table_infos, std::current_exception());
+                        rtlogger.error("vnodes_cleanup failed keyspace={} tables={} failed: {:t}", task->get_status().keyspace, table_infos, std::current_exception());
                         throw;
                     }
                 });
@@ -1130,7 +1130,7 @@ future<> storage_service::sstable_vnodes_cleanup_fiber(raft::server& server, gat
              rtlogger.info("vnodes_cleanup fiber aborted");
              break;
         } catch (...) {
-             rtlogger.error("vnodes_cleanup fiber got an error: {}", std::current_exception());
+             rtlogger.error("vnodes_cleanup fiber got an error: {:t}", std::current_exception());
              err = true;
         }
         if (err) {
@@ -1155,7 +1155,7 @@ future<> storage_service::raft_state_monitor_fiber(raft::server& raft, gate::hol
                     try {
                         _tablet_allocator.local().on_leadership_lost();
                     } catch (...) {
-                        rtlogger.error("tablet_allocator::on_leadership_lost() failed: {}", std::current_exception());
+                        rtlogger.error("tablet_allocator::on_leadership_lost() failed: {:t}", std::current_exception());
                     }
                 }
             }
@@ -1175,7 +1175,7 @@ future<> storage_service::raft_state_monitor_fiber(raft::server& raft, gate::hol
                     _topology_cmd_rpc_tracker);
         }
     } catch (...) {
-        rtlogger.info("raft_state_monitor_fiber aborted with {}", std::current_exception());
+        rtlogger.info("raft_state_monitor_fiber aborted with {:t}", std::current_exception());
     }
     if (as) {
         as->request_abort(); // abort current coordinator if running
@@ -1299,14 +1299,16 @@ public:
         });
         auto result = co_await ser::join_node_rpc_verbs::send_join_node_request(
                 &_ss._messaging.local(), netw::msg_addr(g0_info.ip_addr), g0_info.id, _req);
+        if (utils::get_local_injector().is_enabled("pre_server_start_drop_expiring")) {
+            co_await utils::get_local_injector().inject("pre_server_start_drop_expiring",
+                    utils::wait_for_message(5min));
+            _ss._gossiper.get_mutable_address_map().force_drop_expiring_entries();
+        }
+
         std::visit(overloaded_functor {
             [this] (const join_node_request_result::ok&) {
                 rtlogger.info("join: request to join placed, waiting"
                              " for the response from the topology coordinator");
-
-                if (utils::get_local_injector().enter("pre_server_start_drop_expiring")) {
-                    _ss._gossiper.get_mutable_address_map().force_drop_expiring_entries();
-                }
 
                 _ss._join_node_request_done.set_value();
             },
@@ -2241,7 +2243,7 @@ future<token_metadata_change> storage_service::prepare_token_metadata_change(mut
                 co_await utils::clear_gently(view_erms);
             });
         } catch (...) {
-            slogger.warn("Failure to reset pending token_metadata in cleanup path: {}. Ignored.", std::current_exception());
+            slogger.warn("Failure to reset pending token_metadata in cleanup path: {:t}. Ignored.", std::current_exception());
         }
 
         std::rethrow_exception(std::move(ex));
@@ -2303,7 +2305,7 @@ void storage_service::commit_token_metadata_change(token_metadata_change& change
     } catch (...) {
         // applying the changes on all shards should never fail
         // it will end up in an inconsistent state that we can't recover from.
-        slogger.error("Failed to apply token_metadata changes: {}. Aborting.", std::current_exception());
+        slogger.error("Failed to apply token_metadata changes: {:t}. Aborting.", std::current_exception());
         abort();
     }
 }
@@ -2368,6 +2370,8 @@ future<> storage_service::stop() {
     co_await _global_topology_requests_module->stop();
     co_await _vnodes_to_tablets_migration_module->stop();
     co_await _async_gate.close();
+    // The quiesce action runs detached from its callers, so it can outlive the gate.
+    co_await _quiesce_topology.join();
     _tablet_split_monitor_event.signal();
     co_await std::move(_tablet_split_monitor);
 }
@@ -2389,7 +2393,7 @@ future<> storage_service::remove_endpoint(inet_address endpoint, gms::permit_id 
     try {
         co_await _sys_ks.local().remove_endpoint(endpoint);
     } catch (...) {
-        slogger.error("fail to remove endpoint={}: {}", endpoint, std::current_exception());
+        slogger.error("fail to remove endpoint={}: {:t}", endpoint, std::current_exception());
     }
 }
 
@@ -3003,6 +3007,21 @@ future<> storage_service::drain() {
 future<> storage_service::do_drain() {
     co_await utils::get_local_injector().inject("storage_service_drain_wait", utils::wait_for_message(60s));
 
+    // Hand the leadership of strongly consistent tablet groups led by this node
+    // over to other replicas. Otherwise the tablets we lead would stay unavailable for writes
+    // until the remaining replicas expired their election timeouts.
+    //
+    // This has to happen before stop_transport() below: the transfer is done with Raft RPCs,
+    // which need messaging_service to be up. That is also why it is not a part of
+    // groups_manager::stop(), which runs only after the transport is gone.
+    try {
+        co_await _groups_manager.container().invoke_on_all(
+                &strong_consistency::groups_manager::stepdown_leaders);
+    } catch (...) {
+        slogger.warn("Failed to transfer Raft leadership of strongly consistent tablets: {}. Ignored.",
+                std::current_exception());
+    }
+
     // Need to stop transport before group0, otherwise RPCs may fail with raft_group_not_found.
     co_await stop_transport();
 
@@ -3172,19 +3191,20 @@ future<> storage_service::wait_for_topology_not_busy() {
 future<> storage_service::alter_table_with_tablet_hints(table_id tid,
                                                         std::optional<size_t> min_tablet_count,
                                                         std::optional<size_t> max_tablet_count,
-                                                        bool wait_balancer) {
+                                                        wait_balancer wait_for_balancer,
+                                                        remove_unset erase_unset) {
     if (this_shard_id() != 0) {
         co_return co_await container().invoke_on(0, [&] (auto& ss) {
-            return ss.alter_table_with_tablet_hints(tid, min_tablet_count, max_tablet_count, wait_balancer);
+            return ss.alter_table_with_tablet_hints(tid, min_tablet_count, max_tablet_count, wait_for_balancer, erase_unset);
         });
     }
 
-    if (!min_tablet_count && !max_tablet_count) {
+    if (!min_tablet_count && !max_tablet_count && !erase_unset) {
         slogger.info("alter_table_with_tablet_hints: the tablet hints passed are both nullopt, nothing to update");
         co_return;
     }
 
-    if (wait_balancer && min_tablet_count != max_tablet_count) {
+    if (wait_for_balancer && (!min_tablet_count || !max_tablet_count || *min_tablet_count != *max_tablet_count)) {
         throw std::invalid_argument(format(
             "wait_balancer requires both min_tablet_count and max_tablet_count to be provided and equal, got min={} max={}",
             min_tablet_count ? to_sstring(*min_tablet_count) : "nullopt",
@@ -3204,9 +3224,13 @@ future<> storage_service::alter_table_with_tablet_hints(table_id tid,
         auto tablet_options = schema->raw_tablet_options();
         if (min_tablet_count) {
             tablet_options["min_tablet_count"] = to_sstring(*min_tablet_count);
+        } else if (erase_unset) {
+            tablet_options.erase("min_tablet_count");
         }
         if (max_tablet_count) {
             tablet_options["max_tablet_count"] = to_sstring(*max_tablet_count);
+        } else if (erase_unset) {
+            tablet_options.erase("max_tablet_count");
         }
 
         schema_builder builder(schema);
@@ -3216,8 +3240,8 @@ future<> storage_service::alter_table_with_tablet_hints(table_id tid,
         auto ts = group0_guard.write_timestamp();
         sstring description = format("Altering table {}.{} with tablet count hints min_tablet_count={} max_tablet_count={}",
             schema->ks_name(), schema->cf_name(),
-            min_tablet_count ? to_sstring(*min_tablet_count) : "unchanged",
-            max_tablet_count ? to_sstring(*max_tablet_count) : "unchanged");
+            min_tablet_count ? to_sstring(*min_tablet_count) : (erase_unset ? "removed" : "unchanged"),
+            max_tablet_count ? to_sstring(*max_tablet_count) : (erase_unset ? "removed" : "unchanged"));
 
         auto mutations = co_await prepare_column_family_update_announcement(sp, modified_schema, /*view_updates=*/{}, ts);
 
@@ -3231,7 +3255,7 @@ future<> storage_service::alter_table_with_tablet_hints(table_id tid,
         }
     }
 
-    if (!wait_balancer) {
+    if (!wait_for_balancer) {
         co_return;
     }
 
@@ -3785,7 +3809,7 @@ future<> storage_service::unbootstrap() {
         try {
             co_await std::move(stream_success);
         } catch (...) {
-            slogger.warn("unbootstrap fails to stream : {}", std::current_exception());
+            slogger.warn("unbootstrap fails to stream : {:t}", std::current_exception());
             throw;
         }
         slogger.debug("stream acks all received.");
@@ -3819,26 +3843,18 @@ future<> storage_service::removenode_with_stream(locator::host_id leaving_node,
     return seastar::async([this, leaving_node, as_ptr, topo_guard] {
         auto tmptr = get_token_metadata_ptr();
         abort_source as;
-        auto sub = _abort_source.subscribe([&as] () noexcept {
-            if (!as.abort_requested()) {
-                as.request_abort();
-            }
-        });
+        auto sub = utils::chain_abort_source(as, _abort_source);
         if (!as_ptr) {
             throw std::runtime_error("removenode_with_stream: abort_source is nullptr");
         }
-        auto as_ptr_sub = as_ptr->subscribe([&as] () noexcept {
-            if (!as.abort_requested()) {
-                as.request_abort();
-            }
-        });
+        auto as_ptr_sub = utils::chain_abort_source(as, *as_ptr);
         auto streamer = make_lw_shared<dht::range_streamer>(_stream_manager, tmptr, as, tmptr->get_my_id(), _snitch.local()->get_location(), "Removenode", streaming::stream_reason::removenode, topo_guard,
                 _db.local().get_config().consistent_rangemovement(), _db.local().get_config().stream_plan_ranges_fraction());
         removenode_add_ranges(streamer, leaving_node).get();
         try {
             streamer->stream_async().get();
         } catch (...) {
-            slogger.warn("removenode_with_stream: stream failed: {}", std::current_exception());
+            slogger.warn("removenode_with_stream: stream failed: {:t}", std::current_exception());
             throw;
         }
     });
@@ -4108,11 +4124,11 @@ future<> storage_service::update_tablet_metadata(const locator::tablet_metadata_
     wake_up_topology_state_machine();
 }
 
-locator::tablet_map storage_service::build_tablet_map_for_migration(
-        const locator::token_metadata& tm,
+future<locator::tablet_map> storage_service::build_tablet_map_for_migration(
         const locator::static_effective_replication_map_ptr& erm,
-        size_t target_pow2) const {
-    const auto& sorted_tokens = tm.sorted_tokens();
+        size_t target_pow2) {
+    const auto& tm = erm->get_token_metadata_ptr();
+    const auto& sorted_tokens = tm->sorted_tokens();
 
     // Construct token boundaries: union of vnode tokens + optional pow2 boundaries.
     // target_pow2 == 0 means no pow2 convergence target and only wrap-around pre-split.
@@ -4136,46 +4152,85 @@ locator::tablet_map storage_service::build_tablet_map_for_migration(
     locator::tablet_map tmap(std::move(last_tokens));
     auto tablet_count = tmap.tablet_count();
 
-    // Stateful lambdas for round-robin shard assignment per node.
-    std::unordered_map<locator::host_id, std::function<shard_id()>> next_shard_for;
-    tm.for_each_token_owner([&] (const locator::node& node) {
-        auto host = node.host_id();
-        next_shard_for[host] = [num_shards = node.get_shard_count(), idx = 0u] () mutable {
-            return shard_id(idx++ % num_shards);
-        };
-    });
+    struct tablet_desc {
+        locator::tablet_id id;
+        dht::token vnode_token;
+        uint64_t token_range_size;
+    };
+    utils::chunked_vector<tablet_desc> tablets;
+    tablets.reserve(tablet_count);
 
     size_t vnode_idx = 0;
+    // unbias() maps tokens monotonically onto [0, 2^64), so the distance between
+    // consecutive tablet boundaries is the size of the range a tablet owns.
+    // unbias(minimum_token()) is 0, the lower bound of the first tablet.
+    uint64_t prev_boundary = dht::minimum_token().unbias();
     for (size_t i = 0; i < tablet_count; ++i) {
-        auto tablet = locator::tablet_id(i);
-        auto tablet_last = dht::raw_token(tmap.get_last_token(tablet));
-        while (vnode_idx < sorted_tokens.size() && dht::raw_token(sorted_tokens[vnode_idx]) < tablet_last) {
+        auto tablet_last = tmap.get_last_token(locator::tablet_id(i));
+        while (vnode_idx < sorted_tokens.size() && dht::raw_token(sorted_tokens[vnode_idx]) < dht::raw_token(tablet_last)) {
             ++vnode_idx;
         }
         auto vnode_token = (vnode_idx < sorted_tokens.size())
             ? sorted_tokens[vnode_idx]
             : sorted_tokens[0]; // wrap-around vnode
-        auto vnode_replica_hosts = erm->get_natural_replicas(vnode_token, true);
-        locator::tablet_replica_set tablet_replicas;
-        for (auto host : vnode_replica_hosts) {
-            tablet_replicas.push_back(locator::tablet_replica{host, next_shard_for[host]()});
+        auto boundary = tablet_last.unbias();
+        tablets.push_back(tablet_desc{locator::tablet_id(i), vnode_token, boundary - prev_boundary});
+        prev_boundary = boundary;
+        co_await coroutine::maybe_yield();
+    }
+
+    // Aggregate token range assigned to each shard of a node, kept as a min-heap
+    // ordered by (range, shard). A tablet is placed on at most one shard per node,
+    // so the per-shard sums add up to the size of the ring at most, which uint64_t
+    // holds exactly.
+    using shard_range = std::pair<uint64_t, shard_id>;
+    std::unordered_map<locator::host_id, std::vector<shard_range>> shard_load;
+    tm->for_each_token_owner([&] (const locator::node& node) {
+        auto shard_count = node.get_shard_count();
+        if (!shard_count) {
+            throw std::runtime_error(fmt::format("Shard count not known for node {}", node.host_id()));
         }
-        tmap.set_tablet(tablet, locator::tablet_info(std::move(tablet_replicas)));
+        std::vector<shard_range> shards;
+        shards.reserve(shard_count);
+        for (shard_id shard = 0; shard < shard_count; ++shard) {
+            shards.emplace_back(0, shard);
+        }
+        std::ranges::make_heap(shards, std::greater<>{});
+        shard_load.emplace(node.host_id(), std::move(shards));
+    });
+
+    std::ranges::sort(tablets, std::ranges::greater(), &tablet_desc::token_range_size);
+
+    for (const auto& tablet : tablets) {
+        locator::tablet_replica_set tablet_replicas;
+        for (auto host : erm->get_natural_replicas(tablet.vnode_token, true)) {
+            auto& shards = shard_load.at(host);
+            std::ranges::pop_heap(shards, std::greater<>{});
+            auto& [range, shard] = shards.back();
+            range += tablet.token_range_size;
+            tablet_replicas.push_back(locator::tablet_replica{host, shard});
+            std::ranges::push_heap(shards, std::greater<>{});
+        }
+        tmap.set_tablet(tablet.id, locator::tablet_info(std::move(tablet_replicas)));
+        co_await coroutine::maybe_yield();
     }
 
     if (target_pow2 && tablet_count != target_pow2) {
         tmap.set_target_pow2_tablet_count(target_pow2);
     }
 
-    return tmap;
+    co_return tmap;
 }
 
 future<std::unordered_map<table_id, uint64_t>> storage_service::collect_table_sizes_for_migration(
-    const locator::token_metadata& tm,
+    const sstring& ks_name,
+    const locator::static_effective_replication_map_ptr& erm,
     const locator::tablet_aware_replication_strategy* trs,
     const std::vector<std::pair<table_id, sstring>>& tables_to_estimate) {
 
     std::unordered_map<table_id, uint64_t> table_sizes;
+
+    const auto& tm = *erm->get_token_metadata_ptr();
 
     const auto& local_dc = tm.get_topology().get_location().dc;
     auto local_rf = trs->get_replication_factor(local_dc);
@@ -4186,12 +4241,25 @@ future<std::unordered_map<table_id, uint64_t>> storage_service::collect_table_si
 
     const auto local_host = tm.get_my_id();
 
+    // Compute the token ring fraction for which this node is a replica.
+    // (Same logic as in storage_service::effective_ownership(), but only for a single node.)
     double local_fraction = 0.0;
-    auto token_ownership = dht::token::describe_ownership(tm.sorted_tokens());
-    for (const auto& [tok, fraction] : token_ownership) {
-        if (tm.get_endpoint(tok) == local_host) {
-            local_fraction += fraction;
+    const auto token_ownership = dht::token::describe_ownership(tm.sorted_tokens());
+    const auto ranges = co_await erm->get_ranges(local_host);
+    for (const auto& r : ranges) {
+        // Corner case for wrap-around range:
+        // get_ranges() unwraps the wrapping range (t1, t0] as two ranges
+        // (t1, +inf) and (-inf, t0]. Skipping the former yields the same
+        // ownership as if the range were not split.
+        if (!r.end()) {
+            continue;
         }
+        auto end_token = r.end()->value();
+        auto it = token_ownership.find(end_token);
+        if (it == token_ownership.end()) {
+            on_internal_error(slogger, fmt::format("Cannot find token ownership for token {}", end_token));
+        }
+        local_fraction += it->second;
     }
 
     if (local_fraction <= 0) {
@@ -4199,11 +4267,20 @@ future<std::unordered_map<table_id, uint64_t>> storage_service::collect_table_si
             "Cannot estimate table sizes for migration: local token ownership fraction is {}", local_fraction));
     }
 
-    for (const auto& [tid, ignored_cf_name] : tables_to_estimate) {
-        auto& cf = _db.local().find_column_family(tid);
-        auto local_size = static_cast<uint64_t>(cf.get_stats().live_disk_space_used.on_disk);
-        auto estimated_total_size = static_cast<uint64_t>(local_size / local_fraction) / local_rf;
+    slogger.info("Estimating table sizes for migration of keyspace {} (dc={}, rf={}): "
+            "this node is a replica for {:.2f}% of the token ring",
+            ks_name, local_dc, local_rf, local_fraction * 100);
+
+    for (const auto& [tid, cf_name] : tables_to_estimate) {
+        // Table statistics are per-shard, so the size of the local dataset is
+        // the sum over all shards.
+        auto local_size = co_await _db.map_reduce0([tid] (replica::database& db) {
+            return uint64_t(db.find_column_family(tid).get_stats().live_disk_space_used.on_disk);
+        }, uint64_t(0), std::plus<uint64_t>());
+        auto estimated_total_size = static_cast<uint64_t>(local_size / local_fraction);
         table_sizes.emplace(tid, estimated_total_size);
+        slogger.info("Estimated size of table {}.{}: {} byte(s) (local data set is {} byte(s))",
+                ks_name, cf_name, estimated_total_size, local_size);
     }
 
     co_return table_sizes;
@@ -4261,9 +4338,10 @@ future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) 
         // vnode range. If the last vnode token is not MAX_TOKEN, an additional
         // tablet is created to cover the wrap-around range
         // (last_vnode_token, MAX_TOKEN].
-        // Tablets inherit their replica hosts from their corresponding vnode
-        // and shards are assigned in round-robin fashion per node so that
-        // tablets are evenly distributed within each node.
+        // Tablets inherit their replica hosts from their corresponding vnode.
+        // Shards are picked per node so that the aggregate token range owned by
+        // each shard is as even as possible, since vnode-derived tablets differ
+        // widely in size and counting them alone would misrepresent the load.
         //
         // However, this direct 1:1 mapping is not sufficient in terms of
         // performance because vnode token ranges vary in size, producing
@@ -4299,8 +4377,6 @@ future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) 
         //  min           P1            P2            P3          max
         //   |------------|-------------|-------------|------------|
 
-        const auto& tm = get_token_metadata();
-
         // Estimate table sizes when pow2 convergence is enabled.
         // The estimates are used by the tablet allocator to determine the
         // target pow2 tablet count per table.
@@ -4315,7 +4391,8 @@ future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) 
         target_pow2_per_table_map target_pow2s;
         bool use_pow2_presplit = bool(_feature_service.tablet_pow2_convergence);
         if (use_pow2_presplit) {
-            auto estimated_sizes = co_await collect_table_sizes_for_migration(tm, trs, tables_to_migrate);
+            auto erm = ks.get_static_effective_replication_map();
+            auto estimated_sizes = co_await collect_table_sizes_for_migration(ks_name, erm, trs, tables_to_migrate);
             target_pow2s = co_await _tablet_allocator.local().compute_migration_target_pow2s(trs, estimated_sizes);
         }
 
@@ -4354,11 +4431,11 @@ future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) 
                     if (auto it = target_pow2s.find(tid); it != target_pow2s.end()) {
                         target_pow2 = it->second;
                     }
-                    auto tmap = build_tablet_map_for_migration(tm, erm, target_pow2);
+                    auto tmap = co_await build_tablet_map_for_migration(erm, target_pow2);
                     co_await append_tablet_map_mutations(tid, cf_name, tmap, target_pow2);
                 }
             } else {
-                auto shared_tmap = build_tablet_map_for_migration(tm, erm, 0);
+                auto shared_tmap = co_await build_tablet_map_for_migration(erm, 0);
                 for (const auto& [tid, cf_name] : tables_to_migrate) {
                     co_await append_tablet_map_mutations(tid, cf_name, shared_tmap, 0);
                 }
@@ -4533,8 +4610,11 @@ future<storage_service::keyspace_migration_status> storage_service::get_tablets_
             : intended_storage_mode::vnodes;
         auto intended_mode = rs.storage_mode.value_or(intended_storage_mode::vnodes);
 
+        auto ip = _address_map.find(host_id);
+
         result.nodes.push_back(node_migration_status{
             .host_id = host_id,
+            .endpoint = ip ? sstring(fmt::to_string(*ip)) : sstring(),
             .current_mode = fmt::format("{}", current_mode),
             .intended_mode = fmt::format("{}", intended_mode),
         });
@@ -4655,7 +4735,7 @@ future<> storage_service::finalize_tablets_migration(const sstring& ks_name) {
 }
 
 future<> storage_service::process_tablet_split_candidate(table_id table) noexcept {
-    tasks::task_info tablet_split_task_info;
+    auto tablet_split_task_info = tasks::make_empty_task_info();
 
     auto all_compaction_groups_split = [&] () mutable {
         return _db.map_reduce0([table_ = table] (replica::database& db) {
@@ -4684,7 +4764,7 @@ future<> storage_service::process_tablet_split_candidate(table_id table) noexcep
                 release_guard(std::move(guard));
                 break;
             }
-            tablet_split_task_info.id = tasks::task_id{tmap.resize_task_info().tablet_task_id.uuid()};
+            tablet_split_task_info = tasks::make_cluster_task_info(tasks::task_id{tmap.resize_task_info().tablet_task_id.uuid()});
 
             if (co_await all_compaction_groups_split()) {
                 slogger.debug("All compaction groups of table {} are split ready.", table);
@@ -4698,22 +4778,22 @@ future<> storage_service::process_tablet_split_candidate(table_id table) noexcep
                 co_await split_all_compaction_groups();
             }
         } catch (const locator::no_such_tablet_map& ex) {
-            slogger.warn("Failed to complete splitting of table {} due to {}", table, ex);
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
             break;
         } catch (const replica::no_such_column_family& ex) {
-            slogger.warn("Failed to complete splitting of table {} due to {}", table, ex);
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
             break;
         } catch (const seastar::abort_requested_exception& ex) {
-            slogger.warn("Failed to complete splitting of table {} due to {}", table, ex);
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
             break;
         } catch (raft::request_aborted& ex) {
-            slogger.warn("Failed to complete splitting of table {} due to {}", table, ex);
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
             break;
         } catch (seastar::gate_closed_exception& ex) {
-            slogger.warn("Failed to complete splitting of table {} due to {}", table, ex);
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
             break;
         } catch (...) {
-            slogger.error("Failed to complete splitting of table {} due to {}, retrying after {} seconds",
+            slogger.error("Failed to complete splitting of table {} due to {:t}, retrying after {} seconds",
                           table, std::current_exception(), split_retry.sleep_time());
             sleep = true;
         }
@@ -4721,7 +4801,7 @@ future<> storage_service::process_tablet_split_candidate(table_id table) noexcep
             try {
                 co_await split_retry.retry(_group0_as);
             } catch (...) {
-                slogger.warn("Sleep in split monitor failed with {}", std::current_exception());
+                slogger.warn("Sleep in split monitor failed with {:t}", std::current_exception());
             }
         }
     }
@@ -4737,7 +4817,7 @@ void storage_service::register_tablet_split_candidate(table_id table) noexcept {
             _tablet_split_monitor_event.signal();
         }
     } catch (...) {
-        slogger.error("Unable to register table {} as candidate for tablet splitting, due to {}", table, std::current_exception());
+        slogger.error("Unable to register table {} as candidate for tablet splitting, due to {:t}", table, std::current_exception());
     }
 }
 
@@ -4778,6 +4858,53 @@ future<> storage_service::snitch_reconfigured() {
     }
 }
 
+// Decides whether a topology barrier should evict (abort) user repairs
+// which pin stale token metadata versions and thus block the barrier.
+//
+// Evict only when the barrier is part of a node operation (bootstrap,
+// decommission, removenode, replace, cleanup, rollback) or another
+// coordinator-driven transition. The tablet load balancer runs the same
+// barrier continuously (every migration stage bumps the topology version
+// and drains stale versions), so evicting there would keep killing vnode
+// repairs whenever tablets are being balanced, e.g. for the whole duration
+// of a vnodes-to-tablets migration. A balancing-only barrier instead waits
+// for the repair to finish, as before.
+//
+// A pending per-node request counts as a node operation: with parallel
+// tablet draining, decommission and removenode drain tablets through
+// ordinary migration rounds (transition_state::tablet_migration) while the
+// request is still pending, and those drain barriers must evict the repair
+// for the operation to make progress.
+static bool should_abort_repair(const topology& topo) {
+    if (!topo.requests.empty() || !topo.transition_nodes.empty()) {
+        return true;
+    }
+    if (!topo.tstate) {
+        return false;
+    }
+    switch (*topo.tstate) {
+    // Tablet-balancing-only transitions: wait for the repair instead of
+    // aborting it.
+    case topology::transition_state::tablet_migration:
+    case topology::transition_state::tablet_resize_finalization:
+    case topology::transition_state::tablet_split_finalization:
+        return false;
+    // Coordinator-driven transitions: abort user repairs blocking the
+    // barrier.
+    case topology::transition_state::join_group0:
+    case topology::transition_state::commit_cdc_generation:
+    case topology::transition_state::tablet_draining:
+    case topology::transition_state::write_both_read_old:
+    case topology::transition_state::write_both_read_new:
+    case topology::transition_state::left_token_ring:
+    case topology::transition_state::rollback_to_normal:
+    case topology::transition_state::truncate_table:
+    case topology::transition_state::lock:
+    case topology::transition_state::snapshot_tables:
+        return true;
+    }
+}
+
 future<> storage_service::local_topology_barrier() {
     if (this_shard_id() != 0) {
         co_await container().invoke_on(0, [] (storage_service& ss) {
@@ -4805,7 +4932,11 @@ future<> storage_service::local_topology_barrier() {
         }
     }
 
-    co_await container().invoke_on_all([version] (storage_service& ss) -> future<> {
+    // The topology state used by should_abort_repair() is up to date because
+    // raft_topology_cmd_handler runs a group0 read barrier first.
+    const bool evict_blocking_repairs = should_abort_repair(_topology_state_machine._topology);
+
+    co_await container().invoke_on_all([version, evict_blocking_repairs] (storage_service& ss) -> future<> {
         const auto current_version = ss._shared_token_metadata.get()->get_version();
         rtlogger.info("Got raft_topology_cmd::barrier_and_drain, version {}, "
                       "current version {}, stale versions (version: use_count): {}",
@@ -4828,16 +4959,35 @@ future<> storage_service::local_topology_barrier() {
 
         rtlogger.info("raft_topology_cmd::barrier_and_drain version {}: waiting for stale token metadata versions to be released", version);
         {
-            seastar::timer<lowres_clock> warn_timer([&ss, version] {
+            // A user-requested repair on a vnode keyspace holds its
+            // effective_replication_map, and thus pins a stale token metadata
+            // version, for the entire duration of the repair, which is
+            // unbounded. Abort such repairs instead of stalling the topology
+            // operation behind them; the operator can re-run the repair once
+            // the topology change completes. The abort is retried from the
+            // periodic timer to catch repairs which acquired their
+            // effective_replication_map before the barrier but registered
+            // their per-shard tasks only after the initial call.
+            auto abort_stale_repairs = [&ss, current_version, evict_blocking_repairs] {
+                if (evict_blocking_repairs && ss._repair.local_is_initialized()) {
+                    ss._repair.local().get_repair_module().abort_repairs_pinning_stale_versions(current_version);
+                }
+            };
+            abort_stale_repairs();
+            seastar::timer<lowres_clock> warn_timer([&ss, version, abort_stale_repairs] {
                 rtlogger.warn("raft_topology_cmd::barrier_and_drain version {}: still waiting for stale versions, "
                               "stale versions (version: use_count): {}",
                               version, ss._shared_token_metadata.describe_stale_versions());
+                abort_stale_repairs();
             });
             warn_timer.arm_periodic(std::chrono::minutes(5));
             co_await ss._shared_token_metadata.stale_versions_in_use();
         }
         rtlogger.info("raft_topology_cmd::barrier_and_drain version {}: stale versions released, draining closing sessions", version);
         co_await get_topology_session_manager().drain_closing_sessions();
+
+        rtlogger.debug("raft_topology_cmd::barrier_and_drain version {}: waiting for strongly consistent tablet raft groups to be torn down", version);
+        co_await ss._groups_manager.local_topology_barrier(ss._shared_token_metadata.get(), ss._abort_source);
 
         rtlogger.info("raft_topology_cmd::barrier_and_drain version {}: done", version);
     });
@@ -4966,11 +5116,11 @@ future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(raft
                                 cf->notify_bootstrap_or_replace_start();
                             }
                         });
-                        tasks::task_info parent_info{tasks::task_id{rs.request_id}, 0};
+                        auto parent_info = tasks::make_cluster_task_info(tasks::task_id{rs.request_id});
                         if (rs.state == node_state::bootstrapping) {
                             if (!_topology_state_machine._topology.normal_nodes.empty()) { // stream only if there is a node in normal state
                                 auto task = co_await get_node_ops_module().make_and_start_task<node_ops::streaming_task_impl>(parent_info,
-                                        parent_info.id, streaming::stream_reason::bootstrap, _bootstrap_result, [this, &rs, session] (this auto) -> future<> {
+                                        parent_info.get_id(), streaming::stream_reason::bootstrap, _bootstrap_result, [this, &rs, session] (this auto) -> future<> {
                                     if (is_repair_based_node_ops_enabled(streaming::stream_reason::bootstrap)) {
                                         co_await utils::get_local_injector().inject("delay_bootstrap_120s", std::chrono::seconds(120));
 
@@ -4991,7 +5141,7 @@ future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(raft
                         } else {
                             auto replaced_id = std::get<replace_param>(_topology_state_machine._topology.req_param[id]).replaced_id;
                             auto task = co_await get_node_ops_module().make_and_start_task<node_ops::streaming_task_impl>(parent_info,
-                                    parent_info.id, streaming::stream_reason::replace, _bootstrap_result, [this, &rs, &id, replaced_id, session] (this auto) -> future<> {
+                                    parent_info.get_id(), streaming::stream_reason::replace, _bootstrap_result, [this, &rs, &id, replaced_id, session] (this auto) -> future<> {
                                 if (!_topology_state_machine._topology.req_param.contains(id)) {
                                     on_internal_error(rtlogger, ::format("Cannot find request_param for node id {}", id));
                                 }
@@ -5022,9 +5172,9 @@ future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(raft
                     }
                     break;
                     case node_state::decommissioning: {
-                        tasks::task_info parent_info{tasks::task_id{rs.request_id}, 0};
+                        auto parent_info = tasks::make_cluster_task_info(tasks::task_id{rs.request_id});
                         auto task = co_await get_node_ops_module().make_and_start_task<node_ops::streaming_task_impl>(parent_info,
-                                parent_info.id, streaming::stream_reason::decommission, _decommission_result, [this] (this auto) -> future<> {
+                                parent_info.get_id(), streaming::stream_reason::decommission, _decommission_result, [this] (this auto) -> future<> {
                             co_await utils::get_local_injector().inject("streaming_task_impl_decommission_run", utils::wait_for_message(60s));
                             co_await unbootstrap();
                             co_await utils::get_local_injector().inject("streaming_task_impl_decommission_done_wait", utils::wait_for_message(5min));
@@ -5043,23 +5193,19 @@ future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(raft
                         }
                         auto id = it->first;
                         rtlogger.debug("streaming to remove node {}", id);
-                        tasks::task_info parent_info{tasks::task_id{it->second.request_id}, 0};
+                        auto parent_info = tasks::make_cluster_task_info(tasks::task_id{it->second.request_id});
                         auto task = co_await get_node_ops_module().make_and_start_task<node_ops::streaming_task_impl>(parent_info,
-                                parent_info.id, streaming::stream_reason::removenode, _remove_result[id], [this, id = locator::host_id{id.uuid()}, session] (this auto) {
+                                parent_info.get_id(), streaming::stream_reason::removenode, _remove_result[id], [this, id = locator::host_id{id.uuid()}, session] (this auto) -> future<> {
                             auto as = make_shared<abort_source>();
-                            auto sub = _abort_source.subscribe([as] () noexcept {
-                                if (!as->abort_requested()) {
-                                    as->request_abort();
-                                }
-                            });
+                            auto sub = utils::chain_abort_source(*as, _abort_source);
                             if (is_repair_based_node_ops_enabled(streaming::stream_reason::removenode)) {
                                 std::list<locator::host_id> ignored_ips = _topology_state_machine._topology.ignored_nodes | std::views::transform([] (const auto& id) {
                                     return locator::host_id(id.uuid());
                                 }) | std::ranges::to<std::list<locator::host_id>>();
                                 auto ops = seastar::make_shared<node_ops_info>(node_ops_id::create_random_id(), as, std::move(ignored_ips));
-                                return _repair.local().removenode_with_repair(get_token_metadata_ptr(), id, ops, session);
+                                co_await _repair.local().removenode_with_repair(get_token_metadata_ptr(), id, ops, session);
                             } else {
-                                return removenode_with_stream(id, session, as);
+                                co_await removenode_with_stream(id, session, as);
                             }
                         });
                         co_await task->done();
@@ -5069,9 +5215,9 @@ future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(raft
                     case node_state::rebuilding: {
                         auto source_dc = std::get<rebuild_param>(_topology_state_machine._topology.req_param[id]).source_dc;
                         rtlogger.info("rebuild from dc: {}", source_dc == "" ? "(any dc)" : source_dc);
-                        tasks::task_info parent_info{tasks::task_id{rs.request_id}, 0};
+                        auto parent_info = tasks::make_cluster_task_info(tasks::task_id{rs.request_id});
                         auto task = co_await get_node_ops_module().make_and_start_task<node_ops::streaming_task_impl>(parent_info,
-                                parent_info.id, streaming::stream_reason::rebuild, _rebuild_result, [this, &source_dc, session] (this auto) -> future<> {
+                                parent_info.get_id(), streaming::stream_reason::rebuild, _rebuild_result, [this, &source_dc, session] (this auto) -> future<> {
                             auto tmptr = get_token_metadata_ptr();
                             auto ks_erms = _db.local().get_non_local_strategy_keyspaces_erms();
                             if (is_repair_based_node_ops_enabled(streaming::stream_reason::rebuild)) {
@@ -5141,13 +5287,13 @@ future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(raft
             }
         }
     } catch (const raft::request_aborted& e) {
-        rtlogger.warn("raft_topology_cmd {} failed with: {}", cmd.cmd, e);
+        rtlogger.warn("raft_topology_cmd {} failed with: {:t}", cmd.cmd, e);
         result.error_message = e.what();
     } catch (const std::exception& e) {
-        rtlogger.error("raft_topology_cmd {} failed with: {}", cmd.cmd, e);
+        rtlogger.error("raft_topology_cmd {} failed with: {:t}", cmd.cmd, e);
         result.error_message = e.what();
     } catch (...) {
-        rtlogger.error("raft_topology_cmd {} failed with: {}", cmd.cmd, std::current_exception());
+        rtlogger.error("raft_topology_cmd {} failed with: {:t}", cmd.cmd, std::current_exception());
         result.error_message = "unknown error";
     }
 
@@ -5247,7 +5393,7 @@ future<tablet_operation_result> storage_service::do_tablet_operation(locator::gl
         co_return result;
     } catch (...) {
         p.set_exception(std::current_exception());
-        rtlogger.warn("{} for tablet migration of {} failed: {}", op_name, tablet, std::current_exception());
+        rtlogger.warn("{} for tablet migration of {} failed: {:t}", op_name, tablet, std::current_exception());
         throw;
     }
 }
@@ -5269,7 +5415,7 @@ future<service::tablet_operation_repair_result> storage_service::repair_tablet(l
         auto session = session_id ? session_id : trinfo->session_id;
         slogger.debug("repair_tablet: tablet={} session_id={}", tablet, session);
 
-        tasks::task_info global_tablet_repair_task_info;
+        auto global_tablet_repair_task_info = tasks::make_empty_task_info();
         std::optional<locator::tablet_replica_set> replicas = std::nullopt;
         if (trinfo->stage == locator::tablet_transition_stage::repair) {
             auto& tinfo = tmap.get_tablet_info(tablet.tablet);
@@ -5280,7 +5426,7 @@ future<service::tablet_operation_repair_result> storage_service::repair_tablet(l
             if (!tinfo.repair_task_info) {
                 throw std::runtime_error(fmt::format("Repair request for tablet {} was deleted", tablet));
             }
-            global_tablet_repair_task_info = {tasks::task_id{tinfo.repair_task_info->tablet_task_id.uuid()}, 0};
+            global_tablet_repair_task_info = tasks::make_cluster_task_info(tasks::task_id{tinfo.repair_task_info->tablet_task_id.uuid()});
         } else {
             auto migration_streaming_info = get_migration_streaming_info(get_token_metadata_ptr()->get_topology(), tmap.get_tablet_info(tablet.tablet), *trinfo);
             replicas = locator::tablet_replica_set{migration_streaming_info.read_from.begin(), migration_streaming_info.read_from.end()};
@@ -5347,8 +5493,7 @@ future<> storage_service::clone_locally_tablet_storage(locator::global_tablet_id
             }
             co_return;
         };
-        auto loaded_ssts = co_await table.add_new_sstables_and_update_cache(std::vector(ssts.begin(), ssts.end()), on_add);
-        _view_building_worker.local().load_sstables(tablet.table, loaded_ssts);
+        co_await table.add_new_sstables_and_update_cache(std::vector(ssts.begin(), ssts.end()), on_add);
     });
     rtlogger.debug("Successfully loaded storage of tablet {} into pending replica {}", tablet, pending);
 }
@@ -5463,7 +5608,7 @@ future<> storage_service::stream_tablet(locator::global_tablet_id tablet) {
                     slogger.info("stream_sstables[{}] Streaming for tablet migration of {} finished table={}.{} range={} stream_bytes={} stream_time={} stream_bw={}",
                             ops_id, tablet, table.schema()->ks_name(), table.schema()->cf_name(), range, stream_bytes, duration, bw);
                 } catch (...) {
-                    slogger.warn("stream_sstables[{}] Streaming for tablet migration of {} from {} failed: {}", ops_id, tablet, leaving_replica, std::current_exception());
+                    slogger.warn("stream_sstables[{}] Streaming for tablet migration of {} from {} failed: {:t}", ops_id, tablet, leaving_replica, std::current_exception());
                     throw;
                 }
             }
@@ -5574,11 +5719,15 @@ future<> storage_service::cleanup_tablet(locator::global_tablet_id tablet) {
 
     co_await do_tablet_operation(tablet, "Cleanup", [this, tablet] (locator::tablet_metadata_guard& guard) -> future<tablet_operation_result> {
         shard_id shard;
+        std::optional<raft::group_id> group_id;
 
         {
             auto tm = guard.get_token_metadata();
             auto& tmap = guard.get_tablet_map();
             auto *trinfo = tmap.get_tablet_transition_info(tablet.tablet);
+            if (tmap.has_raft_info()) {
+                group_id = tmap.get_tablet_raft_info(tablet.tablet).group_id;
+            }
 
             // Check if the request is still valid.
             // If there is mismatch, it means this cleanup was canceled and the coordinator moved on.
@@ -5607,6 +5756,39 @@ future<> storage_service::cleanup_tablet(locator::global_tablet_id tablet) {
             } else {
                 throw std::runtime_error(fmt::format("Tablet {} stage is not at cleanup/cleanup_target", tablet));
             }
+        }
+        if (group_id) {
+            co_await _groups_manager.container().invoke_on(shard,
+                    [tablet, group_id = *group_id, shard] (strong_consistency::groups_manager& gm) -> future<> {
+                // The raft group of a strongly consistent tablet must be gone before its
+                // storage is cleaned up: nothing may apply raft entries to a tablet whose
+                // compaction groups have been stopped, and a late apply would kill the raft
+                // server's applier fiber, which is a fatal background error.
+                //
+                // groups_manager::update() tears the group down as soon as the stage that
+                // ended this node's membership is published, and the barrier that precedes
+                // this cleanup waits for the teardown to complete. Failing here means that
+                // ordering broke, so fail the cleanup rather than corrupt the tablet - the
+                // coordinator retries it.
+                if (gm.is_group_running(group_id)) {
+                    throw std::runtime_error(fmt::format("Tablet {} still has a running raft group {} on shard {}",
+                            tablet, group_id, shard));
+                }
+
+                // This replica has left the group for good - this is the cleanup of either
+                // the leaving replica or, on the rollback path, the pending one - so its
+                // persisted raft state has to go with the tablet's storage. Left behind, it
+                // would let the node rejoin the group later claiming a commit index whose
+                // entries it no longer holds, and the leader never resends those.
+                //
+                // Before the storage below rather than after, so that no ordering of a
+                // crash in between leaves raft state describing a tablet whose storage is
+                // already gone. It is not a guarantee: system.raft_groups goes through the
+                // ordinary commitlog with periodic sync, so a crash can lose this delete
+                // while the storage removal below survives. What covers that is commitlog
+                // replay refusing a group whose tablet has no replica on the shard.
+                co_await gm.erase_raft_group_state(group_id);
+            });
         }
         co_await _db.invoke_on(shard, [tablet, &sys_ks = _sys_ks, &vbw = _view_building_worker] (replica::database& db) -> future<> {
             auto& table = db.find_column_family(tablet.table);
@@ -6372,6 +6554,29 @@ future<utils::UUID> storage_service::submit_quiesce_topology_request() {
     }
 }
 
+// Submit a topology request and retry until the coordinator observes an empty tablet
+// balance plan with fresh stats. Runs as _quiesce_topology, so at most one of these is
+// in flight at a time, see await_topology_quiesced().
+future<> storage_service::do_await_topology_quiesced() {
+    while (true) {
+        auto request_id = co_await submit_quiesce_topology_request();
+        auto error = co_await wait_for_topology_request_completion(request_id);
+        if (error.empty()) {
+            co_return;
+        }
+        if (error.starts_with("quiesce request failed")) {
+            slogger.warn("quiesce request {}: {}", request_id, error);
+        } else {
+            slogger.info("quiesce request {}: topology not idle: {}", request_id, error);
+        }
+        // Wait locally for topology to settle before resubmitting.
+        co_await _topology_state_machine.await_not_busy();
+        co_await _topology_state_machine.event.when([this] {
+            return get_token_metadata_ptr()->tablets().is_idle();
+        });
+    }
+}
+
 future<> storage_service::await_topology_quiesced() {
     auto holder = _async_gate.hold();
 
@@ -6391,25 +6596,16 @@ future<> storage_service::await_topology_quiesced() {
         co_return;
     }
 
-    // New behavior — submit a topology request and retry until the
-    // coordinator observes an empty tablet balance plan with fresh stats.
-    while (true) {
-        auto request_id = co_await submit_quiesce_topology_request();
-        auto error = co_await wait_for_topology_request_completion(request_id);
-        if (error.empty()) {
-            co_return;
-        }
-        if (error.starts_with("quiesce request failed")) {
-            slogger.warn("quiesce request {}: {}", request_id, error);
-        } else {
-            slogger.debug("quiesce request {}: topology not idle: {}", request_id, error);
-        }
-        // Wait locally for topology to settle before resubmitting.
-        co_await _topology_state_machine.await_not_busy();
-        co_await _topology_state_machine.event.when([this] {
-            return get_token_metadata_ptr()->tablets().is_idle();
-        });
-    }
+    // Whether the topology has quiesced is a question about the cluster, so concurrent
+    // callers all want the same answer. load_and_stream() asks it from every shard at
+    // once, which used to put smp::count requests into the cluster-wide group0 queue,
+    // each one costing the coordinator a load stats collection and a full balance.
+    //
+    // trigger_later() defers the run briefly so that callers forwarded from other shards
+    // join the same one. Callers which arrive once a run has already started are served
+    // by the next run rather than by that one, so nobody is given an answer which was
+    // computed before it asked.
+    co_await _quiesce_topology.trigger_later();
 }
 
 future<bool> storage_service::verify_topology_quiesced(token_metadata::version_t expected_version) {
@@ -7013,7 +7209,7 @@ static const char* disk_error_to_string(disk_error type) {
 void storage_service::do_isolate_on_error(disk_error type)
 {
     if (!std::exchange(_isolated, true)) {
-        slogger.error("Shutting down communications due to I/O errors until operator intervention: {} error: {}", disk_error_to_string(type), std::current_exception());
+        slogger.error("Shutting down communications due to I/O errors until operator intervention: {} error: {:t}", disk_error_to_string(type), std::current_exception());
         // isolated protect us against multiple stops on _this_ shard
         //FIXME: discarded future.
         (void)isolate();
@@ -7084,7 +7280,7 @@ future<> endpoint_lifecycle_notifier::notify_down(gms::inet_address endpoint, lo
             try {
                 subscriber->on_down(endpoint, hid);
             } catch (...) {
-                slogger.warn("Down notification failed {}/{}: {}", endpoint, hid, std::current_exception());
+                slogger.warn("Down notification failed {}/{}: {:t}", endpoint, hid, std::current_exception());
             }
         });
     });
@@ -7104,7 +7300,7 @@ future<> endpoint_lifecycle_notifier::notify_left(gms::inet_address endpoint, lo
             try {
                 subscriber->on_leave_cluster(endpoint, hid);
             } catch (...) {
-                slogger.warn("Leave cluster notification failed {}/{}: {}", endpoint, hid, std::current_exception());
+                slogger.warn("Leave cluster notification failed {}/{}: {:t}", endpoint, hid, std::current_exception());
             }
         });
     });
@@ -7116,7 +7312,7 @@ future<> endpoint_lifecycle_notifier::notify_released(locator::host_id hid) {
             try {
                 subscriber->on_released(hid);
             } catch (...) {
-                slogger.warn("Node released notification failed {}: {}", hid, std::current_exception());
+                slogger.warn("Node released notification failed {}: {:t}", hid, std::current_exception());
             }
         });
     });
@@ -7142,7 +7338,7 @@ future<> endpoint_lifecycle_notifier::notify_up(gms::inet_address endpoint, loca
             try {
                 subscriber->on_up(endpoint, hid);
             } catch (...) {
-                slogger.warn("Up notification failed {}/{}: {}", endpoint, hid, std::current_exception());
+                slogger.warn("Up notification failed {}/{}: {:t}", endpoint, hid, std::current_exception());
             }
         });
     });
@@ -7164,7 +7360,7 @@ future<> endpoint_lifecycle_notifier::notify_joined(gms::inet_address endpoint, 
             try {
                 subscriber->on_join_cluster(endpoint, hid);
             } catch (...) {
-                slogger.warn("Join cluster notification failed {}/{}: {}", endpoint, hid,std::current_exception());
+                slogger.warn("Join cluster notification failed {}/{}: {:t}", endpoint, hid,std::current_exception());
             }
         });
     });
@@ -7176,7 +7372,7 @@ future<> endpoint_lifecycle_notifier::notify_client_routes_change(const client_r
             try {
                 subscriber->on_client_routes_change(client_route_keys);
             } catch (...) {
-                slogger.warn("Client routes notification failed: {}", std::current_exception());
+                slogger.warn("Client routes notification failed: {:t}", std::current_exception());
             }
         });
     });

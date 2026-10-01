@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "locator/tablets.hh"
 #include "mutation/mutation.hh"
 #include "query/query-result.hh"
 #include "utils/histogram.hh"
@@ -75,38 +76,58 @@ private:
     gms::gossiper& _gossiper;
     stats _stats;
 
+    class replica_selector;
     struct operation_ctx;
+    // `needs_leader` says whether the request has to be executed by the raft group's
+    // leader, which is true for writes and linearizable reads and false for a read that
+    // is served from local storage. It decides both where the request may run and, when
+    // it may not run here, which replica it is redirected to: a request needing the
+    // leader can go to any replica that could be the leader, a local read only to one
+    // that holds the tablet's data.
     future<value_or_redirect<operation_ctx>> create_operation_ctx(const schema& schema,
         const dht::token& token,
         abort_source& as,
-        bool use_leader_cache);
+        bool needs_leader);
 public:
     coordinator(groups_manager& groups_manager, replica::database& db, gms::gossiper& gossiper);
 
     stats& get_stats() { return _stats; }
 
+    // What a request that ran on this node hands back. `routing_info` is set when the
+    // request carried a tablet version block that doesn't match the tablet's current
+    // version: the driver's routing cache is stale, and this is what it should hold
+    // instead. `tablet_version_block` below is that block, when the driver sent one.
+    struct mutate_result {
+        std::optional<locator::tablet_routing_info_v2> routing_info;
+    };
     using mutation_gen = noncopyable_function<mutation(api::timestamp_type)>;
-    future<value_or_redirect<>> mutate(schema_ptr schema, 
+    future<value_or_redirect<mutate_result>> mutate(schema_ptr schema,
         const dht::token& token,
         mutation_gen&& mutation_gen,
         timeout_clock::time_point timeout,
-        abort_source& as);
+        abort_source& as,
+        std::optional<locator::tablet_version_block> tablet_version_block);
 
-    using query_result_type = value_or_redirect<lw_shared_ptr<query::result>>;
+    struct query_result {
+        lw_shared_ptr<query::result> result;
+        std::optional<locator::tablet_routing_info_v2> routing_info;
+    };
+    using query_result_type = value_or_redirect<query_result>;
     future<query_result_type> query(schema_ptr schema,
         const query::read_command& cmd,
         const dht::partition_range_vector& ranges,
         read_type rtype,
         tracing::trace_state_ptr trace_state,
         timeout_clock::time_point timeout,
-        abort_source& as);
+        abort_source& as,
+        std::optional<locator::tablet_version_block> tablet_version_block);
 
     // Sends an RPC to every host that holds a tablet replica of the given table, asking it to wait
     // until the raft groups for those tablets are started and ready to serve queries.
     // For the local node, waits directly without an RPC.
     future<> wait_for_table_raft_groups_on_all_hosts(table_id table, lowres_clock::time_point timeout);
 
-    const groups_manager& get_groups_manager() const noexcept {
+    groups_manager& get_groups_manager() const noexcept {
         return _groups_manager;
     }
 };

@@ -27,7 +27,6 @@ endfunction()
 set(swagger_files
   api-doc/authorization_cache.json
   api-doc/cache_service.json
-  api-doc/collectd.json
   api-doc/column_family.json
   api-doc/commitlog.json
   api-doc/compaction_manager.json
@@ -70,7 +69,6 @@ target_sources(api
     api.cc
     cache_service.cc
     client_routes.cc
-    collectd.cc
     column_family.cc
     commitlog.cc
     compaction_manager.cc
@@ -95,6 +93,7 @@ target_sources(api
     task_manager.cc
     task_manager_test.cc
     token_metadata.cc
+    utils.cc
     ${swagger_gen_files})
 target_include_directories(api
   PUBLIC

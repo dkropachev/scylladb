@@ -17,12 +17,16 @@ on:
         default: 'scylladb/scylladb'
         type: string
 
+# Deny all by default; each job grants only what it needs.
+permissions: {}
+
 jobs:
   route-ci:
     # Run on:
     # 1. PR events (opened/reopened/synchronize/ready_for_review) for non-draft PRs
     # 2. PR unlabeled event when 'conflicts' label is removed
-    # 3. issue_comment event when a non-bot org member comments '@scylladbbot trigger-ci'
+    # 3. issue_comment event when a non-bot org member comments an @scylladbbot
+    #    command: 'trigger-ci', 'trigger-thin-ci' (thin CI on a draft PR) or 'help'
     # 4. workflow_dispatch (manual trigger for testing)
     if: |
       github.event_name == 'workflow_dispatch' ||
@@ -49,11 +53,8 @@ jobs:
           gh_api_retry() {
             local max_attempts=4 attempt=1 delay=1 output rc http_code
             while [ $attempt -le $max_attempts ]; do
-              # Capture the exit code immediately: after `if cmd; then ...; fi`
-              # with a false condition and no else, bash resets $? to 0, which
-              # would make a failed call look successful.
-              output=$(gh api "$@" 2>&1)
-              rc=$?
+              rc=0
+              output=$(gh api "$@" 2>&1) || rc=$?
               if [ $rc -eq 0 ]; then
                 # Only emit when there is output: --silent calls produce none,
                 # and an unconditional trailing newline would corrupt callers
@@ -110,11 +111,51 @@ jobs:
           # (no lines left), which would otherwise fail the step under `bash -e`.
           CLEAN_BODY=$(echo "$COMMENT_BODY" | grep -v '^[[:space:]]*>' || true)
 
-          if echo "$CLEAN_BODY" | grep -qi '@scylladbbot' && echo "$CLEAN_BODY" | grep -qi 'trigger-ci'; then
+          # Supported commands:
+          #   @scylladbbot trigger-thin-ci - thin CI on a draft PR
+          #   @scylladbbot help            - list the available commands
+          #   @scylladbbot trigger-ci      - full CI (loosely matched, as before)
+          # 'run-for-draft', the old name of 'trigger-thin-ci', is still
+          # accepted but no longer advertised.
+          # 'valid' means "go on and trigger CI"; 'command' tells the later
+          # steps which command was requested.
+          if echo "$CLEAN_BODY" | grep -qiE '@scylladbbot[[:space:]]+(trigger-thin-ci|run-for-draft)\b'; then
+            echo "command=trigger-thin-ci" >> "$GITHUB_OUTPUT"
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+          elif echo "$CLEAN_BODY" | grep -qiE '@scylladbbot[[:space:]]+/?help\b'; then
+            echo "command=help" >> "$GITHUB_OUTPUT"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          elif echo "$CLEAN_BODY" | grep -qi '@scylladbbot' && echo "$CLEAN_BODY" | grep -qi 'trigger-ci'; then
+            echo "command=trigger-ci" >> "$GITHUB_OUTPUT"
             echo "valid=true" >> "$GITHUB_OUTPUT"
           else
             echo "valid=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Reply to help command
+        if: github.event_name == 'issue_comment' && steps.comment-check.outputs.command == 'help'
+        env:
+          # Reply as scylladbbot rather than github-actions[bot]. Its own
+          # comments are excluded by the job-level 'if', so the command list
+          # in this reply cannot re-trigger the workflow.
+          GH_TOKEN: ${{ secrets.AUTO_BACKPORT_TOKEN }}
+          PR_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          ACTOR: ${{ github.event.comment.user.login }}
+        shell: bash
+        run: |
+          BODY=$(cat << 'HELP_EOF'
+          Available `@scylladbbot` commands (scylladb org members only):
+
+          | Command | Description |
+          |---------|-------------|
+          | `@scylladbbot trigger-ci` | Trigger a full CI run for this PR. |
+          | `@scylladbbot trigger-thin-ci` | Trigger a thin CI run (dev-mode build + unit tests, no dtest or artifact tests) for a **draft** PR. Runs once per comment; comment again after pushing new changes. |
+          | `@scylladbbot help` | Show this message. |
+          HELP_EOF
+          )
+          gh_api_retry "repos/$PR_REPO/issues/$PR_NUMBER/comments" -f body="@${ACTOR} ${BODY}" --silent \
+            || echo "::warning::Failed to post help reply on PR #$PR_NUMBER"
 
       - name: Resolve PR context
         if: github.event_name != 'issue_comment' || steps.comment-check.outputs.valid == 'true'
@@ -135,6 +176,10 @@ jobs:
           AFTER_SHA: ${{ github.event.after }}
           # Comment event context
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_COMMAND: ${{ steps.comment-check.outputs.command }}
+          COMMENT_ACTOR: ${{ github.event.comment.user.login }}
+          # Replies to @scylladbbot commands are posted as scylladbbot
+          BOT_TOKEN: ${{ secrets.AUTO_BACKPORT_TOKEN }}
           # Manual dispatch context
           DISPATCH_PR_NUMBER: ${{ github.event.inputs.pr_number }}
           DISPATCH_TARGET_REPO: ${{ github.event.inputs.target_repo }}
@@ -170,11 +215,32 @@ jobs:
             PR_URL="$PR_URL_FROM_EVENT"
           fi
 
-          # Skip draft PRs
-          if [ "$PR_DRAFT" = "true" ]; then
-            echo "::warning::PR #$PR_NUMBER is a draft, skipping CI trigger"
+          # '@scylladbbot trigger-thin-ci' only makes sense on a draft PR; point
+          # the commenter at 'trigger-ci' instead of silently doing nothing.
+          if [ "$EVENT_NAME" = "issue_comment" ] && [ "$COMMENT_COMMAND" = "trigger-thin-ci" ] && [ "$PR_DRAFT" != "true" ]; then
+            echo "::warning::PR #$PR_NUMBER is not a draft; ignoring '@scylladbbot trigger-thin-ci'"
+            GH_TOKEN="$BOT_TOKEN" gh_api_retry "repos/$PR_REPO/issues/$PR_NUMBER/comments" \
+              -f body="@${COMMENT_ACTOR} this PR is not a draft, so \`trigger-thin-ci\` does not apply. Use \`@scylladbbot trigger-ci\` to run full CI." --silent || true
             echo "should_continue=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          # Draft PRs get no CI by default. They get a thin (dev-mode only) CI
+          # run when an org member comments '@scylladbbot trigger-thin-ci'.
+          THIN_CI=false
+          if [ "$PR_DRAFT" = "true" ]; then
+            if [ "$EVENT_NAME" = "issue_comment" ] && [ "$COMMENT_COMMAND" = "trigger-thin-ci" ]; then
+              echo "PR #$PR_NUMBER is a draft and '@scylladbbot trigger-thin-ci' was requested, running thin CI"
+              THIN_CI=true
+            else
+              echo "::warning::PR #$PR_NUMBER is a draft, skipping CI trigger"
+              if [ "$EVENT_NAME" = "issue_comment" ]; then
+                GH_TOKEN="$BOT_TOKEN" gh_api_retry "repos/$PR_REPO/issues/$PR_NUMBER/comments" \
+                  -f body="@${COMMENT_ACTOR} this PR is a draft, so full CI was not triggered. Use \`@scylladbbot trigger-thin-ci\` for a thin CI run, or mark the PR ready for review." --silent || true
+              fi
+              echo "should_continue=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
           # Check for code changes on synchronize (skip commit-message-only pushes)
@@ -197,6 +263,7 @@ jobs:
           echo "pr_user=$PR_USER" >> "$GITHUB_OUTPUT"
           echo "base_branch=$BASE_BRANCH" >> "$GITHUB_OUTPUT"
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "thin_ci=$THIN_CI" >> "$GITHUB_OUTPUT"
 
       - name: Check if docs-only PR
         if: steps.resolve-pr.outputs.should_continue == 'true'
@@ -333,7 +400,7 @@ jobs:
             # unstick once GitHub resolves it) -- fall back to the label state.
             echo "::warning::GitHub did not determine mergeability for $PR_URL yet; falling back to the 'conflicts' label state"
           elif [ "$MERGEABLE_STATE" = "clean" ] && [ "$HAS_CONFLICTS" = "true" ]; then
-            # The 'conflicts' label is stale: nothing removes it once applied (RELENG-804),
+            # The 'conflicts' label is stale: nothing removes it once applied,
             # so a PR that resolved its conflicts (e.g. via a force-push) stayed blocked from
             # CI forever. GitHub now reports it as cleanly mergeable, so trust that over the
             # label and clean it up.
@@ -415,21 +482,26 @@ jobs:
             fi
           done <<< "$ALL_FILES"
 
-          # dtest: required if any file does NOT match test*, dist/docker/*, dist/common/scripts/*
+          # Files that cannot affect dtest or unit-test results:
+          # docs/, .github/, *.md at any depth, root repo-metadata dotfiles,
+          # licenses/, NOTICE.txt and ORIGIN.
+          NON_CODE='docs/|\.github/|(.*/)?[^/]+\.md$|\.(clang-format|coderabbit\.yaml|dockerignore|gitattributes|gitignore|gitorderfile|mailmap)$|licenses/|NOTICE\.txt$|ORIGIN$'
+
+          # dtest: required if any file does NOT match test*, dist/docker/*, dist/common/scripts/*, NON_CODE
           DTEST_REQUIRED=false
           while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
-            if ! echo "$FILE" | grep -qE '^(test(\.py|/)|dist/docker/|dist/common/scripts/)'; then
+            if ! echo "$FILE" | grep -qE "^(test(\.py|/)|dist/docker/|dist/common/scripts/|$NON_CODE)"; then
               DTEST_REQUIRED=true
               break
             fi
           done <<< "$ALL_FILES"
 
-          # unittest: required if any file does NOT match dist/docker/*, dist/common/scripts*
+          # unittest: required if any file does NOT match dist/docker/*, dist/common/scripts*, NON_CODE
           UNITTEST_REQUIRED=false
           while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
-            if ! echo "$FILE" | grep -qE '^(dist/docker/|dist/common/scripts)'; then
+            if ! echo "$FILE" | grep -qE "^(dist/docker/|dist/common/scripts|$NON_CODE)"; then
               UNITTEST_REQUIRED=true
               break
             fi
@@ -456,7 +528,7 @@ jobs:
           fi
 
           # scylla_gdb: run ONLY the scylla_gdb suite if EVERY changed file matches
-          # scylla-gdb.py or test/scylla_gdb/* (RELENG-638). A PR changing only
+          # scylla-gdb.py or test/scylla_gdb/*. A PR changing only
           # scylla-gdb.py is treated the same as one changing only test/scylla_gdb.
           GDB_REQUIRED=false
           GDB_HAS_FILES=false
@@ -475,6 +547,13 @@ jobs:
             # restricts the run to includeTests=scylla_gdb instead of all unit tests.
             DTEST_REQUIRED=false
             UNITTEST_REQUIRED=false
+            ARTIFACTS_REQUIRED=false
+          fi
+
+          # Thin CI for draft PRs: dev-mode build + unit tests only,
+          # never dtest or artifact tests.
+          if [ "${{ steps.resolve-pr.outputs.thin_ci }}" = "true" ]; then
+            DTEST_REQUIRED=false
             ARTIFACTS_REQUIRED=false
           fi
 
@@ -544,6 +623,7 @@ jobs:
           FORCE_ON_CLOUD="${{ steps.pr-details.outputs.force_on_cloud }}"
           RUN_GDB_ONLY="${{ steps.required-checks.outputs.gdb_required }}"
           PYTEST_EXTRA_OPTIONS="${{ steps.pr-details.outputs.pytest_extra_options }}"
+          THIN_CI="${{ steps.resolve-pr.outputs.thin_ci }}"
 
           echo "Routing to $TARGET_FOLDER/scylla-ci with:"
           echo "  PR_NUMBER=$PR_NUMBER"
@@ -554,6 +634,7 @@ jobs:
           echo "  FORCE_ON_CLOUD=$FORCE_ON_CLOUD"
           echo "  RUN_ONLY_SCYLLA_GDB=$RUN_GDB_ONLY"
           echo "  PYTEST_EXTRA_COMMANDLINE_OPTIONS=$PYTEST_EXTRA_OPTIONS"
+          echo "  THIN_CI=$THIN_CI"
 
           JOB_PATH="$TARGET_FOLDER/job/scylla-ci"
 
@@ -569,6 +650,7 @@ jobs:
             --data-urlencode "FORCE_ON_CLOUD=$FORCE_ON_CLOUD" \
             --data-urlencode "RUN_ONLY_SCYLLA_GDB=$RUN_GDB_ONLY" \
             --data-urlencode "PYTEST_EXTRA_COMMANDLINE_OPTIONS=$PYTEST_EXTRA_OPTIONS" \
+            --data-urlencode "THIN_CI=$THIN_CI" \
             -w "\n%{http_code}")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)

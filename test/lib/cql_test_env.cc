@@ -48,6 +48,7 @@
 #include "auth/common.hh"
 #include "db/config.hh"
 #include "db/batchlog_manager.hh"
+#include "db/cluster_config_manager.hh"
 #include "schema/schema_builder.hh"
 #include "schema/compression_initializer.hh"
 #include "schema/speculative_retry_initializer.hh"
@@ -169,6 +170,7 @@ private:
     sharded<netw::walltime_compressor_tracker> _compressor_tracker;
     sharded<service::migration_manager> _mm;
     sharded<db::batchlog_manager> _batchlog_manager;
+    sharded<db::cluster_config_manager> _cluster_config_manager;
     sharded<gms::gossiper> _gossiper;
     sharded<service::raft_group_registry> _group0_registry;
     sharded<db::system_keyspace> _sys_ks;
@@ -397,6 +399,10 @@ public:
         return _batchlog_manager;
     }
 
+    virtual sharded<db::cluster_config_manager>& cluster_config_manager() override {
+        return _cluster_config_manager;
+    }
+
     virtual sharded<netw::messaging_service>& get_messaging_service() override {
         return _ms;
     }
@@ -449,10 +455,6 @@ public:
         return _task_manager;
     }
 
-    virtual sharded<locator::shared_token_metadata>& get_shared_token_metadata() override {
-        return _token_metadata;
-    }
-
     virtual sharded<service::topology_state_machine>& get_topology_state_machine() override {
         return _topology_state_machine;
     }
@@ -472,6 +474,14 @@ public:
         }
         if (cfg.strongly_consistent_tables) {
             options += " and consistency = 'global'";
+        }
+        if (cfg.keyspace_storage_options) {
+            // storage_options::from_map() takes the type plus the entries to_map() emits.
+            sstring storage = format("'type': '{}'", cfg.keyspace_storage_options->type_string());
+            for (const auto& [key, value] : cfg.keyspace_storage_options->to_map()) {
+                storage += format(", '{}': '{}'", key, value);
+            }
+            options += format(" and storage = {{{}}}", storage);
         }
         auto query = seastar::format("create keyspace {} with replication = {{ 'class' : 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'replication_factor' : 1}}{};", name,
                             options);
@@ -591,8 +601,8 @@ private:
             create_directories(cfg->hints_directory().c_str());
             create_directories(cfg->view_hints_directory().c_str());
             for (unsigned i = 0; i < this_smp_shard_count(); ++i) {
-                create_directories((cfg->hints_directory() + "/" + std::to_string(i)).c_str());
-                create_directories((cfg->view_hints_directory() + "/" + std::to_string(i)).c_str());
+                create_directories(seastar::format("{}/{}", cfg->hints_directory(), i).c_str());
+                create_directories(seastar::format("{}/{}", cfg->view_hints_directory(), i).c_str());
             }
 
             if (!cfg->max_memory_for_unlimited_query_soft_limit.is_set()) {
@@ -800,6 +810,11 @@ private:
 
             _qp.start(std::ref(_proxy), std::move(local_data_dict), std::ref(_mnotifier), std::ref(_vector_store_client), qp_mcfg, std::ref(_cql_config), auth_prep_cache_config, std::ref(_lang_manager)).get();
             auto stop_qp = defer_verbose_shutdown("query processor", [this] { _qp.stop().get(); });
+
+            _cluster_config_manager.start(std::ref(_cluster_config_manager), std::ref(_db), std::ref(_qp)).get();
+            auto stop_cluster_config_manager = defer_verbose_shutdown("cluster config manager", [this] {
+                _cluster_config_manager.stop().get();
+            });
 
             _elc_notif.start().get();
             auto stop_elc_notif = defer_verbose_shutdown("lifecycle notifier", [this] { _elc_notif.stop().get(); });
@@ -1156,6 +1171,8 @@ private:
                 group0_service.setup_group0_if_exist(_sys_ks.local(), _ss.local(), _qp.local(), _mm.local()).get();
                 group0_service.enable_group0_state_machine().get();
             }
+            // As in main(): the first authoritative refresh runs once the group0 state is applied.
+            _cluster_config_manager.local().refresh().get();
             _groups_manager.invoke_on_all([](service::strong_consistency::groups_manager& m) {
                 return m.start();
             }).get();

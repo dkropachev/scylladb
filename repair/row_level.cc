@@ -1233,7 +1233,7 @@ private:
             _rs._repair_compaction_locks[gid].push_back(std::move(lock_holder));
         }
         auto sstables = co_await table.take_storage_snapshot(_range);
-        _incremental_repair_meta.sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(_schema, _range));
+        _incremental_repair_meta.sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(_schema));
         _incremental_repair_meta.sstables_repaired_at = sstables_repaired_at;
         for (auto& snap : sstables) {
             co_await coroutine::maybe_yield();
@@ -1817,9 +1817,15 @@ public:
         rlogger.debug(">>> Started Row Level Repair (Follower): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_siz={}",
                 repair.my_host_id(), from_id, repair_meta_id, ks_name, cf_name, schema_version, range, seed, max_row_buf_size);
         try {
-            // Trigger read barrier to ensure that session_id is visible.
-            auto& mm = repair.get_migration_manager();
-            co_await mm.get_group0_barrier().trigger(mm.get_abort_source());
+            if (topo_guard != service::null_topology_guard) {
+                // Trigger read barrier to ensure that session_id is visible.
+                // Repairs without a session (user requested repair) have nothing
+                // to make visible, so skip the barrier: it is a raft round trip
+                // per range, serialized on the node wide group0 operation mutex,
+                // and a transient failure would fail the whole repair.
+                auto& mm = repair.get_migration_manager();
+                co_await mm.get_group0_barrier().trigger(mm.get_abort_source());
+            }
             co_await repair.insert_repair_meta(from_id, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason, compaction_time, as, topo_guard, repaired_at, incremental_mode);
             co_return repair_row_level_start_response{repair_row_level_start_status::ok};
         } catch (replica::no_such_column_family&) {
@@ -2216,9 +2222,15 @@ public:
         //     group at capture time (no cross-CG routing mismatch), and
         //   - no concurrent compaction (split bypass, regular minor compaction,
         //     etc.) can move the inputs to a different CG mid-rewrite.
+        //
+        // Sstables which are already repaired (included by full mode) are left
+        // alone. Bumping their repaired_at would take them out of the repaired
+        // set until sstables_repaired_at is committed, or indefinitely if the
+        // repair fails, allowing repaired compaction to purge a tombstone that
+        // shadows their data.
         std::unordered_set<sstables::shared_sstable> repair_set;
         auto add_sstable = [&] (const sstables::shared_sstable& sst) {
-            if (sst->should_update_repaired_at(repaired_at)) {
+            if (sst->should_update_repaired_at(repaired_at) && !repair::is_repaired(_incremental_repair_meta.sstables_repaired_at, sst)) {
                 rlogger.info("Marking sstable={} repaired_at={} being_repaired={} for incremental repair",
                              sst->toc_filename(), repaired_at, sst->being_repaired);
                 repair_set.insert(sst);
@@ -2249,7 +2261,7 @@ public:
         // perform_component_rewrite which captures sstables while compaction
         // is disabled on the target view.
         auto rewritten_sstables = co_await table.perform_component_rewrite(
-                _range, tasks::task_info{}, filter,
+                _range, tasks::make_empty_task_info(), filter,
                 sstables::component_type::Statistics, modifier);
         // FIXME: indent.
             // remove the old sstables from incremental repair meta and add the new ones
@@ -3011,8 +3023,57 @@ static void add_to_repair_meta_for_followers(repair_meta& rm) {
     debug::repair_meta_for_followers.add(rm);
 }
 
+// Ring tokens split the token ring into vnode ranges (t1, t2], each with its
+// own replica set. A token range therefore lies within a single vnode range,
+// and thus has a single replica set, iff no ring token splits it. A ring
+// token t splits a range iff the range covers tokens on both sides of the
+// boundary, i.e. some token <= t and some token > t.
+//
+// Returns the first ring token that splits the given non-wrapping range, or
+// std::nullopt if the range lies within a single vnode range.
+//
+// Example: with sorted ring tokens {10, 20, 30} the vnode ranges are
+// (10, 20], (20, 30] and the wrap-around one owning tokens above 30 and up
+// to 10. Then:
+//
+//   (10, 20] -> nullopt: exactly one vnode range. The first ring token the
+//              range covers is 20 and the range does not extend past it.
+//   (12, 18] -> nullopt: sub-range of (10, 20], ends before ring token 20.
+//   (10, 25] -> 20: covers tokens on both sides of 20 (e.g. 15 and 25), so
+//              the boundary splits it into (10, 20] and (20, 25], whose
+//              replica sets may differ.
+//   (5, 30]  -> 10: crosses 10 and 20; the first splitting token is
+//              returned.
+//   (30, max] -> nullopt: no ring token above 30, the whole range belongs
+//              to the wrap-around vnode range.
+//   [20, 25] -> 20: with an inclusive start the range covers token 20
+//              itself, which belongs to (10, 20], while the tokens after it
+//              belong to (20, 30].
+static std::optional<dht::token> ring_token_splitting_range(const dht::token_range& range, const utils::chunked_vector<dht::token>& sorted_tokens) {
+    // Find the first ring token t such that the range covers some token <= t:
+    // with an inclusive start s that is the first ring token >= s, with an
+    // exclusive start the first ring token > s, and with no start bound any
+    // ring token qualifies.
+    auto t = sorted_tokens.begin();
+    if (const auto& start = range.start()) {
+        t = start->is_inclusive()
+                ? std::lower_bound(sorted_tokens.begin(), sorted_tokens.end(), start->value())
+                : std::upper_bound(sorted_tokens.begin(), sorted_tokens.end(), start->value());
+    }
+    if (t == sorted_tokens.end()) {
+        return std::nullopt;
+    }
+    // The range covers tokens > *t iff it extends past *t. A range ending
+    // exactly on *t is the tail of the vnode range (previous_token, *t].
+    auto last_token = range.end() ? range.end()->value() : dht::maximum_token();
+    if (*t < last_token) {
+        return *t;
+    }
+    return std::nullopt;
+}
+
 class row_level_repair {
-    repair::shard_repair_task_impl& _shard_task;
+    shard_repair_state& _rstate;
     sstring _cf_name;
     table_id _table_id;
     dht::token_range _range;
@@ -3066,26 +3127,24 @@ class row_level_repair {
     service::frozen_topology_guard _topo_guard;
 
 public:
-    row_level_repair(repair::shard_repair_task_impl& shard_task,
+    row_level_repair(shard_repair_state& rstate,
             sstring cf_name,
             table_id table_id,
             dht::token_range range,
             std::vector<locator::host_id> all_live_peer_nodes,
-            bool small_table_optimization,
-            gc_clock::time_point start_time,
-            service::frozen_topology_guard topo_guard)
-        : _shard_task(shard_task)
+            gc_clock::time_point start_time)
+        : _rstate(rstate)
         , _cf_name(std::move(cf_name))
         , _table_id(std::move(table_id))
         , _range(std::move(range))
         , _all_live_peer_nodes(sort_peer_nodes(all_live_peer_nodes))
-        , _small_table_optimization(small_table_optimization)
+        , _small_table_optimization(rstate.small_table_optimization)
         , _seed(get_random_seed())
         , _start_time(start_time)
-        , _is_tablet(_shard_task.db.local().find_column_family(_table_id).uses_tablets())
-        , _topo_guard(topo_guard)
+        , _is_tablet(_rstate.db.local().find_column_family(_table_id).uses_tablets())
+        , _topo_guard(rstate.get_frozen_topology_guard())
     {
-        repair_neighbors r_neighbors = _shard_task.get_repair_neighbors(_range);
+        repair_neighbors r_neighbors = _rstate.get_repair_neighbors(_range);
         auto& map = r_neighbors.shard_map;
         for (auto& n : _all_live_peer_nodes) {
             auto it = map.find(n);
@@ -3128,7 +3187,7 @@ private:
 
     // Step A: Negotiate sync boundary to use
     op_status negotiate_sync_boundary(repair_meta& master) {
-        _shard_task.check_in_abort_or_shutdown();
+        _rstate.check_in_abort_or_shutdown();
         _sync_boundaries.clear();
         _combined_hashes.clear();
         _zero_rows = false;
@@ -3161,7 +3220,7 @@ private:
             } catch (...) {
                 auto ep = std::current_exception();
                 rlogger.warn("repair[{}]: get_sync_boundary: got error from node={}, keyspace={}, table={}, range={}, error={}",
-                        _shard_task.global_repair_id.uuid(), node, _shard_task.get_keyspace(), _cf_name, _range, ep);
+                        _rstate.global_repair_id.uuid(), node, _rstate.get_keyspace(), _cf_name, _range, ep);
                 std::rethrow_exception(ep);
             }
         })).get();
@@ -3194,7 +3253,7 @@ private:
 
     // Step B: Get missing rows from peer nodes so that local node contains all the rows
     op_status get_missing_rows_from_follower_nodes(repair_meta& master) {
-        _shard_task.check_in_abort_or_shutdown();
+        _rstate.check_in_abort_or_shutdown();
         // `combined_hashes` contains the combined hashes for the
         // `_working_row_buf`. Like `_row_buf`, `_working_row_buf` contains
         // rows which are within the (_last_sync_boundary, _current_sync_boundary]
@@ -3227,7 +3286,7 @@ private:
                 auto ep = std::current_exception();
                 auto& node = master.all_nodes()[idx].node;
                 rlogger.warn("repair[{}]: get_combined_row_hash: got error from node={}, keyspace={}, table={}, range={}, error={}",
-                        _shard_task.global_repair_id.uuid(), node, _shard_task.get_keyspace(), _cf_name, _range, ep);
+                        _rstate.global_repair_id.uuid(), node, _rstate.get_keyspace(), _cf_name, _range, ep);
                 std::rethrow_exception(ep);
             }
         })).get();
@@ -3328,7 +3387,7 @@ private:
             rlogger.debug("After get_row_diff node {}, hash_sets={}", master.myhostid(), master.working_row_hashes().get().size());
           } catch (...) {
             rlogger.warn("repair[{}]: get_row_diff: got error from node={}, keyspace={}, table={}, range={}, error={}",
-                    _shard_task.global_repair_id.uuid(), node, _shard_task.get_keyspace(), _cf_name, _range, std::current_exception());
+                    _rstate.global_repair_id.uuid(), node, _rstate.get_keyspace(), _cf_name, _range, std::current_exception());
             throw;
           }
         }
@@ -3340,7 +3399,7 @@ private:
     void send_missing_rows_to_follower_nodes(repair_meta& master) {
         // At this time, repair master contains all the rows between (_last_sync_boundary, _current_sync_boundary]
         // So we can figure out which rows peer node are missing and send the missing rows to them
-        _shard_task.check_in_abort_or_shutdown();
+        _rstate.check_in_abort_or_shutdown();
         repair_hash_set local_row_hash_sets = master.working_row_hashes().get();
         auto sz = _all_live_peer_nodes.size();
         std::vector<repair_hash_set> set_diffs(sz);
@@ -3362,7 +3421,7 @@ private:
                 } catch (...) {
                     std::exception_ptr ep = std::current_exception();
                     rlogger.warn("repair[{}]: put_row_diff: got error from node={}, keyspace={}, table={}, range={}, error={}",
-                            _shard_task.global_repair_id.uuid(), node, _shard_task.get_keyspace(), _cf_name, _range, ep);
+                            _rstate.global_repair_id.uuid(), node, _rstate.get_keyspace(), _cf_name, _range, ep);
                     std::rethrow_exception(ep);
                 }
 
@@ -3374,7 +3433,7 @@ private:
                 } catch (...) {
                     std::exception_ptr ep = std::current_exception();
                     rlogger.warn("repair[{}]: put_row_diff: got error from node={}, keyspace={}, table={}, range={}, error={}",
-                            _shard_task.global_repair_id.uuid(), node, _shard_task.get_keyspace(), _cf_name, _range, ep);
+                            _rstate.global_repair_id.uuid(), node, _rstate.get_keyspace(), _cf_name, _range, ep);
                     std::rethrow_exception(ep);
                 }
             }
@@ -3384,54 +3443,90 @@ private:
 
 private:
     locator::effective_replication_map_ptr get_erm() {
-        return _shard_task.get_erm();
+        return _rstate.get_erm();
     }
 
 private:
     // Update system.repair_history table
     future<> update_system_repair_table() {
         // Update repair_history table only if it is a reguar repair.
-        if (_shard_task.reason() != streaming::stream_reason::repair) {
+        if (_rstate.reason() != streaming::stream_reason::repair) {
             co_return;
         }
-        auto my_address = get_erm()->get_topology().my_host_id();
-        // Update repair_history table only if all replicas have been repaired
-        size_t repaired_replicas = _all_live_peer_nodes.size() + 1;
-        if (_shard_task.get_total_rf() != repaired_replicas){
-            rlogger.debug("repair[{}]: Skipped to update system.repair_history total_rf={}, repaired_replicas={}, local={}, peers={}",
-                    _shard_task.global_repair_id.uuid(), _shard_task.get_total_rf(), repaired_replicas, my_address, _all_live_peer_nodes);
+        auto erm = get_erm();
+        auto my_address = erm->get_topology().my_host_id();
+        // Update repair_history table only if all replicas of the range have
+        // been repaired. Compare the participants against the range's
+        // replicas, not just their count: recording the range as repaired
+        // unlocks tombstone GC on it on the participants, so a wrong
+        // participant set of the right size could let them purge tombstones
+        // while a replica that did not participate still holds data the
+        // tombstones cover, resurrecting it.
+        auto end_token = _range.end() ? _range.end()->value() : dht::maximum_token();
+        std::unordered_set<locator::host_id> replicas;
+        if (_small_table_optimization) {
+            // With the small table optimization the repaired range is the
+            // whole ring and the required participants are all normal token
+            // owners, see get_neighbors().
+            replicas = erm->get_token_metadata().get_normal_token_owners();
+        } else {
+            // The replicas are resolved from the range's end token, which is
+            // correct only if the whole range has a single replica set. All
+            // callers uphold this: user-requested repair splits the requested
+            // ranges on the local replica-set boundaries, and tablet repair
+            // ranges never span tablets. Check this precondition, it is what
+            // makes the comparison below exact.
+            if (_is_tablet) {
+                const auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(_table_id);
+                auto tablet_range = tmap.get_token_range(tmap.get_tablet_id(end_token));
+                if (!tablet_range.contains(_range, dht::token_comparator())) {
+                    on_internal_error(rlogger, format("update_system_repair_table(): repair range {} spans multiple tablets, the end token's tablet range is {}",
+                            _range, tablet_range));
+                }
+            } else if (auto boundary = ring_token_splitting_range(_range, erm->get_token_metadata().sorted_tokens())) {
+                on_internal_error(rlogger, format("update_system_repair_table(): repair range {} spans multiple vnode ranges, it crosses the ring token {}",
+                        _range, *boundary));
+            }
+            auto natural_replicas = erm->get_natural_replicas(end_token);
+            replicas = std::unordered_set<locator::host_id>(natural_replicas.begin(), natural_replicas.end());
+        }
+        auto repaired_nodes = std::unordered_set<locator::host_id>(_all_live_peer_nodes.begin(), _all_live_peer_nodes.end());
+        repaired_nodes.insert(my_address);
+        if (replicas != repaired_nodes) {
+            rlogger.debug("repair[{}]: Skipped to update system.repair_history replicas={}, local={}, peers={}",
+                    _rstate.global_repair_id.uuid(), replicas, my_address, _all_live_peer_nodes);
             co_return;
         }
         // Update repair_history table only if both hints and batchlog have been flushed.
-        if (!_shard_task.hints_batchlog_flushed()) {
+        if (!_rstate.hints_batchlog_flushed) {
             co_return;
         }
 
         // The tablet repair time for tombstone gc will be updated when the
         // system.tablet.repair_time is updated.
-        if (_is_tablet && _shard_task.sched_info.sched_by_scheduler) {
-            rlogger.debug("repair[{}]: Skipped to update system.repair_history for tablet repair scheduled by scheduler total_rf={} repaired_replicas={} local={} peers={}",
-                    _shard_task.global_repair_id.uuid(), _shard_task.get_total_rf(), repaired_replicas, my_address, _all_live_peer_nodes);
+        if (_is_tablet && _rstate.sched_info.sched_by_scheduler) {
+            rlogger.debug("repair[{}]: Skipped to update system.repair_history for tablet repair scheduled by scheduler replicas={} local={} peers={}",
+                    _rstate.global_repair_id.uuid(), replicas, my_address, _all_live_peer_nodes);
             co_return;
         }
 
-        repair_service& rs = _shard_task.rs;
-        std::optional<gc_clock::time_point> repair_time_opt = co_await rs.update_history(_shard_task.global_repair_id.uuid(), _table_id, _range, _start_time, _is_tablet);
+        repair_service& rs = _rstate.rs;
+        std::optional<gc_clock::time_point> repair_time_opt = co_await rs.update_history(_rstate.global_repair_id.uuid(), _table_id, _range, _start_time, _is_tablet);
         if (!repair_time_opt) {
             co_return;
         }
         auto repair_time = repair_time_opt.value();
-        repair_update_system_table_request req{_shard_task.global_repair_id.uuid(), _table_id, _shard_task.get_keyspace(), _cf_name, _range, repair_time};
+        repair_update_system_table_request req{_rstate.global_repair_id.uuid(), _table_id, _rstate.get_keyspace(), _cf_name, _range, repair_time};
         auto all_nodes = _all_live_peer_nodes;
         all_nodes.push_back(my_address);
         co_await coroutine::parallel_for_each(all_nodes, [this, req] (locator::host_id node) -> future<> {
             try {
-                auto& ms = _shard_task.messaging.local();
+                auto& ms = _rstate.messaging.local();
                 repair_update_system_table_response resp = co_await ser::repair_rpc_verbs::send_repair_update_system_table(&ms, node, req);
                 (void)resp;  // nothing to do with the response yet
-                rlogger.debug("repair[{}]: Finished to update system.repair_history table of node {}", _shard_task.global_repair_id.uuid(), node);
+                rlogger.debug("repair[{}]: Finished to update system.repair_history table of node {}", _rstate.global_repair_id.uuid(), node);
             } catch (...) {
-                rlogger.warn("repair[{}]: Failed to update system.repair_history table of node {}: {}", _shard_task.global_repair_id.uuid(), node, std::current_exception());
+                rlogger.warn("repair[{}]: Failed to update system.repair_history table of node {}: {:t}", _rstate.global_repair_id.uuid(), node, std::current_exception());
             }
         });
         co_return;
@@ -3440,11 +3535,11 @@ private:
 public:
     future<> run() {
         return seastar::async([this] {
-            _shard_task.check_in_abort_or_shutdown();
-            auto repair_meta_id = _shard_task.rs.get_next_repair_meta_id().get();
-            auto algorithm = get_common_diff_detect_algorithm(_shard_task.messaging.local(), _all_live_peer_nodes);
+            _rstate.check_in_abort_or_shutdown();
+            auto repair_meta_id = _rstate.rs.get_next_repair_meta_id().get();
+            auto algorithm = get_common_diff_detect_algorithm(_rstate.messaging.local(), _all_live_peer_nodes);
             auto max_row_buf_size = get_max_row_buf_size(algorithm);
-            auto& cf = _shard_task.db.local().find_column_family(_table_id);
+            auto& cf = _rstate.db.local().find_column_family(_table_id);
             auto& sharder = cf.get_effective_replication_map()->get_sharder(*(cf.schema()));
             auto master_node_shard_config = shard_config {
                     this_shard_id(),
@@ -3455,27 +3550,27 @@ public:
             auto schema_version = s->version();
             bool table_dropped = false;
 
-            auto& mem_sem = _shard_task.rs.memory_sem();
-            auto max = _shard_task.rs.max_repair_memory();
+            auto& mem_sem = _rstate.rs.memory_sem();
+            auto max = _rstate.rs.max_repair_memory();
             auto wanted = (_all_live_peer_nodes.size() + 1) * max_row_buf_size;
             wanted = std::min(max, wanted);
             rlogger.trace("repair[{}]: Started to get memory budget, wanted={}, available={}, max_repair_memory={}",
-                    _shard_task.global_repair_id.uuid(), wanted, mem_sem.current(), max);
+                    _rstate.global_repair_id.uuid(), wanted, mem_sem.current(), max);
             auto mem_permit = seastar::get_units(mem_sem, wanted).get();
             rlogger.trace("repair[{}]: Finished to get memory budget, wanted={}, available={}, max_repair_memory={}",
-                    _shard_task.global_repair_id.uuid(), wanted, mem_sem.current(), max);
+                    _rstate.global_repair_id.uuid(), wanted, mem_sem.current(), max);
 
-            auto permit = _shard_task.db.local().obtain_reader_permit(_shard_task.db.local().find_column_family(_table_id), "repair-meta", db::no_timeout, {}).get();
+            auto permit = _rstate.db.local().obtain_reader_permit(_rstate.db.local().find_column_family(_table_id), "repair-meta", db::no_timeout, {}).get();
 
             auto compaction_time = gc_clock::now();
 
             std::optional<int64_t> repaired_at;
-            bool enable_incremental_repair = _shard_task.db.local().features().tablet_incremental_repair && _is_tablet &&
-                                              _shard_task.sched_info.incremental_mode != locator::tablet_repair_incremental_mode::disabled &&
-                                             _shard_task.sched_info.sched_by_scheduler &&
-                                             !_shard_task.sched_info.for_tablet_rebuild;
+            bool enable_incremental_repair = _rstate.db.local().features().tablet_incremental_repair && _is_tablet &&
+                                              _rstate.sched_info.incremental_mode != locator::tablet_repair_incremental_mode::disabled &&
+                                             _rstate.sched_info.sched_by_scheduler &&
+                                             !_rstate.sched_info.for_tablet_rebuild;
             if (enable_incremental_repair) {
-                auto& table = _shard_task.db.local().find_column_family(_table_id);
+                auto& table = _rstate.db.local().find_column_family(_table_id);
                 auto erm = table.get_effective_replication_map();
                 auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(_table_id);
                 auto last_token = _range.end() ? _range.end()->value() : dht::maximum_token();
@@ -3484,8 +3579,8 @@ public:
                 repaired_at = sstables_repaired_at + 1;
             }
 
-            repair_meta master(_shard_task.rs,
-                    _shard_task.db.local().find_column_family(_table_id),
+            repair_meta master(_rstate.rs,
+                    _rstate.db.local().find_column_family(_table_id),
                     s,
                     std::move(permit),
                     _range,
@@ -3494,7 +3589,7 @@ public:
                     _seed,
                     repair_master::yes,
                     repair_meta_id,
-                    _shard_task.reason(),
+                    _rstate.reason(),
                     std::move(master_node_shard_config),
                     _all_live_peer_nodes,
                     _all_live_peer_nodes.size(),
@@ -3503,7 +3598,7 @@ public:
                     compaction_time,
                     _topo_guard,
                     repaired_at,
-                    _shard_task.sched_info.incremental_mode);
+                    _rstate.sched_info.incremental_mode);
             auto auto_stop_master = defer([&master] noexcept {
                 try {
                     master.stop().get();
@@ -3514,7 +3609,7 @@ public:
             });
 
             rlogger.debug(">>> Started Row Level Repair (Master): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_size={}",
-                    master.myhostid(), _all_live_peer_nodes, master.repair_meta_id(), _shard_task.get_keyspace(), _cf_name, schema_version, _range, _seed, max_row_buf_size);
+                    master.myhostid(), _all_live_peer_nodes, master.repair_meta_id(), _rstate.get_keyspace(), _cf_name, schema_version, _range, _seed, max_row_buf_size);
 
             std::exception_ptr ex = nullptr;
             std::vector<repair_node_state> nodes_to_stop;
@@ -3523,7 +3618,7 @@ public:
                 parallel_for_each(master.all_nodes(), coroutine::lambda([&] (repair_node_state& ns) -> future<> {
                     const auto& node = ns.node;
                     ns.state = repair_state::row_level_start_started;
-                    co_await master.repair_row_level_start(node, _shard_task.get_keyspace(), _cf_name, _range, schema_version, _shard_task.reason(), compaction_time, ns.shard);
+                    co_await master.repair_row_level_start(node, _rstate.get_keyspace(), _cf_name, _range, schema_version, _rstate.reason(), compaction_time, ns.shard);
                     ns.state = repair_state::row_level_start_finished;
                     nodes_to_stop.push_back(ns);
                     ns.state = repair_state::get_estimated_partitions_started;
@@ -3551,7 +3646,7 @@ public:
                     // To save memory and have less different conditions, we
                     // use the estimation for RBNO repair as well.
 
-                    _estimated_partitions *= _shard_task.rs.get_config().repair_partition_count_estimation_ratio();
+                    _estimated_partitions *= _rstate.rs.get_config().repair_partition_count_estimation_ratio();
                 }
 
                 parallel_for_each(master.all_nodes(), coroutine::lambda([&] (repair_node_state& ns) -> future<> {
@@ -3578,11 +3673,11 @@ public:
             } catch (replica::no_such_column_family& e) {
                 table_dropped = true;
                 rlogger.warn("repair[{}]: shard={}, keyspace={}, cf={}, range={}, got error in row level repair: {}",
-                        _shard_task.global_repair_id.uuid(), this_shard_id(), _shard_task.get_keyspace(), _cf_name, _range, e);
+                        _rstate.global_repair_id.uuid(), this_shard_id(), _rstate.get_keyspace(), _cf_name, _range, e);
                 _failed = true;
             } catch (std::exception& e) {
                 rlogger.warn("repair[{}]: shard={}, keyspace={}, cf={}, range={}, got error in row level repair: {}",
-                        _shard_task.global_repair_id.uuid(), this_shard_id(), _shard_task.get_keyspace(), _cf_name, _range, e);
+                        _rstate.global_repair_id.uuid(), this_shard_id(), _rstate.get_keyspace(), _cf_name, _range, e);
                 // In case the repair process fail, we need to call repair_row_level_stop to clean up repair followers
                 _failed = true;
                 ex = std::current_exception();
@@ -3598,35 +3693,34 @@ public:
             parallel_for_each(nodes_to_stop, coroutine::lambda([&] (repair_node_state& ns) -> future<> {
                 auto node = ns.node;
                 master.set_repair_state(repair_state::row_level_stop_started, node);
-                co_await master.repair_row_level_stop(node, _shard_task.get_keyspace(), _cf_name, _range, ns.shard, mark_as_repaired);
+                co_await master.repair_row_level_stop(node, _rstate.get_keyspace(), _cf_name, _range, ns.shard, mark_as_repaired);
                 master.set_repair_state(repair_state::row_level_stop_finished, node);
             })).get();
 
-            _shard_task.update_statistics(master.stats());
+            _rstate.update_statistics(master.stats());
             if (_failed) {
                 if (table_dropped) {
-                    throw replica::no_such_column_family(_shard_task.get_keyspace(),  _cf_name);
+                    throw replica::no_such_column_family(_rstate.get_keyspace(),  _cf_name);
                 } else {
-                    throw nested_exception(std::make_exception_ptr(std::runtime_error(fmt::format("Failed to repair for keyspace={}, cf={}, range={}", _shard_task.get_keyspace(),
+                    throw nested_exception(std::make_exception_ptr(std::runtime_error(fmt::format("Failed to repair for keyspace={}, cf={}, range={}", _rstate.get_keyspace(),
                                             _cf_name, _range))), std::move(ex));
                 }
             } else {
                 update_system_repair_table().get();
             }
             rlogger.debug("<<< Finished Row Level Repair (Master): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, range={}, tx_hashes_nr={}, rx_hashes_nr={}, tx_row_nr={}, rx_row_nr={}, row_from_disk_bytes={}, row_from_disk_nr={}",
-                    master.myhostid(), _all_live_peer_nodes, master.repair_meta_id(), _shard_task.get_keyspace(), _cf_name, _range, master.stats().tx_hashes_nr, master.stats().rx_hashes_nr, master.stats().tx_row_nr, master.stats().rx_row_nr, master.stats().row_from_disk_bytes, master.stats().row_from_disk_nr);
+                    master.myhostid(), _all_live_peer_nodes, master.repair_meta_id(), _rstate.get_keyspace(), _cf_name, _range, master.stats().tx_hashes_nr, master.stats().rx_hashes_nr, master.stats().tx_row_nr, master.stats().rx_row_nr, master.stats().row_from_disk_bytes, master.stats().row_from_disk_nr);
         });
     }
 };
 
-future<> repair_cf_range_row_level(repair::shard_repair_task_impl& shard_task,
+future<> repair_cf_range_row_level(shard_repair_state& rstate,
         sstring cf_name, table_id table_id, dht::token_range range,
-        const std::vector<locator::host_id>& all_peer_nodes, bool small_table_optimization, gc_clock::time_point flush_time,
-        service::frozen_topology_guard topo_guard) {
+        const std::vector<locator::host_id>& all_peer_nodes, gc_clock::time_point flush_time) {
     auto start_time = flush_time;
-    auto repair = row_level_repair(shard_task, std::move(cf_name), std::move(table_id), std::move(range), all_peer_nodes, small_table_optimization, start_time, topo_guard);
-    bool is_tablet = shard_task.db.local().find_column_family(table_id).uses_tablets();
-    bool is_tablet_rebuild = shard_task.sched_info.for_tablet_rebuild;
+    auto repair = row_level_repair(rstate, std::move(cf_name), std::move(table_id), std::move(range), all_peer_nodes, start_time);
+    bool is_tablet = rstate.db.local().find_column_family(table_id).uses_tablets();
+    bool is_tablet_rebuild = rstate.sched_info.for_tablet_rebuild;
     auto t = std::chrono::steady_clock::now();
     auto update_time = seastar::defer([&] noexcept {
         if (is_tablet && !is_tablet_rebuild) {
@@ -3651,7 +3745,7 @@ public:
             });
             rlogger.debug("Finished to remove row level repair on all shards for node {}", node);
         } catch(...) {
-            rlogger.warn("Failed to remove row level repair for node {}: {}", node, std::current_exception());
+            rlogger.warn("Failed to remove row level repair for node {}: {:t}", node, std::current_exception());
         }
     }
     virtual future<> on_dead(
@@ -3743,7 +3837,7 @@ future<> repair_service::stop() {
     _state = state::stopped;
     rlogger.info("Stopped repair_service");
   } catch (...) {
-    on_fatal_internal_error(rlogger, format("Failed stopping repair_service: {}", std::current_exception()));
+    on_fatal_internal_error(rlogger, format("Failed stopping repair_service: {:t}", std::current_exception()));
   }
 }
 
@@ -3842,7 +3936,7 @@ future<> repair_service::load_history() {
                     gc_state.batch_update_repair_time(table_uuid, updates);
                 });
             } catch (...) {
-                rlogger.warn("Failed to update repair history time for table_uuid={}: {}", table_uuid, std::current_exception());
+                rlogger.warn("Failed to update repair history time for table_uuid={}: {:t}", table_uuid, std::current_exception());
             }
             updates.clear();
         };
@@ -3866,7 +3960,7 @@ future<> repair_service::load_history() {
   } catch (const abort_requested_exception&) {
     // Ignore
   } catch (...) {
-    rlogger.warn("Failed to update repair history time: {}.  Ignored", std::current_exception());
+    rlogger.warn("Failed to update repair history time: {:t}.  Ignored", std::current_exception());
   }
 }
 

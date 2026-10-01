@@ -22,7 +22,6 @@ class function_name;
 
 class function {
 public:
-    using opt_bytes = std::optional<bytes>;
     virtual ~function() {}
     virtual const function_name& name() const = 0;
     virtual const std::vector<data_type>& arg_types() const = 0;
@@ -50,6 +49,19 @@ public:
      * @return <code>true</code> if the function is an aggregate function, <code>false</code> otherwise.
      */
     virtual bool is_aggregate() const = 0;
+
+    /**
+     * Checks whether the function is external to CQL's own evaluation: a placeholder the
+     * statement containing it has to deal with while preparing, rather than a computation over its
+     * arguments. It may be replaced with a temporary or another expression, stand for something
+     * done outside the coordinator, or need validation of its own.
+     *
+     * It must be non-pure: otherwise a call with constant arguments would be constant-folded, and
+     * executed, before the statement is prepared.
+     *
+     * @return <code>true</code> if the function is an external one, <code>false</code> otherwise.
+     */
+    virtual bool is_external() const { return false; }
 
     virtual void print(std::ostream& os) const = 0;
 

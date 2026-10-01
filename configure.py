@@ -505,7 +505,7 @@ modes = {
         'advanced_optimizations': False,
     },
     'coverage': {
-        'cxxflags': '-fprofile-instr-generate -fcoverage-mapping -g -gz',
+        'cxxflags': '-DSCYLLA_ENABLE_ERROR_INJECTION -fprofile-instr-generate -fcoverage-mapping -g -gz',
         'cxx_ld_flags': '-fprofile-instr-generate -fcoverage-mapping',
         'stack-usage-threshold': 1024*40,
         'optimization-level': 'g',
@@ -592,6 +592,7 @@ scylla_tests = set([
     'test/boost/incremental_compaction_test',
     'test/boost/index_reader_test',
     'test/boost/input_stream_test',
+    'test/boost/interval_index_test',
     'test/boost/intrusive_array_test',
     'test/boost/json_test',
     'test/boost/keys_test',
@@ -693,6 +694,7 @@ scylla_tests = set([
     'test/perf/perf_commitlog',
     'test/perf/perf_cql_parser',
     'test/perf/perf_hash',
+    'test/perf/perf_logstor',
     'test/perf/perf_mutation',
     'test/perf/perf_collection',
     'test/perf/perf_row_cache_reads',
@@ -704,6 +706,7 @@ scylla_tests = set([
     'test/unit/row_cache_stress_test',
     'test/unit/cross_shard_barrier_test',
     'test/boost/address_map_test',
+    'test/boost/endpoint_state_merge_test',
 ]) | ldap_tests
 
 perf_tests = set([
@@ -1067,6 +1070,7 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/statements/cas_request.cc',
                 'cql3/statements/raw/parsed_statement.cc',
                 'cql3/statements/property_definitions.cc',
+                'cql3/statements/insert_statement.cc',
                 'cql3/statements/update_statement.cc',
                 'cql3/statements/delete_statement.cc',
                 'cql3/statements/prune_materialized_view_statement.cc',
@@ -1075,8 +1079,9 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/statements/external_search/external_index_select_statement.cc',
                 'cql3/statements/external_search/vector_indexed_table_select_statement.cc',
                 'cql3/statements/external_search/fulltext_indexed_table_select_statement.cc',
-                'cql3/statements/external_search/external_score_provider.cc',
+                'cql3/statements/external_search/values_provider.cc',
                 'cql3/statements/external_search/filter.cc',
+                'cql3/statements/external_search/external_function.cc',
                 'cql3/statements/use_statement.cc',
                 'cql3/statements/index_prop_defs.cc',
                 'cql3/statements/index_target.cc',
@@ -1091,6 +1096,7 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/statements/grant_statement.cc',
                 'cql3/statements/revoke_statement.cc',
                 'cql3/statements/alter_type_statement.cc',
+                'cql3/statements/alter_cluster_config_statement.cc',
                 'cql3/statements/alter_keyspace_statement.cc',
                 'cql3/statements/role-management-statements.cc',
                 'cql3/statements/service_level_statement.cc',
@@ -1146,6 +1152,8 @@ scylla_core = (['message/messaging_service.cc',
                 'db/commitlog/commitlog_entry.cc',
                 'db/commitlog/commitlog_replayer.cc',
                 'db/commitlog/raft_commitlog_replay_buffer.cc',
+                'db/cluster_config_manager.cc',
+                'db/cluster_config_registry.cc',
                 'db/config.cc',
                 'db/consistency_level.cc',
                 'db/cql_type_parser.cc',
@@ -1209,9 +1217,12 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/gz/crc_combine_table.cc',
                 'utils/http.cc',
                 'utils/http_client_error_processing.cc',
+                'utils/object_storage_metrics.cc',
                 'utils/rest/client.cc',
                 'utils/s3/aws_error.cc',
+                'utils/s3/aws_error_definitions.cc',
                 'utils/s3/client.cc',
+                'utils/s3/aws_throttling_controller.cc',
                 'utils/s3/default_aws_retry_strategy.cc',
                 'utils/s3/credentials_providers/aws_credentials_provider.cc',
                 'utils/s3/credentials_providers/environment_aws_credentials_provider.cc',
@@ -1347,6 +1358,7 @@ scylla_core = (['message/messaging_service.cc',
                 'ent/encryption/replicated_key_provider.cc',
                 'ent/encryption/system_key.cc',
                 'ent/encryption/encrypted_file_impl.cc',
+                'ent/encryption/key_cache.cc',
                 'ent/encryption/kmip_host.cc',
                 'ent/encryption/kmip_key_provider.cc',
                 'ent/encryption/kms_host.cc',
@@ -1434,8 +1446,6 @@ api = ['api/api.cc',
        'api/cache_service.cc',
        Json2Code('api/api-doc/client_routes.json'),
        'api/client_routes.cc',
-       Json2Code('api/api-doc/collectd.json'),
-       'api/collectd.cc',
        Json2Code('api/api-doc/endpoint_snitch_info.json'),
        'api/endpoint_snitch.cc',
        Json2Code('api/api-doc/compaction_manager.json'),
@@ -1467,6 +1477,7 @@ api = ['api/api.cc',
        'api/cql_server_test.cc',
        'api/service_levels.cc',
        Json2Code('api/api-doc/service_levels.json'),
+       'api/utils.cc',
        ]
 
 alternator = [
@@ -1509,7 +1520,6 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/query.idl.hh',
         'idl/idl_test.idl.hh',
         'idl/commitlog.idl.hh',
-        'idl/logstor.idl.hh',
         'idl/tracing.idl.hh',
         'idl/consistency_level.idl.hh',
         'idl/cache_temperature.idl.hh',
@@ -1565,6 +1575,7 @@ scylla_tests_dependencies = scylla_core + alternator + idls + scylla_tests_gener
     'test/lib/key_utils.cc',
     'test/lib/proc_utils.cc',
     'test/lib/gcs_fixture.cc',
+    'test/lib/s3_fixture.cc',
     'test/lib/aws_kms_fixture.cc',
     'test/lib/gcp_kms_fixture.cc',
     'test/lib/azure_kms_fixture.cc',
@@ -1575,11 +1586,12 @@ scylla_raft_dependencies = scylla_raft_core + ['utils/uuid.cc', 'utils/error_inj
 scylla_tools = ['tools/scylla-local-file-key-generator.cc',
                 'tools/read_mutation.cc',
                 'tools/scylla-types.cc',
-                'tools/scylla-sstable.cc',
+                'tools/scylla-sstable/scylla-sstable.cc',
+                'tools/scylla-sstable/scylla-sstable-layout.cc',
                 'tools/scylla-nodetool.cc',
                 'tools/json_mutation_stream_parser.cc',
                 'tools/schema_loader.cc',
-                'tools/load_system_tablets.cc',
+                'tools/load_system_tables.cc',
                 'tools/utils.cc',
                 'tools/lua_sstable_consumer.cc']
 scylla_perfs = ['test/perf/perf_alternator.cc',
@@ -1624,6 +1636,7 @@ pure_boost_tests = set([
     'test/boost/enum_option_test',
     'test/boost/enum_set_test',
     'test/boost/idl_test',
+    'test/boost/interval_index_test',
     'test/boost/json_test',
     'test/boost/keys_test',
     'test/boost/like_matcher_test',
@@ -1717,6 +1730,7 @@ deps['test/boost/combined_tests'] += [
     'test/boost/commitlog_cleanup_test.cc',
     'test/boost/commitlog_raft_replay_test.cc',
     'test/boost/commitlog_test.cc',
+    'test/boost/cluster_config_manager_test.cc',
     'test/boost/cql_auth_query_test.cc',
     'test/boost/cql_functions_test.cc',
     'test/boost/cql_query_group_test.cc',
@@ -1729,6 +1743,7 @@ deps['test/boost/combined_tests'] += [
     'test/boost/disk_space_monitor_test.cc',
     'test/boost/digest_checked_data_source_test.cc',
     'test/boost/error_injection_test.cc',
+    'test/boost/external_search_test.cc',
     'test/boost/extensions_test.cc',
     'test/boost/filtering_test.cc',
     'test/boost/group0_cmd_merge_test.cc',
@@ -1767,6 +1782,7 @@ deps['test/boost/combined_tests'] += [
     'test/boost/sstable_compressor_factory_test.cc',
     'test/boost/sstable_compression_config_test.cc',
     'test/boost/sstable_directory_test.cc',
+    'test/boost/sstables_manager_subscription_test.cc',
     'test/boost/sstable_set_test.cc',
     'test/boost/sstable_tablet_streaming_test.cc',
     'test/boost/statement_restrictions_test.cc',
@@ -1801,6 +1817,7 @@ deps['test/boost/bytes_ostream_test'] = [
     "test/lib/log.cc",
 ]
 deps['test/boost/input_stream_test'] = ['test/boost/input_stream_test.cc']
+deps['test/boost/interval_index_test'] = ['test/boost/interval_index_test.cc']
 deps['test/boost/UUID_test'] = ['clocks-impl.cc', 'utils/UUID_gen.cc', 'test/boost/UUID_test.cc', 'utils/uuid.cc', 'utils/dynamic_bitset.cc', 'utils/hashers.cc', 'utils/on_internal_error.cc']
 deps['test/boost/url_parse_test'] = ['utils/http.cc', 'test/boost/url_parse_test.cc', ]
 deps['test/boost/hwlb_test'] = ['db/heat_load_balance.cc', 'test/boost/hwlb_test.cc']
@@ -1812,7 +1829,9 @@ deps['test/boost/estimated_histogram_test'] = ['test/boost/estimated_histogram_t
 deps['test/boost/summary_test'] = ['test/boost/summary_test.cc']
 deps['test/boost/anchorless_list_test'] = ['test/boost/anchorless_list_test.cc']
 deps['test/perf/perf_canonical_mutation'] += ['seastar/tests/perf/linux_perf_event.cc']
+deps['test/perf/perf_mutation'] += ['seastar/tests/perf/linux_perf_event.cc']
 deps['test/perf/perf_commitlog'] += ['test/perf/perf.cc', 'seastar/tests/perf/linux_perf_event.cc']
+deps['test/perf/perf_logstor'] += ['test/perf/perf.cc', 'seastar/tests/perf/linux_perf_event.cc']
 deps['test/perf/perf_row_cache_reads'] += ['test/perf/perf.cc', 'seastar/tests/perf/linux_perf_event.cc']
 deps['test/boost/reusable_buffer_test'] = [
     "test/boost/reusable_buffer_test.cc",
@@ -1845,6 +1864,7 @@ deps['test/raft/etcd_test'] =  ['test/raft/etcd_test.cc', 'test/raft/helpers.cc'
 deps['test/raft/raft_sys_table_storage_test'] = ['test/raft/raft_sys_table_storage_test.cc'] + \
     scylla_core + alternator + scylla_tests_generic_dependencies
 deps['test/boost/address_map_test'] = ['test/boost/address_map_test.cc'] + scylla_core + alternator
+deps['test/boost/endpoint_state_merge_test'] = ['test/boost/endpoint_state_merge_test.cc'] + scylla_core + alternator
 deps['test/raft/discovery_test'] =  ['test/raft/discovery_test.cc',
                                      'test/raft/helpers.cc',
                                      'test/lib/log.cc',
@@ -2128,6 +2148,15 @@ def prepare_advanced_optimizations(*, modes, build_modes, args):
         # It's valuable in general, but our training suite is not realistic and exhaustive
         # enough to be confident about value profiling. Let's also keep it disabled by
         # default, conservatively. (Currently it is enabled in Clang by default.)
+        #
+        # Note that `-mllvm` is a compile-only option: the driver doesn't forward it to
+        # the LTO backend, so passing it to a link command achieves nothing except a
+        # -Wunused-command-line-argument warning (there are hundreds of them in a full
+        # build). Hence these flags belong to the compile flags only.
+        # (Disabling pgso in the LTO backend of the `scylla` link would require
+        # `-Wl,-plugin-opt=-pgso=false`; `-enable-value-profiling` has no such
+        # counterpart, and doesn't need one, since instrumentation only happens at
+        # compile time.)
         conservative_opts = "" if args.experimental_pgo else "-mllvm -pgso=false -mllvm -enable-value-profiling=false"
 
         llvm_instr_types = []
@@ -2144,7 +2173,7 @@ def prepare_advanced_optimizations(*, modes, build_modes, args):
                 submode['cxx_ld_flags'] += f" -fprofile-use={profile_path}"
                 submode['profile_target'] = profile_target
             submode['lib_cflags'] += f" -f{it}profile-generate={os.path.realpath(outdir)}/{submode_name} {conservative_opts}"
-            submode['cxx_ld_flags'] += f" -f{it}profile-generate={os.path.realpath(outdir)}/{submode_name} {conservative_opts}"
+            submode['cxx_ld_flags'] += f" -f{it}profile-generate={os.path.realpath(outdir)}/{submode_name}"
             submode['profile_recipe'] = textwrap.dedent(f"""\
                 build $builddir/{submode_name}/profiles/prof.profdata: train $builddir/{submode_name}/scylla
                 build $builddir/{submode_name}/profiles/merged.profdata: merge_profdata $builddir/{submode_name}/profiles/prof.profdata {profile_target or str()}
@@ -2157,7 +2186,7 @@ def prepare_advanced_optimizations(*, modes, build_modes, args):
 
         if profile_path is not None:
             modes[mode]['lib_cflags'] += f" -fprofile-use={profile_path} {conservative_opts}"
-            modes[mode]['cxx_ld_flags'] += f" -fprofile-use={profile_path} {conservative_opts}"
+            modes[mode]['cxx_ld_flags'] += f" -fprofile-use={profile_path}"
             modes[mode]['profile_target'] = profile_target
             modes[mode].setdefault('profile_recipe', "")
             modes[mode]['profile_recipe'] += textwrap.dedent(f"""\
@@ -2174,6 +2203,52 @@ def semicolon_separated(*flags):
     # using spaces
     f = ' '.join(flags)
     return re.sub(' +', ';', f)
+
+def ninja_escape_path(path):
+    return path.replace('$', '$$').replace(' ', '$ ').replace(':', '$:')
+
+
+def ninja_unescape_path(path):
+    return re.sub(r'\$(.)', r'\1', path)
+
+
+def cmake_input_files(cmake_build_dir):
+    """List the files cmake read when generating cmake_build_dir/build.ninja.
+
+    A submodule's own build.ninja knows how to re-run cmake when its
+    configuration changes, but scylla's build.ninja embeds settings queried
+    from that configuration (the flags in seastar.pc, for instance), so
+    configure.py has to re-run as well. cmake records the full list of inputs
+    in the edge which regenerates the submodule's build.ninja; reuse it
+    instead of guessing which files make up the configuration.
+    """
+    build_ninja = os.path.join(cmake_build_dir, 'build.ninja')
+    inputs = []
+    try:
+        with open(build_ninja) as f:
+            for line in f:
+                if not line.startswith('build '):
+                    continue
+                parts = line.rstrip('\n').split(': RERUN_CMAKE | ', 1)
+                if len(parts) != 2:
+                    continue
+                for dep in re.split(r'(?<!\$) ', parts[1]):
+                    if not dep or dep.startswith('|'):
+                        continue
+                    dep = ninja_unescape_path(dep)
+                    if not os.path.isabs(dep):
+                        # deps are relative to the cmake build directory
+                        dep = os.path.join(cmake_build_dir, dep)
+                    dep = os.path.abspath(dep)
+                    # keep in-tree files relative, like the rest of build.ninja
+                    if dep.startswith(curdir + os.sep):
+                        dep = os.path.relpath(dep, curdir)
+                    inputs.append(dep)
+                break
+    except FileNotFoundError:
+        pass
+    return inputs
+
 
 def real_relpath(path, start):
     return os.path.relpath(os.path.realpath(path), os.path.realpath(start))
@@ -2218,9 +2293,17 @@ def configure_seastar(build_dir, mode, mode_config, compiler_cache=None):
         '-DCMAKE_C_COMPILER={}'.format(args.cc),
         '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
         '-DCMAKE_EXPORT_NO_PACKAGE_REGISTRY=ON',
-        '-DCMAKE_CXX_STANDARD=23',
+        '-DCMAKE_CXX_STANDARD=26',
         '-DCMAKE_CXX_EXTENSIONS=ON',
         '-DSeastar_CXX_FLAGS=SHELL:{}'.format(mode_config['lib_cflags'] + extra_file_prefix_map),
+        # Resolve fmt to the bundled submodule we build in configure_fmt()
+        # rather than whatever version happens to be installed on the host.
+        '-Dfmt_ROOT={}'.format(fmt_build_dir(build_dir, mode)),
+        # Likewise for c-ares: point Seastar's Findc-ares.cmake at the prefix
+        # that configure_c_ares() installs the bundled submodule into. A
+        # <package>_ROOT is searched by find_library()/find_path() ahead of
+        # the pkg-config HINTS, so the host's c-ares is not consulted.
+        '-Dc-ares_ROOT={}'.format(c_ares_install_dir(build_dir, mode)),
         '-DSeastar_LD_FLAGS={}'.format(semicolon_separated(mode_config['lib_ldflags'], seastar_cxx_ld_flags)),
         '-DSeastar_API_LEVEL=9',
         '-DSeastar_DEPRECATED_OSTREAM_FORMATTERS=OFF',
@@ -2252,6 +2335,12 @@ def configure_seastar(build_dir, mode, mode_config, compiler_cache=None):
     if mode_config['build_seastar_shared_libs']:
         seastar_cmake_args += ['-DBUILD_SHARED_LIBS=ON']
 
+    # The coverage mode uses cmake_build_type='Debug', which by default enables sanitizers
+    # in Seastar. Since coverage mode doesn't link against sanitizer runtime libraries,
+    # we must explicitly disable them to avoid linker errors for __asan_* / __ubsan_* symbols.
+    if '-DSANITIZE' not in mode_config['cxxflags']:
+        seastar_cmake_args += ['-DSeastar_SANITIZE=OFF']
+
     cmake_args = seastar_cmake_args[:]
     seastar_cmd = ['cmake', '-G', 'Ninja', real_relpath(args.seastar_path, seastar_build_dir)] + cmake_args
     cmake_dir = seastar_build_dir
@@ -2265,6 +2354,225 @@ def configure_seastar(build_dir, mode, mode_config, compiler_cache=None):
         print(" \\\n  ".join(seastar_cmd))
     os.makedirs(seastar_build_dir, exist_ok=True)
     subprocess.check_call(seastar_cmd, shell=False, cwd=cmake_dir)
+
+
+def fmt_build_dir(build_dir, mode):
+    # Where configure_fmt() sets up fmt's CMake build. fmt is not installed
+    # anywhere: both Scylla and Seastar consume it straight out of this build
+    # tree (fmt's own export() drops a build-tree fmt-config.cmake here, which
+    # is what Seastar's find_package(fmt) picks up via fmt_ROOT).
+    # Absolute, because it ends up in an rpath and in Seastar's fmt_ROOT.
+    return os.path.realpath(os.path.join(build_dir, mode, 'fmt'))
+
+
+def fmt_lib(mode, mode_config):
+    # The library that the fmt sub-build produces, as a ninja path. fmt is
+    # shared or static to match Seastar (build_seastar_shared_libs), so a mode
+    # doesn't end up with fmt symbols in both libseastar and a static libfmt.
+    ext = 'so' if mode_config['build_seastar_shared_libs'] else 'a'
+    return f'$builddir/{mode}/fmt/libfmt.{ext}'
+
+
+def fmt_link_flags(build_dir, mode, mode_config):
+    # Link flags for Scylla to use the fmt built by the fmt sub-build.
+    libdir = fmt_build_dir(build_dir, mode)
+    if mode_config['build_seastar_shared_libs']:
+        return f"-L{libdir} -Wl,-rpath,{libdir} -lfmt"
+    return os.path.join(libdir, 'libfmt.a')
+
+
+def configure_fmt(build_dir, mode, mode_config, compiler_cache=None):
+    # Set up the CMake build of the bundled fmt submodule (rather than relying
+    # on the host's fmt, whose version may differ from the headers we compile
+    # against). Only the configure step runs here; the library itself is built
+    # during the ninja build, like Seastar's and abseil's. Modeled on
+    # configure_abseil().
+    fmt_cflags = mode_config['lib_cflags']
+    cxx_flags = mode_config['cxxflags']
+    if '-DSANITIZE' in cxx_flags:
+        fmt_cflags += ' -fsanitize=address -fsanitize=undefined -fno-sanitize=vptr'
+
+    # We are not interested in the coverage of fmt itself.
+    if args.coverage:
+        for flag in COVERAGE_INST_FLAGS:
+            cxx_flags = cxx_flags.replace(f' {flag}', '')
+
+    cxx_flags += ' ' + fmt_cflags.strip()
+
+    cmake_mode = mode_config['cmake_build_type']
+    fmt_cmake_args = [
+        '-DCMAKE_BUILD_TYPE={}'.format(cmake_mode),
+        '-DCMAKE_C_COMPILER={}'.format(args.cc),
+        '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
+        '-DCMAKE_CXX_FLAGS_{}={}'.format(cmake_mode.upper(), cxx_flags),
+        '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+        '-DCMAKE_CXX_STANDARD=26',
+        # Static fmt gets linked into shared libseastar in some modes, so it
+        # must be position-independent.
+        '-DCMAKE_POSITION_INDEPENDENT_CODE=ON',
+        # Match Seastar's shared/static choice for the mode.
+        '-DBUILD_SHARED_LIBS={}'.format('ON' if mode_config['build_seastar_shared_libs'] else 'OFF'),
+        # We never run fmt's install target, but FMT_INSTALL also guards the
+        # generation of fmt-config.cmake / fmt-targets.cmake in the build tree
+        # (fmt calls export() there), which is how Seastar's find_package(fmt)
+        # finds the library we are about to build.
+        '-DFMT_INSTALL=ON',
+        # Keep the library named libfmt.{a,so} in every mode; otherwise fmt
+        # appends a 'd' in Debug builds and fmt_link_flags()'s -lfmt misses it.
+        '-DFMT_DEBUG_POSTFIX=',
+        '-DFMT_TEST=OFF',
+        '-DFMT_DOC=OFF',
+        '-DFMT_FUZZ=OFF',
+        # We don't consume fmt's C++20 module; building it drags in module
+        # dependency scanning, which Scylla otherwise disables.
+        '-DFMT_MODULE=OFF',
+    ]
+
+    if compiler_cache:
+        fmt_cmake_args += [f'-DCMAKE_CXX_COMPILER_LAUNCHER={compiler_cache}',
+                           f'-DCMAKE_C_COMPILER_LAUNCHER={compiler_cache}']
+
+    cmake_dir = fmt_build_dir(build_dir, mode)
+    fmt_cmd = ['cmake', '-G', 'Ninja', real_relpath('fmt', cmake_dir)] + fmt_cmake_args
+
+    if args.verbose:
+        print(' \\\n  '.join(fmt_cmd))
+    os.makedirs(cmake_dir, exist_ok=True)
+    subprocess.check_call(fmt_cmd, shell=False, cwd=cmake_dir)
+
+
+def c_ares_build_dir(build_dir, mode):
+    # Where configure_c_ares() sets up c-ares's CMake build.
+    # Absolute, because it ends up in Seastar's c-ares_ROOT.
+    return os.path.realpath(os.path.join(build_dir, mode, 'c-ares'))
+
+
+def c_ares_install_dir(build_dir, mode):
+    # Unlike fmt, c-ares cannot be consumed straight out of its build tree:
+    # Seastar's Findc-ares.cmake looks for a libcares and an ares_dns.h, and
+    # c-ares generates ares_build.h/ares_config.h into the build tree while
+    # ares_dns.h stays in the source tree. So the sub-build installs into this
+    # prefix, which collects the headers and the library in one place.
+    return os.path.join(c_ares_build_dir(build_dir, mode), 'install')
+
+
+def c_ares_lib(build_dir, mode):
+    # The installed library, as a ninja path: the output of the c-ares
+    # sub-build, and what Seastar's link line ends up naming.
+    return f'$builddir/{mode}/c-ares/install/lib/libcares.a'
+
+
+def strip_advanced_optimization_flags(flags):
+    # Drop the whole-program-optimization flags that prepare_advanced_optimizations()
+    # adds to lib_cflags. They are meant for Scylla's own code, and a library that
+    # configure_c_ares() builds at configure time cannot have them:
+    #
+    #  - the PGO flags name a profile that has not been downloaded or trained yet
+    #    when configure.py runs, and clang treats a missing -fprofile-use file as
+    #    a hard error;
+    #  - LTO would leave bitcode instead of machine code in libcares.a, which is
+    #    handed to Seastar's CMake as a plain library, and buys nothing for a
+    #    dependency that is never inlined into Scylla anyway.
+    #
+    # (-Wno-backend-plugin goes too: it exists only to silence the stale-profile
+    # warnings that the PGO flags produce.)
+    tokens = flags.split()
+    kept = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if (token.startswith('-flto')
+                or token == '-ffat-lto-objects'
+                or token == '-Wno-backend-plugin'
+                or token.startswith('-fprofile-use=')
+                or token.startswith('-fprofile-generate=')
+                or token.startswith('-fcs-profile-generate=')):
+            i += 1
+        elif (token == '-mllvm'
+              and i + 1 < len(tokens)
+              and tokens[i + 1] in ('-pgso=false', '-enable-value-profiling=false')):
+            i += 2
+        else:
+            kept.append(token)
+            i += 1
+    return ' '.join(kept)
+
+
+def configure_c_ares(build_dir, mode, mode_config, compiler_cache=None):
+    # Set up the CMake build of the bundled c-ares submodule rather than
+    # relying on the host's c-ares, whose version we do not control. Only the
+    # configure step runs here; the library is built (and installed into
+    # c_ares_install_dir()) during the ninja build, like fmt's and abseil's.
+    # Modeled on configure_fmt().
+    # Only lib_cflags, not cxxflags: the latter is Scylla's own -D soup (and,
+    # under --coverage, the instrumentation flags we would have to strip again
+    # here), none of which means anything to a C library.
+    c_flags = strip_advanced_optimization_flags(mode_config['lib_cflags'])
+
+    # The CMAKE_C_FLAGS_<mode> we set below replaces whatever CMake would have
+    # defaulted to for the build type, and two of Scylla's build types (Dev,
+    # Sanitize) are not build types CMake knows at all. So name the mode's
+    # optimization level and debug info explicitly rather than inheriting them.
+    c_flags += ' -O{}'.format(mode_config['optimization-level'])
+    if args.debuginfo and mode_config['can_have_debug_info']:
+        c_flags += ' -g -gz'
+    if '-DSANITIZE' in mode_config['cxxflags']:
+        c_flags += ' -fsanitize=address -fsanitize=undefined'
+
+    cmake_mode = mode_config['cmake_build_type']
+    c_ares_cmake_args = [
+        '-DCMAKE_BUILD_TYPE={}'.format(cmake_mode),
+        '-DCMAKE_C_COMPILER={}'.format(args.cc),
+        '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
+        '-DCMAKE_C_FLAGS_{}={}'.format(cmake_mode.upper(), c_flags),
+        '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+        '-DCMAKE_INSTALL_PREFIX={}'.format(c_ares_install_dir(build_dir, mode)),
+        # c_ares_lib() names .../install/lib/libcares.a; without this,
+        # GNUInstallDirs would pick lib64 on Fedora.
+        '-DCMAKE_INSTALL_LIBDIR=lib',
+        # c-ares 1.34.6 declares cmake_minimum_required(VERSION 3.5.0...3.10.0),
+        # which CMake 4 rejects outright.
+        '-DCMAKE_POLICY_VERSION_MINIMUM=3.10',
+        # Link c-ares statically into Seastar, so that there is no libcares.so
+        # to find at runtime and nothing extra to ship. The static library is
+        # linked into a shared libseastar in some modes, so it must be
+        # position-independent.
+        '-DCARES_STATIC=ON',
+        '-DCARES_SHARED=OFF',
+        '-DCARES_STATIC_PIC=ON',
+        # We do run c-ares's install target: it is how the headers and the
+        # library reach c_ares_install_dir().
+        '-DCARES_INSTALL=ON',
+        '-DCARES_BUILD_TESTS=OFF',
+        '-DCARES_BUILD_CONTAINER_TESTS=OFF',
+        '-DCARES_BUILD_TOOLS=OFF',
+    ]
+
+    if compiler_cache:
+        c_ares_cmake_args += [f'-DCMAKE_CXX_COMPILER_LAUNCHER={compiler_cache}',
+                              f'-DCMAKE_C_COMPILER_LAUNCHER={compiler_cache}']
+
+    cmake_dir = c_ares_build_dir(build_dir, mode)
+    c_ares_cmd = ['cmake', '-G', 'Ninja', real_relpath('c-ares', cmake_dir)] + c_ares_cmake_args
+
+    if args.verbose:
+        print(' \\\n  '.join(c_ares_cmd))
+    os.makedirs(cmake_dir, exist_ok=True)
+    subprocess.check_call(c_ares_cmd, shell=False, cwd=cmake_dir)
+
+    # Unlike fmt, whose find_package() only needs a config file that the
+    # configure step above already wrote, Seastar's Findc-ares.cmake locates
+    # c-ares with find_library()/find_path() - so the library and the headers
+    # must exist by the time configure_seastar() runs, not merely by the time
+    # ninja links Seastar. Build and install c-ares here; the ninja rule for
+    # c_ares_lib() keeps it up to date from then on. c-ares is small, so this
+    # costs little, and it is a no-op on subsequent configure.py runs.
+    install_cmd = ['cmake', '--build', cmake_dir, '--target', 'install']
+    if args.verbose:
+        print(' '.join(install_cmd))
+        subprocess.check_call(install_cmd, shell=False)
+    else:
+        subprocess.check_call(install_cmd, shell=False, stdout=subprocess.DEVNULL)
 
 
 def configure_abseil(build_dir, mode, mode_config, compiler_cache=None):
@@ -2289,7 +2597,7 @@ def configure_abseil(build_dir, mode, mode_config, compiler_cache=None):
         '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
         '-DCMAKE_CXX_FLAGS_{}={}'.format(cmake_mode.upper(), cxx_flags),
         '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
-        '-DCMAKE_CXX_STANDARD=23',
+        '-DCMAKE_CXX_STANDARD=26',
         '-DABSL_PROPAGATE_CXX_STD=ON',
     ]
 
@@ -2418,6 +2726,7 @@ cpp_jwt_encryption_sources = [
     'ent/encryption/encryption_config.cc',
     'ent/encryption/gcp_host.cc',
     'ent/encryption/gcp_key_provider.cc',
+    'ent/encryption/key_cache.cc',
     'ent/encryption/kmip_host.cc',
     'ent/encryption/kmip_key_provider.cc',
     'ent/encryption/kms_host.cc',
@@ -2498,15 +2807,20 @@ def write_build_file(f,
     use_precompiled_header = not args.disable_precompiled_header
     warnings = get_warning_options(args.cxx)
     rustc_target = pick_rustc_target('wasm32-wasi', 'wasm32-wasip1')
-    # If compiler cache is available, prefix the compiler with it
-    cxx_with_cache = f'{compiler_cache} {args.cxx}' if compiler_cache else args.cxx
+    # If a compiler cache is available, compilations are run through it as a
+    # launcher. Only compilations are wrapped, never links: a compiler cache
+    # has nothing to cache for a link, and sccache drops the jobserver it was
+    # handed, which serializes an LTO link. See
+    # https://github.com/mozilla/sccache/issues/2855
+    cxx_launcher = compiler_cache if compiler_cache else ''
     # For Rust, sccache is used via RUSTC_WRAPPER environment variable
     rustc_wrapper = f'RUSTC_WRAPPER={compiler_cache} ' if compiler_cache and 'sccache' in compiler_cache and args.sccache_rust else ''
     f.write(textwrap.dedent('''\
         configure_args = {configure_args}
         builddir = {outdir}
         cxx = {cxx}
-        cxxflags = -std=gnu++23 {user_cflags} {warnings} {defines}
+        cxx_launcher = {cxx_launcher}
+        cxxflags = -std=gnu++26 {user_cflags} {warnings} {defines}
         ldflags = {linker_flags} {user_ldflags}
         ldflags_build = {linker_flags}
         libs = {libs}
@@ -2523,9 +2837,6 @@ def write_build_file(f,
         rule serializer
             command = ./idl-compiler.py --ns ser -f $in -o $out
             description = IDL compiler $out
-        rule aws_service_errors
-            command = ./utils/s3/gen_aws_service_errors.py --output-dir $out_dir
-            description = AWS service errors generator $out
         rule ninja
             command = {ninja} -C $subdir $target
             restat = 1
@@ -2586,7 +2897,8 @@ def write_build_file(f,
           command = llvm-profdata merge $in -output=$out
         ''').format(configure_args=configure_args,
                     outdir=outdir,
-                    cxx=cxx_with_cache,
+                    cxx=args.cxx,
+                    cxx_launcher=cxx_launcher,
                     user_cflags=user_cflags,
                     warnings=warnings,
                     defines=defines,
@@ -2617,24 +2929,25 @@ def write_build_file(f,
         seastar_dep = f'$builddir/{mode}/seastar/libseastar.{seastar_lib_ext}'
         seastar_testing_dep = f'$builddir/{mode}/seastar/libseastar_testing.{seastar_lib_ext}'
         abseil_dep = ' '.join(f'$builddir/{mode}/abseil/{lib}' for lib in abseil_libs)
-        fmt_lib = 'fmt'
+        fmt_dep = fmt_lib(mode, modeval)
+        fmt_libs = fmt_link_flags(outdir, mode, modeval)
         f.write(textwrap.dedent('''\
             cxx_ld_flags_{mode} = {cxx_ld_flags}
             ld_flags_{mode} = $cxx_ld_flags_{mode} {lib_ldflags}
             cxxflags_{mode} = {lib_cflags} {cxxflags} -iquote. -iquote $builddir/{mode}/gen
-            libs_{mode} = -l{fmt_lib}
+            libs_{mode} = {fmt_libs}
             seastar_libs_{mode} = {seastar_libs}
             seastar_testing_libs_{mode} = {seastar_testing_libs}
             rule cxx.{mode}
-              command = $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags_{mode} $cxxflags $obj_cxxflags -c -o $out $in
+              command = $cxx_launcher $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags_{mode} $cxxflags $obj_cxxflags -c -o $out $in
               description = CXX $out
               depfile = $out.d
             rule cxx_build_precompiled_header.{mode}
-              command = $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags_{mode} $cxxflags $obj_cxxflags -c -o $out $in -Winvalid-pch -fpch-instantiate-templates -Xclang -emit-pch -DSCYLLA_USE_PRECOMPILED_HEADER
+              command = $cxx_launcher $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags_{mode} $cxxflags $obj_cxxflags -c -o $out $in -Winvalid-pch -fpch-instantiate-templates -Xclang -emit-pch -DSCYLLA_USE_PRECOMPILED_HEADER
               description = CXX-PRECOMPILED-HEADER $out
               depfile = $out.d
             rule cxx_with_pch.{mode}
-              command = $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags_{mode} $cxxflags $obj_cxxflags -c -o $out $in -Winvalid-pch -Xclang -include-pch -Xclang $builddir/{mode}/stdafx.hh.pch
+              command = $cxx_launcher $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags_{mode} $cxxflags $obj_cxxflags -c -o $out $in -Winvalid-pch -Xclang -include-pch -Xclang $builddir/{mode}/stdafx.hh.pch
               description = CXX $out
               depfile = $out.d
             rule link.{mode}
@@ -2670,7 +2983,7 @@ def write_build_file(f,
                         $builddir/{mode}/gen/${{stem}}Parser.cpp
                 description = ANTLR3 $in
             rule checkhh.{mode}
-              command = $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags $cxxflags_{mode} $obj_cxxflags -include $in -c -o $out $builddir/{mode}/gen/empty.cc -USCYLLA_USE_PRECOMPILED_HEADER
+              command = $cxx_launcher $cxx -MD -MT $out -MF $out.d {seastar_cflags} $cxxflags $cxxflags_{mode} $obj_cxxflags -include $in -c -o $out $builddir/{mode}/gen/empty.cc -USCYLLA_USE_PRECOMPILED_HEADER
               description = CHECKHH $in
               depfile = $out.d
             rule test.{mode}
@@ -2682,11 +2995,7 @@ def write_build_file(f,
               command = CARGO_BUILD_DEP_INFO_BASEDIR='.' CARGO_NET_RETRY=10 {rustc_wrapper}cargo build --locked --manifest-path=rust/Cargo.toml --target-dir=$builddir/{mode} --profile=rust-{mode} $
                         && touch $out
               description = RUST_LIB $out
-            ''').format(mode=mode, antlr3_exec=args.antlr3_exec, fmt_lib=fmt_lib, test_repeat=args.test_repeat, test_timeout=args.test_timeout, rustc_wrapper=rustc_wrapper, **modeval))
-        aws_errors_gen_dir = '$builddir/{}/gen'.format(mode)
-        aws_errors_gen_hh = '{}/utils/s3/aws_error_definitions_generated.hh'.format(aws_errors_gen_dir)
-        aws_errors_gen_cc = '{}/utils/s3/aws_error_definitions_generated.cc'.format(aws_errors_gen_dir)
-        aws_errors_gen_obj = aws_errors_gen_cc.replace('.cc', '.o')
+            ''').format(mode=mode, antlr3_exec=args.antlr3_exec, fmt_libs=fmt_libs, test_repeat=args.test_repeat, test_timeout=args.test_timeout, rustc_wrapper=rustc_wrapper, **modeval))
         f.write(
             'build {mode}-build: phony {artifacts} {wasms}\n'.format(
                 mode=mode,
@@ -2728,11 +3037,6 @@ def write_build_file(f,
             objs = ['$builddir/' + mode + '/' + src.replace('.cc', '.o')
                     for src in srcs
                     if src.endswith('.cc')]
-            # If the binary consumes utils/s3/aws_error.cc, it also needs
-            # the generated aws_error_definitions_generated.o (which
-            # provides the aws_error::get_errors() map).
-            if 'utils/s3/aws_error.cc' in srcs:
-                objs.append(aws_errors_gen_obj)
             has_rust = False
             for dep in deps[binary]:
                 if isinstance(dep, Antlr3Grammar):
@@ -2750,7 +3054,9 @@ def write_build_file(f,
             if binary in cpp_apps:
                 # binary only needs the C++ standard library, no additional
                 # libraries.
-                f.write('build $builddir/{}/{}: {}.{} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs)))
+                # These only need the C++ standard library, but the link
+                # command still picks up $libs_<mode>, which links fmt.
+                f.write('build $builddir/{}/{}: {}.{} {} | {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), fmt_dep))
                 # In debug/sanitize modes, we compile with fsanitizers,
                 # so must use the same options during the link:
                 if '-DSANITIZE' in modes[mode]['cxxflags']:
@@ -2788,14 +3094,14 @@ def write_build_file(f,
                 # quickly re-link the test unstripped by adding a "_g"
                 # to the test name, e.g., "ninja build/release/testname_g"
                 link_rule = perf_tests_link_rule if binary.startswith('test/perf/') else tests_link_rule
-                f.write('build $builddir/{}/{}: {}.{} {} | {} {} {}\n'.format(mode, binary, link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep))
+                f.write('build $builddir/{}/{}: {}.{} {} | {} {} {} {}\n'.format(mode, binary, link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep, fmt_dep))
                 f.write('   libs = {}\n'.format(local_libs))
-                f.write('build $builddir/{}/{}_g: {}.{} {} | {} {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep))
+                f.write('build $builddir/{}/{}_g: {}.{} {} | {} {} {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep, fmt_dep))
                 f.write('   libs = {}\n'.format(local_libs))
             else:
                 if binary == 'scylla':
                     local_libs += f' {seastar_testing_libs}'
-                f.write('build $builddir/{}/{}: {}.{} {} | {} {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep))
+                f.write('build $builddir/{}/{}: {}.{} {} | {} {} {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep, fmt_dep))
                 f.write('   libs = {}\n'.format(local_libs))
                 f.write(f'build $builddir/{mode}/{binary}.stripped: strip $builddir/{mode}/{binary}\n')
                 f.write(f'build $builddir/{mode}/{binary}.debug: phony $builddir/{mode}/{binary}.stripped\n')
@@ -2870,10 +3176,6 @@ def write_build_file(f,
         gen_headers += list(ragels.keys())
         gen_headers += list(rust_headers.keys())
         gen_headers.append('$builddir/{}/gen/rust/cxx.h'.format(mode))
-        # The AWS error definitions header is included (transitively) by
-        # anything that touches utils/s3/aws_error.hh, so it must exist on
-        # disk before any translation unit is compiled.
-        gen_headers.append(aws_errors_gen_hh)
         gen_headers_dep = ' '.join(gen_headers)
 
         for hh in rust_headers:
@@ -2902,19 +3204,6 @@ def write_build_file(f,
         for hh in serializers:
             src = serializers[hh]
             f.write('build {}: serializer {} | idl-compiler.py\n'.format(hh, src))
-        f.write('build {hh} {cc}: aws_service_errors | utils/s3/gen_aws_service_errors.py utils/s3/aws_error_definitions.hh.in utils/s3/aws_error_definitions.cc.in\n'
-                '  out_dir = {out_dir}\n'.format(
-                    hh=aws_errors_gen_hh, cc=aws_errors_gen_cc,
-                    out_dir=aws_errors_gen_dir))
-        # Compile the generated .cc so it can be linked into any binary
-        # that consumes utils/s3/aws_error.cc (see the objs loop above).
-        # The generated .cc lives under $builddir/{mode}/gen/utils/s3/ but
-        # still uses `#include "aws_error.hh"` inherited from the template,
-        # so we add an extra -iquote for utils/s3 to resolve it.
-        f.write('build {obj}: cxx.{mode} {cc} | {profile_dep}\n'
-                '  obj_cxxflags = -iquote utils/s3\n'.format(
-                    obj=aws_errors_gen_obj, mode=mode, cc=aws_errors_gen_cc,
-                    profile_dep=profile_dep))
         for hh in ragels:
             src = ragels[hh]
             f.write('build {}: ragel {}\n'.format(hh, src))
@@ -2944,14 +3233,28 @@ def write_build_file(f,
 
         seastar_dep = f'$builddir/{mode}/seastar/libseastar.{seastar_lib_ext}'
         seastar_testing_dep = f'$builddir/{mode}/seastar/libseastar_testing.{seastar_lib_ext}'
-        f.write(f'build {seastar_dep}: ninja $builddir/{mode}/seastar/build.ninja | always {profile_dep}\n')
+        f.write(f'build {seastar_dep}: ninja $builddir/{mode}/seastar/build.ninja | always {fmt_lib(mode, modeval)} {c_ares_lib(outdir, mode)} {profile_dep}\n')
         f.write('  pool = submodule_pool\n')
         f.write(f'  subdir = $builddir/{mode}/seastar\n')
         f.write('  target = seastar\n')
-        f.write(f'build {seastar_testing_dep}: ninja $builddir/{mode}/seastar/build.ninja | always {profile_dep}\n')
+        f.write(f'build {seastar_testing_dep}: ninja $builddir/{mode}/seastar/build.ninja | always {fmt_lib(mode, modeval)} {c_ares_lib(outdir, mode)} {profile_dep}\n')
         f.write('  pool = submodule_pool\n')
         f.write(f'  subdir = $builddir/{mode}/seastar\n')
         f.write('  target = seastar_testing\n')
+        f.write(f'  profile_dep = {profile_dep}\n')
+
+        f.write(f'build {fmt_lib(mode, modeval)}: ninja $builddir/{mode}/fmt/build.ninja | always {profile_dep}\n')
+        f.write(f'  pool = submodule_pool\n')
+        f.write(f'  subdir = $builddir/{mode}/fmt\n')
+        f.write(f'  target = fmt\n')
+        f.write(f'  profile_dep = {profile_dep}\n')
+
+        # 'install' rather than a library target: Seastar consumes c-ares out
+        # of the install prefix (see c_ares_install_dir()).
+        f.write(f'build {c_ares_lib(outdir, mode)}: ninja $builddir/{mode}/c-ares/build.ninja | always {profile_dep}\n')
+        f.write(f'  pool = submodule_pool\n')
+        f.write(f'  subdir = $builddir/{mode}/c-ares\n')
+        f.write(f'  target = install\n')
         f.write(f'  profile_dep = {profile_dep}\n')
 
         for lib in abseil_libs:
@@ -3123,13 +3426,24 @@ def write_build_file(f,
     for mode in build_modes:
         build_ninja_files += [f'{outdir}/{mode}/seastar/build.ninja']
         build_ninja_files += [f'{outdir}/{mode}/abseil/build.ninja']
+        build_ninja_files += [f'{outdir}/{mode}/fmt/build.ninja']
+        build_ninja_files += [f'{outdir}/{mode}/c-ares/build.ninja']
+
+    # Re-run configure.py (and with it, cmake) whenever the cmake
+    # configuration of a submodule changes.
+    cmake_deps = [f'{args.seastar_path}/CMakeLists.txt']
+    for mode in build_modes:
+        for submodule in ['seastar', 'abseil']:
+            cmake_deps += cmake_input_files(f'{outdir}/{mode}/{submodule}')
+    cmake_deps = sorted(set(ninja_escape_path(dep) for dep in cmake_deps))
+    cmake_deps_list = ' '.join(cmake_deps)
 
     f.write(textwrap.dedent('''\
         rule configure
           command = ./configure.py --out={buildfile_final_name}.new --out-final-name={buildfile_final_name} $configure_args && mv {buildfile_final_name}.new {buildfile_final_name}
           generator = 1
           description = CONFIGURE $configure_args
-        build {buildfile_final_name} {build_ninja_list}: configure | configure.py SCYLLA-VERSION-GEN $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE {args.seastar_path}/CMakeLists.txt
+        build {buildfile_final_name} {build_ninja_list}: configure | configure.py SCYLLA-VERSION-GEN $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE {cmake_deps_list}
         rule cscope
             command = find -name '*.[chS]' -o -name "*.cc" -o -name "*.hh" | cscope -bq -i-
             description = CSCOPE
@@ -3138,12 +3452,15 @@ def write_build_file(f,
             command = rm -rf build
             description = CLEAN
         build clean: clean
+        # A missing cmake input file is not an error: the submodule
+        # configuration changed, and re-running configure.py picks that up.
+        build {cmake_deps_list}: phony
         rule mode_list
             command = echo {modes_list}
             description = List configured modes
         build mode_list: mode_list
         default {modes_list}
-        ''').format(modes_list=' '.join(default_modes), build_ninja_list=" ".join(build_ninja_files), **globals()))
+        ''').format(modes_list=' '.join(default_modes), build_ninja_list=" ".join(build_ninja_files), cmake_deps_list=cmake_deps_list, **globals()))
     unit_test_list = set(test for test in build_artifacts if test in set(tests))
     f.write(textwrap.dedent('''\
         rule unit_test_list
@@ -3194,9 +3511,18 @@ def create_build_system(args):
         # {outdir}/{mode}/seastar/build.ninja, and
         # {outdir}/{mode}/seastar/seastar.pc is queried for building flags
         for mode, mode_config in build_modes.items():
+            # fmt and c-ares must be configured before Seastar is, so that
+            # Seastar's find_package() resolves fmt's build tree (via
+            # fmt_ROOT) and c-ares's install prefix (via c-ares_ROOT).
+            configure_fmt(outdir, mode, mode_config, compiler_cache)
+            configure_c_ares(outdir, mode, mode_config, compiler_cache)
             configure_seastar(outdir, mode, mode_config, compiler_cache)
             configure_abseil(outdir, mode, mode_config, compiler_cache)
         user_cflags += ' -isystem abseil'
+        # Compile against the bundled fmt submodule headers rather than
+        # whatever version happens to be installed on the host. The matching
+        # library is built and linked per-mode (see fmt_link_flags()).
+        user_cflags += ' -isystem fmt/include'
 
     for mode, mode_config in build_modes.items():
         mode_config.update(query_seastar_flags(f'{outdir}/{mode}/seastar/seastar.pc',

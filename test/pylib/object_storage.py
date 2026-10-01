@@ -10,19 +10,31 @@ Classes, factory functions, and shared pytest fixtures used by
 test/cluster/object_store/ and test/cqlpy/ tests.
 """
 
-import os
+import asyncio
+import contextlib
 import logging
+import os
 import re
+import sys
 import uuid
+from collections.abc import Awaitable, Callable
+from operator import attrgetter
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Literal
 
-from test.pylib.minio_server import MinioServer
+import boto3
+import pytest
+import requests
+
 from test.pylib.dockerized_service import DockerizedServer
 from test.pylib.host_registry import HostRegistry
-from operator import attrgetter
+from test.pylib.s3mock_server import S3MockServer, create_conf
 
-import pytest
-import boto3
-import requests
+
+type StorageKind = Literal["s3", "gs"]
+type Storage = S3Server | GSFront
+type StorageFactory = Callable[[StorageKind], Awaitable[Storage]]
 
 
 def format_tuples(tuples=None, **kwargs):
@@ -74,7 +86,7 @@ class S3Server:
         return 'S3'
 
     def create_endpoint_conf(self):
-        return MinioServer.create_conf(self.address, self.region)
+        return create_conf(self.address, self.region)
 
     def get_resource(self):
         """Creates boto3.resource object that can be used to communicate to the given server"""
@@ -125,49 +137,32 @@ class S3Server:
 S3_Server = S3Server
 
 
-class MinioWrapper(S3Server):
-    def __init__(self, tempdir, log_dir=None):
-        self.host_registry = HostRegistry()
-        self.leased_host = None
+class S3MockWrapper(S3Server):
+    def __init__(self, log_dir):
         self.server = None
         self.log_dir = log_dir
         # Fields are fully initialized by start(); base-class values are
-        # placeholders until then.
-        super().__init__(tempdir, '', 0, '', '', MinioServer.DEFAULT_REGION, '')
-
-    def create_endpoint_conf(self):
-        return MinioServer.create_conf(self.address, self.region)
+        # placeholders until then. The server keeps its objects inside the
+        # container, so it has no use for a temporary directory either.
+        super().__init__('', '', 0, '', '', S3MockServer.DEFAULT_REGION, '')
 
     async def start(self):
-        self.leased_host = await self.host_registry.lease_host()
-        self.server = MinioServer(self.tempdir,
-                                  self.leased_host,
-                                  logging.getLogger('minio'),
-                                  log_dir=self.log_dir)
-        try:
-            await self.server.start()
-        except Exception:
-            await self.host_registry.release_host(self.leased_host)
-            self.leased_host = None
-            raise
-        self.ip = self.server.address
-        self.port = self.server.port
-        self.address = f'http://{self.ip}:{self.port}'
-        self.acc_key = self.server.access_key
-        self.secret_key = self.server.secret_key
-        self.bucket_name = self.server.bucket_name
+        server = S3MockServer(self.log_dir, logging.getLogger('s3mock'))
+        await server.start()
+        self.server = server
+        self.ip = server.address
+        self.port = server.port
+        self.address = server.uri
+        self.acc_key = server.access_key
+        self.secret_key = server.secret_key
+        self.bucket_name = server.bucket_name
 
     async def stop(self):
-        try:
-            if self.server is not None:
-                # Dropped only on success, so that a retry still has a
-                # server to stop.
-                await self.server.stop()
-                self.server = None
-        finally:
-            if self.leased_host is not None:
-                await self.host_registry.release_host(self.leased_host)
-                self.leased_host = None
+        if self.server is not None:
+            # Dropped only on success, so that a retry still has a
+            # server to stop.
+            await self.server.stop()
+            self.server = None
 
 
 class GSFront:
@@ -233,10 +228,117 @@ class GSFront:
         pass
 
 
+VALIDATOR_PORT_RE = re.compile(r"Starting GCS upload validator on \('[^']+', (\d+)\)")
+
+
+async def start_gcs_upload_validator(upstream_host, upstream_port, log_dir, timeout=30):
+    """Run test/pylib/gcs_upload_validator.py in front of a fake-gcs-server.
+
+    Returns (handle, port). See the script for what it enforces and why.
+    """
+    script = Path(__file__).parent / 'gcs_upload_validator.py'
+    logf = None
+    if log_dir:
+        # log_dir is the shared suite log dir and this fixture is per test, so
+        # the name has to be unique or parallel tests truncate each other's log
+        # -- DockerizedServer does the same for the mock's own log.
+        logpath = Path(log_dir) / f'gcs-upload-validator-{uuid.uuid4()}.log'
+        logging.info('GCS upload validator log: %s', logpath)
+        logf = open(logpath, 'wb')
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(script),
+            '--upstream-host', str(upstream_host),
+            '--upstream-port', str(upstream_port),
+            '--bind-host', str(upstream_host),
+            '--port', '0',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except BaseException:
+        if logf:
+            logf.close()
+        raise
+
+    async def read_port():
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                raise RuntimeError('GCS upload validator exited before reporting a port')
+            if logf:
+                logf.write(line)
+            m = VALIDATOR_PORT_RE.search(line.decode(errors='replace'))
+            if m:
+                return int(m.group(1))
+
+    try:
+        port = await asyncio.wait_for(read_port(), timeout)
+    except BaseException:
+        # BaseException, not Exception: a cancelled setup would otherwise leave
+        # the validator running, and the caller cannot clean it up either since
+        # it never got the handle.
+        # The validator has usually exited on its own here -- that is what this
+        # path is for -- and terminating a reaped process raises
+        # ProcessLookupError, which would replace the error that actually
+        # explains the failure and skip the cleanup below.
+        try:
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
+                await proc.wait()
+        finally:
+            if logf:
+                logf.close()
+        raise
+
+    async def drain():
+        # keep the pipe empty and the rejections in the log
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                return
+            if logf:
+                logf.write(line)
+                logf.flush()
+            if b'REJECT' in line:
+                logging.error('%s', line.decode(errors='replace').rstrip())
+
+    handle = SimpleNamespace(proc=proc, drain=asyncio.create_task(drain()), logf=logf)
+    logging.info('GCS upload validator listening on %s:%s -> %s:%s',
+                 upstream_host, port, upstream_host, upstream_port)
+    return handle, port
+
+
+async def stop_gcs_upload_validator(handle):
+    try:
+        if handle.proc.returncode is None:
+            handle.proc.terminate()
+            try:
+                await asyncio.wait_for(handle.proc.wait(), 10)
+            except asyncio.TimeoutError:
+                handle.proc.kill()
+                await handle.proc.wait()
+        handle.drain.cancel()
+        try:
+            await handle.drain
+        except asyncio.CancelledError:
+            pass
+    finally:
+        # A cancelled teardown has to release these too -- the callback is
+        # popped once, so nothing retries it. Cancelling before the close is
+        # race-free: drain only runs while this coroutine is suspended, so it
+        # cannot be part-way through a write here.
+        handle.drain.cancel()
+        if handle.logf:
+            handle.logf.close()
+
+
 class GSServerImpl(GSFront):
     def __init__(self, log_dir):
         super(GSServerImpl, self).__init__(None, 'testbucket', None)
         self.server = None
+        self.validator = None
         self.host = None
         self.port = None
         self.oldvars = {}
@@ -278,6 +380,24 @@ class GSServerImpl(GSFront):
         await self.server.start()
         self.port = self.server.port
         self.host = self.server.host
+
+        # fake-gcs-server accepts any Content-Range it is given, so protocol
+        # level upload bugs are invisible when testing against it
+        # (SCYLLADB-3889). Unless disabled, front it with a validator that
+        # enforces what real GCS enforces, and hand its address out instead.
+        if not os.environ.get('GCP_STORAGE_SKIP_UPLOAD_VALIDATOR'):
+            try:
+                self.validator, validator_port = await start_gcs_upload_validator(
+                    self.host, self.port, self.log_dir)
+            except BaseException:
+                # Nothing frees the server until make_object_storage() has
+                # registered its teardown callback, which happens only once
+                # start() returns, so the container is ours to clean up here.
+                await self.server.stop()
+                self.server = None
+                raise
+            self.port = validator_port
+
         self.publish()
 
 
@@ -317,19 +437,31 @@ class GSServerImpl(GSFront):
         self.bucket_name = None
 
     async def stop(self):
-        if self.server:
-            # Dropped only on success, so that a retry still has a server to
-            # stop.
-            await self.server.stop()
-            self.server = None
-        self.unpublish()
+        # This runs as a cluster teardown callback, and those have their
+        # exceptions swallowed. Nesting the steps keeps a failure in one from
+        # stranding the container or leaving GS_SERVER_ADDRESS_FOR_TEST pointed
+        # at a dead validator, which every later gs test in this worker would
+        # then pick up.
+        try:
+            if self.validator:
+                await stop_gcs_upload_validator(self.validator)
+                self.validator = None
+        finally:
+            try:
+                if self.server:
+                    # Dropped only on success, so that a retry still has a
+                    # server to stop.
+                    await self.server.stop()
+                    self.server = None
+            finally:
+                self.unpublish()
 
 
 # Keep the old name as an alias for backward compatibility (conftest.py imports it)
 GSServer = GSServerImpl
 
 
-def create_s3_server(pytestconfig, tmpdir, log_dir=None):
+def create_s3_server(pytestconfig, tmpdir, log_dir):
     server = None
     s3_server_address = pytestconfig.getoption('--s3-server-address')
     s3_server_port = pytestconfig.getoption('--s3-server-port')
@@ -338,12 +470,12 @@ def create_s3_server(pytestconfig, tmpdir, log_dir=None):
     aws_region = pytestconfig.getoption('--aws-region')
     s3_server_bucket = pytestconfig.getoption('--s3-server-bucket')
 
-    default_address = os.environ.get(MinioServer.ENV_ADDRESS)
-    default_port = os.environ.get(MinioServer.ENV_PORT)
-    default_acc_key = os.environ.get(MinioServer.ENV_ACCESS_KEY)
-    default_secret_key = os.environ.get(MinioServer.ENV_SECRET_KEY)
-    default_region = MinioServer.DEFAULT_REGION
-    default_bucket = os.environ.get(MinioServer.ENV_BUCKET)
+    default_address = os.environ.get(S3MockServer.ENV_ADDRESS)
+    default_port = os.environ.get(S3MockServer.ENV_PORT)
+    default_acc_key = os.environ.get(S3MockServer.ENV_ACCESS_KEY)
+    default_secret_key = os.environ.get(S3MockServer.ENV_SECRET_KEY)
+    default_region = S3MockServer.DEFAULT_REGION
+    default_bucket = os.environ.get(S3MockServer.ENV_BUCKET)
 
     # Note: bucket_name passed here is overwritten by create_test_bucket() when
     # using the s3_server fixture. The --s3-server-bucket option currently only
@@ -366,7 +498,7 @@ def create_s3_server(pytestconfig, tmpdir, log_dir=None):
                           default_region,
                           default_bucket)
     else:
-        server = MinioWrapper(tempdir, log_dir)
+        server = S3MockWrapper(log_dir)
     return server
 
 

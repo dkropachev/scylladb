@@ -646,10 +646,12 @@ async def test_enforce_rack_list_option(request: pytest.FixtureRequest, manager:
     injection = "create_with_numeric"
     config = {"tablets_mode_for_new_keyspaces": "enabled", "error_injections_at_startup": [injection]}
 
-    servers = [await manager.server_add(config=config, cmdline=['--smp=2'], property_file={'dc': 'dc1', 'rack': 'rack1a'}),
-                await manager.server_add(config=config, cmdline=['--smp=2'], property_file={'dc': 'dc1', 'rack': 'rack1b'}),
-                await manager.server_add(config=config, cmdline=['--smp=2'], property_file={'dc': 'dc2', 'rack': 'rack2a'}),
-                await manager.server_add(config=config, cmdline=['--smp=2'], property_file={'dc': 'dc2', 'rack': 'rack2b'})]
+    servers = await manager.servers_add(4, config=config, cmdline=['--smp=2'], property_file=[
+        {'dc': 'dc1', 'rack': 'rack1a'},
+        {'dc': 'dc1', 'rack': 'rack1b'},
+        {'dc': 'dc2', 'rack': 'rack2a'},
+        {'dc': 'dc2', 'rack': 'rack2b'},
+    ])
 
     cql = manager.get_cql()
     host = (await wait_for_cql_and_get_hosts(cql, [servers[0]], time.time() + 30))[0]
@@ -1256,9 +1258,11 @@ async def test_failed_tablet_rebuild_is_retried(request: pytest.FixtureRequest, 
         '--smp=2',
     ]
 
-    servers = [await manager.server_add(config=config, cmdline=cmdline, property_file={'dc': 'dc1', 'rack': 'rack1a'}),
-                await manager.server_add(config=config, cmdline=cmdline, property_file={'dc': 'dc1', 'rack': 'rack1b'}),
-                await manager.server_add(config=config, cmdline=cmdline, property_file={'dc': 'dc1', 'rack': 'rack1c'})]
+    servers = await manager.servers_add(3, config=config, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1a'},
+        {'dc': 'dc1', 'rack': 'rack1b'},
+        {'dc': 'dc1', 'rack': 'rack1c'},
+    ])
 
     cql = manager.get_cql()
 
@@ -2551,7 +2555,7 @@ async def test_repair_with_invalid_session_id(manager: ScyllaClusterManager):
     [await manager.api.enable_injection(s.ip_addr, injection, one_shot=True) for s in servers]
     await manager.api.tablet_repair(servers[0].ip_addr, ks, "test", token)
 
-    matches = [await log.grep(r"std::runtime_error \(Session not found", from_mark=mark) for log, mark in zip(logs, marks)]
+    matches = [await log.grep(r"std::runtime_error: Session not found", from_mark=mark) for log, mark in zip(logs, marks)]
     assert sum(len(x) for x in matches) > 0
 
 async def test_moving_replica_to_replica(manager: ScyllaClusterManager):
@@ -2852,6 +2856,12 @@ async def test_split_completion_with_data_in_main_cg(manager: ScyllaClusterManag
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int) WITH tablets = {{'min_tablet_count': 1}};")
         await cql.run_async(f"ALTER TABLE {ks}.test WITH tablets = {{'min_tablet_count': 2}};")
 
+        # All the log messages below are matched against this table only.  Other tables
+        # (in particular system keyspaces once they are migrated from vnodes to tablets)
+        # can be split concurrently and emit the very same messages.
+        table = re.escape(f"{ks}.test")
+        table_id = (await cql.run_async(f"SELECT id FROM system_schema.tables WHERE keyspace_name = '{ks}' AND table_name = 'test'"))[0].id
+
         # Configure the target to hold the split monitor at startup.
         await manager.server_update_config(target.server_id, "error_injections_at_startup", ['tablet_split_monitor_wait'])
 
@@ -2864,10 +2874,20 @@ async def test_split_completion_with_data_in_main_cg(manager: ScyllaClusterManag
 
         log_target = await manager.server_open_log(target.server_id)
 
+        # The node starts serving CQL before it finishes replaying the group0
+        # entries it missed while down: the replay only starts once the failure
+        # detector marks the peers alive, so entries A and B are applied some
+        # time after server_start() returns.  Issue a group0 read barrier to
+        # make sure the target has caught up before looking at its log.
+        await read_barrier(manager.api, target.ip_addr)
+
         # Verify the fix code path was hit: the log message from the else-if
         # branch in update_effective_replication_map().
-        matches = await log_target.grep('Detected new split decision for table.*setting split mode on existing storage groups')
-        assert matches, "Fix code path not hit: set_split_mode() was not called via update_effective_replication_map()"
+        try:
+            await log_target.wait_for(f'Detected new split decision for table {table} at tablet count .*, '
+                                      'setting split mode on existing storage groups', timeout=60)
+        except TimeoutError:
+            pytest.fail("Fix code path not hit: set_split_mode() was not called via update_effective_replication_map()")
 
         # Insert data to confirm writes land in split-ready groups (not _main_cg).
         keys = range(100)
@@ -2881,12 +2901,12 @@ async def test_split_completion_with_data_in_main_cg(manager: ScyllaClusterManag
         await manager.api.message_injection(target.ip_addr, "tablet_split_monitor_wait")
 
         # Wait for the split to complete on the target node.
-        await log_target.wait_for('Detected tablet split for table', from_mark=mark_target, timeout=60)
+        await log_target.wait_for(f'Detected tablet split for table {table}, increasing from ', from_mark=mark_target, timeout=60)
 
         # The bug manifests as on_internal_error logged at ERR level.
         # With the fix, _main_cg is empty because set_split_mode() was called
         # during Raft log replay, so writes landed in split-ready groups.
-        errors = await log_target.grep("wasn't split correctly", from_mark=mark_target)
+        errors = await log_target.grep(f"Found that storage of group .* for table {table_id} wasn't split correctly", from_mark=mark_target)
         assert not errors, f"Crash reproduced — storage group wasn't split correctly: {errors}"
 
         # Release the split monitor hold for clean shutdown.

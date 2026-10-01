@@ -19,6 +19,7 @@
 
 #include <seastar/core/align.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/metrics.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/units.hh>
@@ -31,6 +32,7 @@
 #include "utils/exceptions.hh"
 #include "utils/http.hh"
 #include "utils/http_client_error_processing.hh"
+#include "utils/object_storage_metrics.hh"
 #include "utils/overloaded_functor.hh"
 
 static logger gcp_storage("gcp_storage");
@@ -44,6 +46,10 @@ static constexpr char GCP_OBJECT_SCOPE_FULL_CONTROL[] = "https://www.googleapis.
 
 static constexpr char STORAGE_APIS_URI[] = "https://storage.googleapis.com";
 static constexpr char APPLICATION_JSON[] = "application/json";
+// A cancelled resumable upload is answered with 499, which seastar's status_type
+// does not name.
+static constexpr int CLIENT_CLOSED_REQUEST = 499;
+
 static constexpr char LOCATION[] = "Location";
 static constexpr char CONTENT_RANGE[] = "Content-Range";
 static constexpr char RANGE[] = "Range";
@@ -118,9 +124,16 @@ public:
             } catch (...) {
                 _exception = std::current_exception();
             }
-            if (auto ex = std::exchange(_exception, {})) {
-                co_await remove_upload();
-                std::rethrow_exception(ex);
+            if (_exception) {
+                // Cancelling is best effort: whether it fails in remove_upload() itself or
+                // in the request under it, the upload's own error is the one the caller
+                // needs, so hold it across the cancel and rethrow it below.
+                try {
+                    co_await remove_upload();
+                } catch (...) {
+                    gcp_storage.warn("Could not cancel upload of {}:{}: {}", _bucket, _object_name, std::current_exception());
+                }
+                std::rethrow_exception(std::exchange(_exception, {}));
             }
         }
     }
@@ -129,9 +142,15 @@ public:
         return min_gcp_storage_chunk_size;
     }
 
+    struct session_status {
+        bool completed = false;   // the service finalized the object while we asked
+        uint64_t committed = 0;
+    };
+
     future<> acquire_session();
     future<> do_single_upload(std::deque<temporary_buffer<char>>, size_t offset, size_t len, bool final);
     future<> check_upload();
+    future<session_status> query_session();
     future<> remove_upload();
     future<> adjust_memory_limit(size_t);
     future<> maybe_do_upload(bool force) {
@@ -298,6 +317,9 @@ class utils::gcp::storage::client::impl {
     seastar::semaphore _unlimited;
     seastar::semaphore& _limits;
     seastar::http::client _client;
+    uint64_t _read_bytes = 0;
+    uint64_t _write_bytes = 0;
+    std::optional<utils::http_client_metrics> _metrics;
     shared_ptr<seastar::tls::certificate_credentials> _certs;
     seastar::gate _gate;
     future<> authorize(request_wrapper& req, const std::string& scope);
@@ -315,6 +337,17 @@ public:
     auto try_get_units(size_t s) const {
         return seastar::try_get_units(_limits, s);
     }
+    void count_read_bytes(uint64_t bytes) {
+        _read_bytes += bytes;
+    }
+    void count_write_bytes(uint64_t bytes) {
+        _write_bytes += bytes;
+    }
+    utils::object_storage_bytes bytes() const {
+        return {.read = _read_bytes, .written = _write_bytes};
+    }
+    void register_metrics(utils::object_storage_metrics_labels);
+    void unregister_metrics();
     future<> close();
 };
 
@@ -399,6 +432,7 @@ public:
                         auto n = std::min(buf.size(), len - result);
                         std::copy_n(buf.get(), n, dst + result);
                         result += n;
+                        _impl->count_read_bytes(n);
                     }
                 },
                 httpclient::method_type::GET,
@@ -581,7 +615,7 @@ utils::gcp::storage::client::impl::send_with_retry(const std::string& path, cons
              * resumable upload protocol works.
              */
             if (status_class != reply::status_class::informational && status_class != reply::status_class::success &&
-                rep._status != status_type::permanent_redirect) {
+                rep._status != status_type::permanent_redirect && int(rep._status) != CLIENT_CLOSED_REQUEST) {
                 if (rep._status == status_type::unauthorized) {
                     gcp_storage.warn("Request to failed with status {}. Refreshing credentials.", rep._status);
                     co_await authorize(req, scope);
@@ -626,7 +660,7 @@ utils::gcp::storage::client::impl::send_with_retry(const std::string& path, cons
 
             throw storage_io_error{EIO, format("GCP request failed with ({})", status)};
         } catch (...) {
-            throw storage_io_error{EIO, format("GCP error ({})", std::current_exception())};
+            throw storage_io_error{EIO, format("GCP error ({:t})", std::current_exception())};
         }
     }
 }
@@ -652,6 +686,14 @@ utils::gcp::storage::client::impl::send_with_retry(const std::string& path, cons
         res.reply._version = r._version;
     }, op, headers, as);
     co_return res;
+}
+
+void utils::gcp::storage::client::impl::register_metrics(utils::object_storage_metrics_labels labels) {
+    _metrics.emplace(_client, std::move(labels));
+}
+
+void utils::gcp::storage::client::impl::unregister_metrics() {
+    _metrics.reset();
 }
 
 future<> utils::gcp::storage::client::impl::close() {
@@ -745,10 +787,23 @@ future<> utils::gcp::storage::client::object_data_sink::do_single_upload(std::de
     // Enforce our concurrency constraints
     auto sem_units = co_await seastar::get_units(_semaphore, 1);
 
+    if (_exception) {
+        // An earlier chunk failed while this one waited its turn, so the session is not
+        // where this chunk expects it to be.
+        gcp_storage.debug("{}:{} skipping the chunk at {} after an earlier failure", _bucket, _object_name, offset);
+        co_return;
+    }
+
     // our file range. if the sink was closed, we can set the
     // final size, otherwise, leave it open (*)
     auto last = offset + std::max(len, size_t(1)) - 1; // inclusive.
     auto end = offset + len;
+
+    // A server that keeps not advancing would otherwise spin here. The bound covers the
+    // whole loop, so it does not matter which branch below decided not to move `offset`.
+    constexpr unsigned max_stalled = 10;
+    unsigned stalled = 0;
+    auto progress_at = offset;
 
     for (;;) {
         // A zero-length chunk names no bytes, so it must not name a last byte:
@@ -766,6 +821,15 @@ future<> utils::gcp::storage::client::object_data_sink::do_single_upload(std::de
             );
 
         try {
+            if (offset != progress_at) {
+                progress_at = offset;
+                stalled = 0;
+            } else if (stalled++ == max_stalled) {
+                throw failed_upload_error(308, fmt::format("{}:{} made no progress at offset {} in {} attempts"
+                    , _bucket, _object_name, offset, stalled
+                ));
+            }
+
             if (_session_path.empty()) {
                 co_await acquire_session();
             }
@@ -792,19 +856,59 @@ future<> utils::gcp::storage::client::object_data_sink::do_single_upload(std::de
             case status_type::ok:
             case status_type::created:
                 _completed = true;
+                _impl->count_write_bytes(len);
                 gcp_storage.debug("{}:{} completed ({} bytes)", _bucket, _object_name, offset+len);
                 co_return; // done and happy
             default:
                 if (int(res.result()) == 308) {
+                    // A Range on a 308 reports what the session holds, counted from byte 0. It
+                    // never describes this chunk, so its absence says only that we do not know
+                    // where the session stands - ask instead of assuming the chunk was dropped.
+                    // https://docs.cloud.google.com/storage/docs/performing-resumable-uploads
                     uint64_t first = 0, new_last = 0;
-                    if (parse_response_range(res.reply, first, new_last) && last != new_last) {
-                        auto written = (new_last + 1) - offset;
+                    uint64_t committed = 0;
 
-                        gcp_storage.debug("{}:{} partial upload ({} bytes)", _bucket, _object_name, written);
+                    if (parse_response_range(res.reply, first, new_last)) {
+                        committed = new_last + 1;
+                    } else if (len == 0) {
+                        // the "bytes */<total>" finalize names no chunk to resend; leave the
+                        // session where it is and let check_upload() settle the object
+                        committed = offset;
+                    } else {
+                        auto status = co_await query_session();
+                        if (status.completed) {
+                            _impl->count_write_bytes(len);
+                            co_return;
+                        }
+                        committed = status.committed;
+                    }
+
+                    if (committed < offset) {
+                        // The session lost bytes it had already acknowledged, and
+                        // maybe_do_upload() released the buffers holding them, so the upload
+                        // can never be made contiguous again.
+                        throw failed_upload_error(int(res.result()), fmt::format("{}:{} session holds {} bytes, behind the chunk at offset {}"
+                            , _bucket, _object_name, committed, offset
+                        ));
+                    }
+
+                    auto acknowledged = committed - offset;
+
+                    if (acknowledged < len) {
+                        auto written = acknowledged;
+
+                        gcp_storage.debug("{}:{} session holds {} bytes, {} of the chunk at {}"
+                            , _bucket, _object_name, committed, acknowledged, offset
+                        );
 
                         if (!final && (len - written) < min_gcp_storage_chunk_size) {
                             written = len - std::min(min_gcp_storage_chunk_size, len);
                         }
+
+                        // The rewind above can put some acknowledged bytes back in
+                        // the queue to keep the next chunk aligned, so they go over
+                        // the wire twice. Count the bytes the object keeps, once.
+                        _impl->count_write_bytes(written);
 
                         auto to_remove = written;
                         while (to_remove) {
@@ -824,7 +928,8 @@ future<> utils::gcp::storage::client::object_data_sink::do_single_upload(std::de
                         assert(len == total);
                         continue;
                     }
-                    // incomplete. ok for partial
+                    // the whole chunk landed
+                    _impl->count_write_bytes(len);
                     gcp_storage.debug("{}:{} chunk {}:{} done", _bucket, _object_name, offset, offset+len);
                     co_return;
                 }
@@ -872,6 +977,39 @@ future<> utils::gcp::storage::client::object_data_sink::check_upload() {
     }
 }
 
+// Ask the service where the session stands. Unlike an upload reply, a 308 here with no
+// Range does mean the session holds nothing.
+// https://docs.cloud.google.com/storage/docs/performing-resumable-uploads#status-check
+future<utils::gcp::storage::client::object_data_sink::session_status>
+utils::gcp::storage::client::object_data_sink::query_session() {
+    auto res = co_await _impl->send_with_retry(_session_path
+        , GCP_OBJECT_SCOPE_READ_WRITE
+        , ""s
+        , APPLICATION_JSON
+        , httpclient::method_type::PUT
+        , rest::key_values({ { CONTENT_RANGE, "bytes */*"s } })
+        , _as
+    );
+
+    switch (res.result()) {
+    case status_type::ok:
+    case status_type::created:
+        // the service finalized the object while we were asking
+        _completed = true;
+        gcp_storage.debug("{}:{} completed while querying the session", _bucket, _object_name);
+        co_return session_status{.completed = true};
+    case status_type::permanent_redirect: {
+        uint64_t first = 0, last = 0;
+        auto held = parse_response_range(res.reply, first, last) ? last + 1 : 0;
+        gcp_storage.debug("{}:{} session holds {} bytes", _bucket, _object_name, held);
+        co_return session_status{.committed = held};
+    }
+    default:
+        throw failed_upload_error(int(res.result()),
+                                  fmt::format("{}:{} could not query the session: {}", _bucket, _object_name, get_gcp_error_message(res.body())));
+    }
+}
+
 // https://cloud.google.com/storage/docs/performing-resumable-uploads#cancel-upload
 future<> utils::gcp::storage::client::object_data_sink::remove_upload() {
     if (_completed || _session_path.empty()) {
@@ -890,19 +1028,15 @@ future<> utils::gcp::storage::client::object_data_sink::remove_upload() {
     );
 
     switch (int(res.result())) {
-    case 499: // not in enum yet
+    case CLIENT_CLOSED_REQUEST:
         gcp_storage.debug("Upload of {}:{} removed ({})", _bucket, _object_name, _session_path);
         co_return; // done and happy
-    default: {
-        auto msg = get_gcp_error_message(res.body());
-        gcp_storage.warn("Failed to remove broken upload of {}:{} ({})", _bucket, _object_name, msg);
-        if (!_exception) {
-            throw failed_upload_error(int(res.result()), fmt::format("{}:{} incomplete. ({}): {}"
-                , _bucket, _object_name, res.reply._headers[RANGE]
-                , msg
-            ));
-        }
-    }
+    default:
+        // Only close() cancels, and only once the upload has already failed, so there is
+        // no caller left for this status to be reported to. Warn and let the upload's own
+        // error stand.
+        gcp_storage.warn("Failed to remove broken upload of {}:{} ({})", _bucket, _object_name, get_gcp_error_message(res.body()));
+        break;
     }
 }
 
@@ -955,6 +1089,7 @@ future<temporary_buffer<char>> utils::gcp::storage::client::object_data_source::
                     auto bufs = co_await util::read_entire_stream(in);
                     for (auto&& buf : bufs) {
                         s.position += buf.size();
+                        _impl->count_read_bytes(buf.size());
                         s.buffers.emplace_back(std::move(buf));
                     }
                     gcp_storage.debug("Read object {}:{} ({}-{}/{})", _bucket, _object_name, old, s.position, _size);
@@ -1161,6 +1296,23 @@ future<> utils::gcp::storage::client::delete_bucket(std::string_view bucket_in, 
     }
 }
 
+// The GCS object resource carries user-defined attributes in its "metadata"
+// member.  Callers hand us plain key/value pairs, so building that member -- and
+// knowing that this is where GCS keeps them -- belongs here rather than in the
+// generic object-storage layer above.
+static rjson::value make_object_resource(const utils::gcp::storage::object_metadata& metadata) {
+    if (metadata.empty()) {
+        return {};
+    }
+    rjson::value members = rjson::empty_object();
+    for (const auto& [key, value] : metadata) {
+        rjson::add_with_string_name(members, key, rjson::from_string(value));
+    }
+    rjson::value resource = rjson::empty_object();
+    rjson::add(resource, "metadata", std::move(members));
+    return resource;
+}
+
 static utils::gcp::storage::object_info create_info(const rjson::value& item) {
     utils::gcp::storage::object_info info;
 
@@ -1169,6 +1321,17 @@ static utils::gcp::storage::object_info create_info(const rjson::value& item) {
     info.size = std::stoull(rjson::get<std::string>(item, "size"));
     info.generation = std::stoull(rjson::get<std::string>(item, "generation"));
     info.modified = parse_rfc3339(rjson::get<std::string>(item, "updated"));
+    // An object with no user-defined attributes has no "metadata" member at all,
+    // but treat an explicit null as the same thing rather than failing the whole
+    // listing over it.
+    if (auto metadata = rjson::find(item, "metadata"); metadata && !metadata->IsNull()) {
+        if (!metadata->IsObject()) {
+            throw utils::gcp::storage::failed_operation("Malformed object metadata");
+        }
+        for (const auto& member : metadata->GetObject()) {
+            info.metadata.emplace(member.name.GetString(), rjson::to_string(member.value));
+        }
+    }
 
     return info;
 }
@@ -1288,7 +1451,7 @@ future<> utils::gcp::storage::client::delete_object(std::string_view bucket_in, 
 // See https://cloud.google.com/storage/docs/copying-renaming-moving-objects
 // GCP does not support moveTo across buckets.
 future<> utils::gcp::storage::client::rename_object(std::string_view bucket, std::string_view object_name, std::string_view new_bucket, std::string_view new_name, seastar::abort_source* as) {
-    co_await copy_object(bucket, object_name, new_bucket, new_name, as);
+    co_await copy_object(bucket, object_name, new_bucket, new_name, object_metadata{}, as);
     co_await delete_object(bucket, object_name, as);
 }
 
@@ -1327,8 +1490,9 @@ future<> utils::gcp::storage::client::rename_object(std::string_view bucket_in, 
 // See https://cloud.google.com/storage/docs/copying-renaming-moving-objects
 // Copying an object in GCP can only process a certain amount of data in one call
 // Must keep doing it until all data is copied, and check response.
-future<> utils::gcp::storage::client::copy_object(std::string_view bucket_in, std::string_view object_name_in, std::string_view new_bucket_in, std::string_view to_name_in, seastar::abort_source* as) {
+future<> utils::gcp::storage::client::copy_object(std::string_view bucket_in, std::string_view object_name_in, std::string_view new_bucket_in, std::string_view to_name_in, object_metadata metadata, seastar::abort_source* as) {
     std::string bucket(bucket_in), object_name(object_name_in), new_bucket(new_bucket_in), to_name(to_name_in);
+    auto resource = make_object_resource(metadata);
 
     auto path = fmt::format("/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}"
         , bucket
@@ -1336,7 +1500,7 @@ future<> utils::gcp::storage::client::copy_object(std::string_view bucket_in, st
         , new_bucket
         , seastar::http::internal::url_encode(to_name)
     );
-    std::string body = "{}";
+    std::string body = resource.IsObject() ? rjson::print(resource) : "{}";
 
     for (;;) {
         auto res = co_await _impl->send_with_retry(path
@@ -1365,7 +1529,9 @@ future<> utils::gcp::storage::client::copy_object(std::string_view bucket_in, st
         auto size = rjson::get<uint64_t>(resp, "objectSize");
 
         // Call 2+ must include the rewriteToken
-        body = fmt::format("{{\"rewriteToken\": \"{}\"}}", token);
+        rjson::value rewrite_request = resource.IsObject() ? rjson::copy(resource) : rjson::empty_object();
+        rjson::add(rewrite_request, "rewriteToken", token);
+        body = rjson::print(rewrite_request);
 
         gcp_storage.debug("Partial copy of {}:{} to {}:{} ({}/{})", bucket, object_name, new_bucket, to_name, written, size);
     }
@@ -1411,12 +1577,12 @@ future<utils::gcp::storage::object_info> utils::gcp::storage::client::merge_obje
     co_return create_info(resp);
 }
 
-future<> utils::gcp::storage::client::copy_object(std::string_view bucket, std::string_view object_name, std::string_view to_name, seastar::abort_source* as) {
-    co_await copy_object(bucket, object_name, bucket, to_name, as);
+future<> utils::gcp::storage::client::copy_object(std::string_view bucket, std::string_view object_name, std::string_view to_name, object_metadata metadata, seastar::abort_source* as) {
+    co_await copy_object(bucket, object_name, bucket, to_name, std::move(metadata), as);
 }
 
-seastar::data_sink utils::gcp::storage::client::create_upload_sink(std::string_view bucket, std::string_view object_name, rjson::value metadata, seastar::abort_source* as) const {
-    return seastar::data_sink(std::make_unique<object_data_sink>(_impl, bucket, object_name, std::move(metadata), as));
+seastar::data_sink utils::gcp::storage::client::create_upload_sink(std::string_view bucket, std::string_view object_name, object_metadata metadata, seastar::abort_source* as) const {
+    return seastar::data_sink(std::make_unique<object_data_sink>(_impl, bucket, object_name, make_object_resource(metadata), as));
 }
 
 seekable_data_source utils::gcp::storage::client::create_download_source(std::string_view bucket, std::string_view object_name, seastar::abort_source* as) const {
@@ -1445,6 +1611,31 @@ future<bool> storage::client::object_exists(std::string_view bucket, std::string
         throw;
     }
     co_return true;
+}
+
+future<utils::gcp::storage::object_info> storage::client::get_object_info(std::string_view bucket_in, std::string_view object_name_in, seastar::abort_source* as) const {
+    std::string bucket(bucket_in), object_name(object_name_in);
+    gcp_storage.debug("Get object metadata {}:{}", bucket, object_name);
+
+    auto path = fmt::format("/storage/v1/b/{}/o/{}", bucket, seastar::http::internal::url_encode(object_name));
+    auto res = co_await _impl->send_with_retry(path, GCP_OBJECT_SCOPE_READ_ONLY, ""s, ""s, httpclient::method_type::GET, {}, as);
+    if (res.result() != status_type::ok) {
+        throw failed_operation(
+            fmt::format("Could not retrieve object metadata {}:{}: {} ({})", bucket, object_name, res.result(), get_gcp_error_message(res.body())));
+    }
+    co_return create_info(rjson::parse(res.body()));
+}
+
+utils::object_storage_bytes utils::gcp::storage::client::bytes() const {
+    return _impl->bytes();
+}
+
+void utils::gcp::storage::client::register_metrics(utils::object_storage_metrics_labels labels) {
+    _impl->register_metrics(std::move(labels));
+}
+
+void utils::gcp::storage::client::unregister_metrics() {
+    _impl->unregister_metrics();
 }
 
 future<> utils::gcp::storage::client::close() {

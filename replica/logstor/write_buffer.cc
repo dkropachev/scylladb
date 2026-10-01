@@ -17,8 +17,8 @@
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/as_future.hh>
 #include "serializer_impl.hh"
-#include "idl/logstor.dist.hh"
-#include "idl/logstor.dist.impl.hh"
+#include "idl/frozen_schema.dist.hh"
+#include "idl/frozen_schema.dist.impl.hh"
 #include <seastar/core/align.hh>
 #include <seastar/core/aligned_buffer.hh>
 #include "utils/crc.hh"
@@ -26,17 +26,13 @@
 namespace replica::logstor {
 
 void log_record_writer::compute_sizes() const {
-    seastar::measuring_output_stream ms_header;
-    ser::serialize(ms_header, _record.header);
-    _header_size = ms_header.size();
-
     seastar::measuring_output_stream ms_data;
     ser::serialize(ms_data, _record.mut);
     _data_size = ms_data.size();
 }
 
 void log_record_writer::write(ostream& out) const {
-    ser::serialize(out, _record.header);
+    ondisk::write_log_record_header(out, _record.header);
     ser::serialize(out, _record.mut);
 }
 
@@ -91,9 +87,13 @@ raw_write_buffer::append_result raw_write_buffer::append_record(const log_record
         throw std::runtime_error("Cannot write empty record");
     }
 
+    if (header_size < ondisk::log_record_header_fixed_size) {
+        on_internal_error(logstor_logger, fmt::format("Log record header size {} is below its fixed size {}", header_size, ondisk::log_record_header_fixed_size));
+    }
+
     size_t record_header_offset = offset_in_buffer();
     auto rh = ondisk::record_header {
-        .header_size = static_cast<uint32_t>(header_size),
+        .key_size = static_cast<uint32_t>(header_size - ondisk::log_record_header_fixed_size),
         .data_size = static_cast<uint32_t>(data_size)
     };
     ser::serialize(_stream, rh);
@@ -106,11 +106,11 @@ raw_write_buffer::append_result raw_write_buffer::append_record(const log_record
 
     _net_data_size += total_size;
     _record_count++;
-    if (!_min_token || header.key.dk.token() < *_min_token) {
-        _min_token = header.key.dk.token();
+    if (!_min_token || header.key.token() < *_min_token) {
+        _min_token = header.key.token();
     }
-    if (!_max_token || header.key.dk.token() > *_max_token) {
-        _max_token = header.key.dk.token();
+    if (!_max_token || header.key.token() > *_max_token) {
+        _max_token = header.key.token();
     }
 
     // Add padding to align record
@@ -189,14 +189,9 @@ future<> write_buffer::abort_writes(std::exception_ptr ex) {
         _written.set_exception(std::move(ex));
     }
 
-    // Mixed buffers keep per-record futures for separator rewriting. When the
-    // flush fails there is no separator pass to consume them, so drain them here
-    // before reset() clears the vector and would otherwise abandon failed futures.
-    auto records = std::exchange(_records_copy, {});
-    for (auto& record : records) {
-        auto f = co_await coroutine::as_future(std::move(record.loc));
-        f.ignore_ready_future();
-    }
+    // Mixed buffers keep copies of their records for separator rewriting. A failed flush has no
+    // separator pass to consume them, and they were never written anywhere, so drop them.
+    _records_copy.clear();
 
     co_await close();
 }
@@ -232,19 +227,12 @@ template <log_record_writer_concept Writer>
 future<log_location_with_holder> write_buffer::write(Writer writer, write_target target) {
     auto append_result = _raw.append(writer);
 
-    auto record_location = [record_header_offset = append_result.record_header_offset, total_size = append_result.total_size] (log_location base_location) {
-        return log_location {
-            .segment = base_location.segment,
-            .offset = static_cast<uint32_t>(base_location.offset + record_header_offset),
-            .size = static_cast<uint32_t>(total_size)
-        };
-    };
-
     if (with_record_copy()) {
         if constexpr (std::same_as<Writer, log_record_writer>) {
             _records_copy.push_back(record_in_buffer {
                 .writer = std::move(writer),
-                .loc = _written.get_shared_future().then(record_location),
+                .offset_in_buffer = append_result.record_header_offset,
+                .size = append_result.total_size,
                 .target = std::move(target)
             });
         } else {
@@ -257,8 +245,10 @@ future<log_location_with_holder> write_buffer::write(Writer writer, write_target
     // as index updates.
     auto op = _write_gate.hold();
 
-    return _written.get_shared_future().then([record_location, op = std::move(op)] (log_location base_location) mutable {
-        return std::make_tuple(record_location(base_location), std::move(op));
+    return _written.get_shared_future().then(
+            [offset_in_buffer = append_result.record_header_offset, size = append_result.total_size, op = std::move(op)]
+            (log_location buffer_location) mutable {
+        return std::make_tuple(record_location(buffer_location, offset_in_buffer, size), std::move(op));
     });
 }
 
@@ -326,7 +316,12 @@ bool ondisk::validate_header(const ondisk::buffer_header& bh) {
 }
 
 bool ondisk::validate_record_header(const ondisk::record_header& rh) {
-    return rh.header_size != 0;
+    // A record always carries a serialized canonical_mutation, so a zero data_size cannot come
+    // from a record this code wrote. It is what a scan sees in the zero-filled tail of a torn
+    // buffer, and rejecting it stops the scan there instead of walking the tail as a run of
+    // zero-length records. The key bound rejects a corrupt header before its key_size is
+    // trusted to size a read or an allocation.
+    return rh.data_size != 0 && rh.key_size <= ondisk::max_key_size;
 }
 
 // write_buffer_pool
@@ -416,7 +411,7 @@ void write_buffer_pool::return_buffer(write_buffer* wb, seastar::semaphore_units
         buf->reset();
         _free.push_back(std::move(buf));
     } catch (...) {
-        logstor_logger.error("Failed to return a write buffer, dropping it from the pool: {}", std::current_exception());
+        logstor_logger.error("Failed to return a write buffer, dropping it from the pool: {:t}", std::current_exception());
         drop_buffer(std::move(buf), pool_units);
     }
 }
@@ -548,7 +543,10 @@ bool buffered_writer::maybe_advance_head() noexcept {
     return true;
 }
 
-std::optional<future<log_location_with_holder>> buffered_writer::append_to_head_buffer(log_record_writer& writer, write_target target) {
+// The target is taken by reference and moved from only once the record is in a buffer: a caller
+// whose append does not happen goes on to queue the record, and the write target it queues has to
+// be the one it came with, holders and all.
+std::optional<future<log_location_with_holder>> buffered_writer::append_to_head_buffer(log_record_writer& writer, write_target& target) {
     if (!head_buf().can_fit(writer) && !maybe_advance_head()) {
         return std::nullopt;
     }
@@ -634,7 +632,7 @@ future<bool> buffered_writer::drain_queued_writes() {
         on_queued_write_removed(request);
         removed_queued_writes = true;
         try {
-            auto persisted = append_to_head_buffer(request.writer, std::move(request.target)).value();
+            auto persisted = append_to_head_buffer(request.writer, request.target).value();
             request.accepted_pr.set_value(buffered_write_result{request.persisted_pr.get_future()});
             std::move(persisted).forward_to(std::move(request.persisted_pr));
         } catch (...) {
@@ -733,7 +731,16 @@ future<> buffered_writer::flush() {
     });
 }
 
-future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
+// A record that goes straight into the head buffer waits for nothing - it is accepted by returning,
+// and only its place in a segment is still to come - so this is not a coroutine: one that suspends
+// nowhere would allocate a frame per write to do nothing with it. A record that has to be queued
+// waits in queue_write(), which is where the frame belongs.
+//
+// Not being a coroutine, it has to report a failure as a failed future itself, which is what the
+// noexcept says: the caller counts a failed write off the future it gets back, and a throw out of
+// here would go past that accounting. The try costs nothing on the path that does not throw.
+future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) noexcept {
+  try {
     auto holder = _async_gate.hold();
 
     // The record has to fit the mixed buffer it goes into here and the full segment the separator
@@ -741,39 +748,45 @@ future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer
     // fits the buffer it is written to first would be accepted here and then never fit anywhere the
     // separator could put it.
     const size_t max_size = raw_write_buffer::max_record_size_any_kind(head_buf().get_buffer_size());
-    if (writer.size() > max_size) {
-        co_await coroutine::return_exception(std::runtime_error(fmt::format("Write size {} exceeds the maximum record size {}", writer.size(), max_size)));
+    if (writer.size() > max_size) [[unlikely]] {
+        return make_exception_future<buffered_write_result>(std::runtime_error(
+                fmt::format("Write size {} exceeds the maximum record size {}", writer.size(), max_size)));
     }
 
     // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the
     // head buffer if needed and write to it.
     if (_queued_writes.empty()) {
-        if (auto persisted = append_to_head_buffer(writer, std::move(target))) {
-            co_return buffered_write_result{std::move(*persisted)};
+        if (auto persisted = append_to_head_buffer(writer, target)) {
+            return make_ready_future<buffered_write_result>(buffered_write_result{std::move(*persisted)});
         }
     }
 
     // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
+    return queue_write(std::move(writer), timeout, std::move(target), std::move(holder));
+  } catch (...) {
+    return current_exception_as_future<buffered_write_result>();
+  }
+}
 
+// The future of the request is what this returns, so there is nothing to wait for here either: the
+// consumer resolves it when it makes room for the record. The request carries the gate holder of the
+// write, which is what has to outlive the wait.
+future<buffered_write_result> buffered_writer::queue_write(log_record_writer writer, db::timeout_clock::time_point timeout,
+        write_target target, seastar::gate::holder holder) {
     if (_max_queued_write_bytes != 0 && _queued_write_bytes + writer.size() > _max_queued_write_bytes) {
-        co_await coroutine::return_exception(replica::rate_limit_exception());
+        return make_exception_future<buffered_write_result>(replica::rate_limit_exception());
     }
 
     const bool queue_was_empty = _queued_writes.empty();
     const auto write_size = writer.size();
-    queued_write request(std::move(writer), std::move(target), timeout, _next_queued_write_id++, write_size);
+    queued_write request(std::move(writer), std::move(target), std::move(holder), timeout, _next_queued_write_id++, write_size);
     auto accepted = request.accepted_pr.get_future();
     _queued_write_bytes += write_size;
     _queued_writes.push_back(std::move(request), timeout);
     if (queue_was_empty) {
         _consumer_progress_cv.signal();
     }
-    co_return co_await std::move(accepted);
-}
-
-future<log_location_with_holder> buffered_writer::write(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
-    auto result = co_await write_to_buffer(std::move(writer), timeout, std::move(target));
-    co_return co_await std::move(result.persisted);
+    return accepted;
 }
 
 future<> buffered_writer::consumer_loop() {
@@ -814,7 +827,7 @@ future<> buffered_writer::consumer_loop() {
             co_await coroutine::maybe_yield();
         }
     } catch (...) {
-        on_internal_error(logstor_logger, format("buffered_writer consumer loop aborted unexpectedly: {}", std::current_exception()));
+        on_internal_error(logstor_logger, format("buffered_writer consumer loop aborted unexpectedly: {:t}", std::current_exception()));
     }
 }
 

@@ -56,6 +56,7 @@
 #include "service/view_update_backlog_broker.hh"
 #include "service/qos/service_level_controller.hh"
 #include "streaming/stream_session.hh"
+#include "db/cluster_config_manager.hh"
 #include "db/system_keyspace.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "db/batchlog_manager.hh"
@@ -340,7 +341,7 @@ private:
                             _cfg.broadcast_to_all_shards().get();
                             startlog.info("completed re-reading configuration file");
                         } catch (...) {
-                            startlog.error("failed to re-read configuration file: {}", std::current_exception());
+                            startlog.error("failed to re-read configuration file: {:t}", std::current_exception());
                         }
                     }
                     return stop_iteration::no;
@@ -388,7 +389,7 @@ class sigquit_handler {
                     });
                 });
             } catch (...) {
-                diaglog.error("Failed to dump diagnostics: {}", std::current_exception());
+                diaglog.error("Failed to dump diagnostics: {:t}", std::current_exception());
             }
         }
     }
@@ -1534,6 +1535,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
             static sharded<db::system_distributed_keyspace> sys_dist_ks;
             static sharded<db::system_keyspace> sys_ks;
+            static sharded<db::cluster_config_manager> cluster_config_manager;
             static sharded<db::view::view_update_generator> view_update_generator;
             static sharded<db::view::view_builder> view_builder;
             static sharded<db::view::view_building_worker> view_building_worker;
@@ -2104,6 +2106,12 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             checkpoint(stop_signal, "initializing system schema");
             db::schema_tables::save_system_schema(qp.local()).get();
 
+            checkpoint(stop_signal, "starting cluster config manager");
+            cluster_config_manager.start(std::ref(cluster_config_manager), std::ref(db), std::ref(qp)).get();
+            auto stop_cluster_config_manager = defer_verbose_shutdown("cluster config manager", [] {
+                cluster_config_manager.stop().get();
+            });
+
             // making compaction manager api available, after system keyspace has already been established.
             api::set_server_compaction_manager(ctx, cm).get();
             auto stop_cm_api = defer_verbose_shutdown("compaction manager API", [&ctx] {
@@ -2130,7 +2138,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 if (!cfg->maintenance_mode()) {
                     throw;
                 }
-                startlog.error("Failed to load tablet metadata (ignoring due to maintenance mode): {}", std::current_exception());
+                startlog.error("Failed to load tablet metadata (ignoring due to maintenance mode): {:t}", std::current_exception());
             }
 
             // We do not support tablet re-sharding yet, see https://github.com/scylladb/scylladb/issues/16739.
@@ -2466,6 +2474,8 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 group0_service.enable_group0_state_machine().get();
             }
 
+            cluster_config_manager.local().refresh().get();
+
             // The call to enable_group0_state_machine() above guarantees that, if group0 is
             // created and started, the locally persisted group0 state has been applied
             // before it returns. As a result, tablet Raft groups are started using
@@ -2493,7 +2503,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                             try {
                                 return gossiper.local().get_host_id(ip);
                             } catch (...) {
-                                startlog.debug("Could not resolve host id: {}, {}", ip, std::current_exception());
+                                startlog.debug("Could not resolve host id: {}, {:t}", ip, std::current_exception());
                                 return locator::host_id{};
                             }
                         });
@@ -2851,7 +2861,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             _exit(0);
             return 0;
           } catch (...) {
-            startlog.error("Startup failed: {}", std::current_exception());
+            startlog.error("Startup failed: {:t}", std::current_exception());
             // We should be returning 1 here, but the system is not yet prepared for orderly rollback of main() objects
             // and thread_local variables.
             _exit(1);
@@ -2872,7 +2882,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
     });
   } catch (...) {
       // reactor may not have been initialized, so can't use logger
-      fmt::print(std::cerr, "FATAL: Exception during startup, aborting: {}\n", std::current_exception());
+      fmt::print(std::cerr, "FATAL: Exception during startup, aborting: {:t}\n", std::current_exception());
       return 7; // 1 has a special meaning for upstart
   }
 }

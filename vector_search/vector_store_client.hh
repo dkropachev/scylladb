@@ -16,6 +16,9 @@
 #include <chrono>
 #include <expected>
 #include <functional>
+#include <optional>
+#include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 #include <seastar/core/abort_source.hh>
@@ -43,6 +46,14 @@ struct primary_key {
     /// [0.0, 1.0] for cosine and euclidean; unbounded for dot product on
     /// non-normalized vectors.
     float similarity = 0.0f;
+    /// Values of the columns requested via ann()'s return_columns
+    /// parameter, keyed by column name, exactly as returned by the vector
+    /// store (a raw JSON value - the caller is responsible for decoding it
+    /// according to that column's actual type). A column absent from this
+    /// map had no stored value for this row (e.g. the attribute didn't
+    /// exist in the item when it was indexed). Always empty when
+    /// return_columns was empty.
+    std::unordered_map<std::string, rjson::value> column_values;
 };
 
 /// A client with the vector-store service.
@@ -54,6 +65,9 @@ public:
     using config = db::config;
     using vs_vector = std::vector<float>;
     using query_string = std::string;
+    using document = sstring;
+    using documents = std::vector<document>;
+    using highlights = std::vector<std::optional<sstring>>;
     using host_name = sstring;
     using index_name = sstring;
     using keyspace_name = sstring;
@@ -107,8 +121,23 @@ public:
     /// the similarity score returned by the vector store, which sorts the
     /// results in decreasing similarity order (higher similarity score = more
     /// similar).
-    auto ann(keyspace_name keyspace, index_name name, schema_ptr schema, vs_vector vs_vector, limit limit, const rjson::value& filter, abort_source& as)
-            -> future<std::expected<primary_keys, ann_error>>;
+    ///
+    /// If `routing` is true (the default), the vector store may serve the
+    /// request from a different, better-matching index on the same column
+    /// than the one named by `name` - this is what CQL relies on, since it
+    /// has no way to pick between several indexes on the same column. Pass
+    /// `false` when the caller (e.g. Alternator, which lets the user name
+    /// the exact index to query) must not have its choice of index
+    /// second-guessed.
+    ///
+    /// `return_columns` names filtering columns (as added to the index's
+    /// "fc" target - see Alternator's compute_extra_fc_attributes()) whose
+    /// stored values should be returned alongside the primary keys, in each
+    /// result's primary_key::column_values. Empty (the default) means
+    /// return no column values, matching CQL's use of ann(), which doesn't
+    /// need this.
+    auto ann(keyspace_name keyspace, index_name name, schema_ptr schema, vs_vector vs_vector, limit limit, const rjson::value& filter, abort_source& as,
+            bool routing = true, std::vector<std::string> return_columns = {}) -> future<std::expected<primary_keys, ann_error>>;
 
     /// Request the vector store service for the primary keys of the top
     /// full-text search results. Each returned primary_key has its similarity
@@ -117,6 +146,19 @@ public:
     /// more relevant).
     auto bm25(keyspace_name keyspace, index_name name, schema_ptr schema, query_string fts_query, limit limit, abort_source& as)
             -> future<std::expected<primary_keys, fts_error>>;
+
+    /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
+    ///
+    /// The index is asked because choosing which of a document's terms matter needs the corpus
+    /// statistics and the analyzer that only it has - not because it can look the documents up.
+    /// It stores none of their text, which is why the caller has to send it.
+    ///
+    /// The answer is positional: entry i belongs to documents[i], std::nullopt where the reply
+    /// carried no fragment for it. Nothing in the reply pairs a fragment with its document -
+    /// hence no schema - so we expect the index to answer in the order it was asked, and pass
+    /// the reply through unchanged.
+    auto highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)
+            -> future<std::expected<highlights, fts_error>>;
 
 private:
     friend struct vector_store_client_tester;

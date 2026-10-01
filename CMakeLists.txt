@@ -52,7 +52,7 @@ endif()
 include(limit_jobs)
 
 # Configure Seastar compile options to align with Scylla
-set(CMAKE_CXX_STANDARD "23" CACHE INTERNAL "")
+set(CMAKE_CXX_STANDARD "26" CACHE INTERNAL "")
 set(CMAKE_CXX_EXTENSIONS ON CACHE INTERNAL "")
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE INTERNAL "")
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
@@ -62,6 +62,59 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 add_compile_definitions(SEASTAR_NO_EXCEPTION_HACK)
 # Hacks needed to expose internal APIs for xxhash dependencies
 add_compile_definitions(XXH_PRIVATE_API)
+
+# Build the bundled fmt submodule rather than relying on whatever version
+# happens to be installed on the host (matching configure.py). This must come
+# before Seastar is configured below: for the in-tree Seastar build, CMake
+# redirects Seastar's find_package(fmt) to this subdirectory's fmt::fmt target.
+# Build fmt shared in Debug/Dev and static otherwise, matching Seastar's own
+# linkage so fmt symbols don't end up in both libseastar and a static libfmt.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "Dev")
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+else()
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+endif()
+set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
+set(FMT_TEST OFF CACHE BOOL "" FORCE)
+set(FMT_DOC OFF CACHE BOOL "" FORCE)
+set(FMT_FUZZ OFF CACHE BOOL "" FORCE)
+# We don't consume fmt's C++20 module; building it drags in module dependency
+# scanning, which Scylla otherwise disables.
+set(FMT_MODULE OFF CACHE BOOL "" FORCE)
+add_subdirectory(fmt)
+
+# Same story for c-ares: build the bundled submodule rather than the host's,
+# and do it before Seastar is configured, so that cmake/Findc-ares.cmake can
+# hand Seastar's find_package(c-ares) the target defined here. Static and
+# position-independent, matching configure_c_ares(): c-ares is linked into
+# libseastar, so there is no libcares.so to find at runtime.
+set(CARES_STATIC ON CACHE BOOL "" FORCE)
+set(CARES_SHARED OFF CACHE BOOL "" FORCE)
+set(CARES_STATIC_PIC ON CACHE BOOL "" FORCE)
+set(CARES_INSTALL OFF CACHE BOOL "" FORCE)
+set(CARES_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(CARES_BUILD_CONTAINER_TESTS OFF CACHE BOOL "" FORCE)
+set(CARES_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+# c-ares 1.34.6 declares cmake_minimum_required(VERSION 3.5.0...3.10.0), which
+# CMake 4 rejects outright.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+# mode.common.cmake puts -Werror in this directory's COMPILE_OPTIONS, and
+# add_subdirectory() inherits them. Scylla's warning policy is for Scylla's own
+# code, not for a vendored library we do not maintain, so turn -Werror back off
+# for c-ares. That also matches configure_c_ares(), which passes only
+# lib_cflags to its sub-build; Scylla's warning flags are not part of those.
+#
+# -Wc11-extensions on top of that, for quiet rather than for correctness:
+# c-ares compiles as gnu90, and under -Wpedantic every call to a glibc string
+# function whose header defines it in terms of _Generic (strchr(), memchr(),
+# ...) warns. That is 15 warnings with nothing behind them.
+get_directory_property(scylla_compile_options COMPILE_OPTIONS)
+add_compile_options(-Wno-error -Wno-c11-extensions)
+add_subdirectory(c-ares)
+set_directory_properties(PROPERTIES COMPILE_OPTIONS "${scylla_compile_options}")
+unset(scylla_compile_options)
+unset(CMAKE_POLICY_VERSION_MINIMUM)
+
 # SEASTAR_TESTING_MAIN is added later (after add_subdirectory(seastar) and
 # add_subdirectory(abseil)) to avoid leaking into the seastar subdirectory.
 # If SEASTAR_TESTING_MAIN is defined globally before seastar, it causes a
@@ -124,23 +177,6 @@ else()
         set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     endif()
     add_subdirectory(seastar)
-
-    # Coverage mode sets cmake_build_type='Debug' for Seastar
-    # (configure.py:515), so Seastar's pkg-config output includes sanitizer
-    # link flags in seastar_libs_coverage (configure.py:2514,2649).
-    # Seastar's own CMake only activates sanitizer targets for Debug/Sanitize
-    # configs, so we inject link options on the seastar target for Coverage.
-    # Using PUBLIC ensures they propagate to all targets linking Seastar
-    # (but not standalone tools like patchelf), matching configure.py's
-    # behavior.  Compile-time flags and defines are handled globally in
-    # cmake/mode.Coverage.cmake.
-    if(CMAKE_BUILD_TYPE STREQUAL "Coverage")
-        target_link_options(seastar
-            PUBLIC
-                -fsanitize=address
-                -fsanitize=undefined
-                -fsanitize=vptr)
-    endif()
 endif()
 
 set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
@@ -217,7 +253,9 @@ target_link_libraries(Boost::regex
 find_package(Lua REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(ICU COMPONENTS uc i18n REQUIRED)
-find_package(fmt 10.0.0 REQUIRED)
+# Resolves to the bundled submodule added via add_subdirectory(fmt) above
+# (CMake redirects find_package to it), not the host's fmt.
+find_package(fmt REQUIRED)
 find_package(libdeflate REQUIRED)
 find_package(libxcrypt REQUIRED)
 find_package(p11-kit REQUIRED)

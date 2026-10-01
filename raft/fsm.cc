@@ -84,11 +84,14 @@ fsm::fsm(server_id id, sstring tag, term_t current_term, server_id voted_for, lo
     }
 }
 
-future<semaphore_units<>> fsm::wait_for_memory_permit(seastar::abort_source* as, size_t size) {
+future<fsm::memory_permit> fsm::wait_for_memory_permit(seastar::abort_source* as, size_t size) {
     check_is_leader();
 
-    auto& sm = *leader_state().log_limiter_semaphore;
-    return as ? get_units(sm, size, *as) : get_units(sm, size);
+    auto sm = leader_state().log_limiter_semaphore;
+    auto f_units = as ? get_units(*sm, size, *as) : get_units(*sm, size);
+    return f_units.then([sm = std::move(sm)] (auto&& units) mutable {
+        return memory_permit(std::move(sm), std::move(units));
+    });
 }
 
 const configuration& fsm::get_configuration() const {
@@ -437,23 +440,26 @@ fsm_output fsm::get_output() {
         output.term_and_vote = {_current_term, _voted_for};
     }
 
-    // Return committed entries.
+    // Report the entries that became committed: their ids only, the
+    // entries themselves stay in the log.
     // Observer commit index may be smaller than snapshot index
-    // in which case we should not attempt committing entries belonging
+    // in which case we should not report entries belonging
     // to a snapshot.
     auto observed_ci =  std::max(_observed._commit_idx, _log.get_snapshot().idx);
     if (observed_ci < _commit_idx) {
-        output.committed.reserve((_commit_idx - observed_ci).value());
-
+        auto& committed = output.committed;
         for (auto idx = observed_ci + index_t{1}; idx <= _commit_idx; ++idx) {
             const auto& entry = _log[idx.value()];
-            output.committed.push_back(entry);
+            committed.ids.append(idx, entry->term);
+            if (const auto* cfg = std::get_if<configuration>(&entry->data); cfg && !cfg->is_joint()) {
+                committed.non_joint_conf_committed = true;
+            }
         }
     }
 
     // Get a snapshot of all unsent messages.
-    // Do it after populating log_entries and committed arrays
-    // to not lose messages in case arrays population throws
+    // Do it after populating the log_entries array
+    // to not lose messages in case the population throws
     std::swap(output.messages, _messages);
 
     // Get status of leadership transfer (if any)
@@ -810,6 +816,7 @@ void fsm::tick_leader() {
             leader_state().log_limiter_semaphore->signal(_config.max_log_size);
             state.stepdown.reset();
             state.timeout_now_sent.reset();
+            state.leadership_transfer_target.reset();
             _abort_leadership_transfer = true;
             _sm_events.signal(); // signal to handle aborting of leadership transfer
         } else if (state.timeout_now_sent) {
@@ -1037,9 +1044,11 @@ void fsm::append_entries_reply(server_id from, append_reply&& reply) {
         progress.become_pipeline();
 
         // If a leader is stepping down, transfer the leadership
-        // to a first voting node that has fully replicated log.
+        // to a first voting node that has fully replicated log,
+        // If a transfer target was selected, only accept that node.
         if (leader_state().stepdown && !leader_state().timeout_now_sent &&
-                         progress.can_vote && progress.match_idx == _log.last_idx()) {
+                progress.can_vote && progress.match_idx == _log.last_idx() &&
+                (!leader_state().leadership_transfer_target || *leader_state().leadership_transfer_target == progress.id)) {
             send_timeout_now(progress.id);
             // We may have resigned leadership if a stepdown process completed
             // while the leader is no longer part of the configuration.
@@ -1339,6 +1348,41 @@ bool fsm::apply_snapshot(snapshot_descriptor snp, size_t max_trailing_entries, s
         return false;
     }
 
+    if (!local && _observed._commit_idx < _commit_idx) {
+        // There are entries this server saw committed and get_output() has not
+        // reported yet. Their terms live only in the log, which this snapshot
+        // would truncate, and get_output() reports from above the snapshot
+        // index -- so they would be skipped for good, and their waiters left
+        // with commit_status_unknown for entries that did commit and whose
+        // effect this very snapshot carries.
+        //
+        // Reject it and let the leader retry. Nothing advances the commit
+        // index while the transfer is outstanding, so the retry finds the
+        // output consumed: a snapshot only goes to a follower the leader
+        // cannot append to, and while it is in snapshot state the leader sends
+        // that follower neither entries nor a higher commit index (see
+        // follower_progress::can_send_to(), tick() and
+        // broadcast_read_quorum(), which carries min(match_idx, commit_idx)).
+        //
+        // This is not cheap. The snapshot has already been transferred by the
+        // time we get here -- rejecting it throws that away and the leader
+        // sends it again, so for a large snapshot the cost is a second full
+        // transfer. The retry is not immediate either: it waits for a tick,
+        // and takes a couple of round trips more than that, because
+        // become_probe() leaves next_idx just above the snapshot index, so the
+        // leader first tries appending and has to be walked back down before
+        // it decides on a snapshot again. Hence the warning rather than a
+        // trace: how often this fires is worth knowing, and if it fires often
+        // it is worth carrying the entries through a snapshot instead of
+        // turning the snapshot away.
+        logger.warn("apply_snapshot[{}]: reject snapshot {}/{}, commit idx {} not reported past {}."
+                        " The leader will transfer it again, which wastes the transfer just made"
+                        " -- expensive for a large snapshot.",
+                        _tag, snp.id, snp.idx, _commit_idx, _observed._commit_idx);
+        _output.snps_to_drop.push_back(snp.id);
+        return false;
+    }
+
     _output.snps_to_drop.push_back(current_snp.id);
 
     // If the snapshot is local, _commit_idx is larger than snp.idx.
@@ -1357,7 +1401,7 @@ bool fsm::apply_snapshot(snapshot_descriptor snp, size_t max_trailing_entries, s
     return true;
 }
 
-void fsm::transfer_leadership(logical_clock::duration timeout) {
+void fsm::transfer_leadership(logical_clock::duration timeout, server_id target) {
     check_is_leader();
     auto leader = leader_state().tracker.find(_my_id);
     if (configuration::voter_count(get_configuration().current) == 1 && leader && leader->can_vote) {
@@ -1366,10 +1410,16 @@ void fsm::transfer_leadership(logical_clock::duration timeout) {
         throw raft::no_other_voting_member();
     }
 
+    if (target) {
+        leader_state().leadership_transfer_target = target;
+    } else {
+        leader_state().leadership_transfer_target.reset();
+    }
+
     leader_state().stepdown = _clock.now() + timeout;
     // Stop new requests from coming in
     leader_state().log_limiter_semaphore->consume(_config.max_log_size);
-    // If there is a fully up-to-date voting replica make it start an election.
+    // If there is a fully up-to-date eligible replica make it start an election.
     //
     // Prefer one whose clock still works: the reason we transfer automatically
     // is that ours does not, and moving to another clockless node would not
@@ -1379,7 +1429,8 @@ void fsm::transfer_leadership(logical_clock::duration timeout) {
     for (const bool require_clock_ok : {true, false}) {
         for (auto&& [_, p] : leader_state().tracker) {
             if (p.id != _my_id && p.can_vote && p.match_idx == _log.last_idx()
-                    && (!require_clock_ok || p.clock_ok)) {
+                    && (!require_clock_ok || p.clock_ok)
+                    && (!leader_state().leadership_transfer_target || *leader_state().leadership_transfer_target == p.id)) {
                 send_timeout_now(p.id);
                 return;
             }

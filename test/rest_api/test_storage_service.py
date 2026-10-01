@@ -787,6 +787,33 @@ def test_storage_service_system_keyspace_repair(rest_api):
     resp.raise_for_status()
     assert not [stats for stats in resp.json() if stats["sequence_number"] == sequence_number], "Repair task for keyspace with local replication strategy was created"
 
+# Nodetool sends the parallelism option as the name of Cassandra's
+# RepairParallelism enum, while other callers send the enum's ordinal. Both
+# have to be accepted, and anything else has to be rejected.
+@pytest.mark.parametrize("parallelism", ["sequential", "parallel", "dc_parallel", "0", "1", "2"])
+def test_storage_service_repair_parallelism(rest_api, parallelism):
+    resp = rest_api.send("POST", "storage_service/repair_async/system", {"parallelism": parallelism})
+    resp.raise_for_status()
+    assert resp.json() > 0, "Repair got invalid sequence number"
+
+@pytest.mark.parametrize("parallelism", ["3", "-1", "par", "1x"])
+def test_storage_service_repair_parallelism_invalid(rest_api, parallelism):
+    resp = rest_api.send("POST", "storage_service/repair_async/system", {"parallelism": parallelism})
+    assert resp.status_code == requests.codes.bad_request
+
+# The integer repair options are parsed strictly, and ranges_parallelism has to
+# be positive. An unusable value is a bad parameter, not a server error.
+@pytest.mark.parametrize("option,value", [("ranges_parallelism", "0"),
+                                          ("ranges_parallelism", "-1"),
+                                          ("ranges_parallelism", "abc"),
+                                          ("ranges_parallelism", "1x"),
+                                          ("ranges_parallelism", "9999999999"),
+                                          ("jobThreads", "abc"),
+                                          ("jobThreads", "1x")])
+def test_storage_service_repair_int_option_invalid(rest_api, option, value):
+    resp = rest_api.send("POST", "storage_service/repair_async/system", {option: value})
+    assert resp.status_code == requests.codes.bad_request
+
 @pytest.mark.parametrize("tablets_enabled", ["true", "false"])
 def test_storage_service_get_natural_endpoints(cql, rest_api, tablets_enabled, skip_without_tablets):
     with new_test_keyspace(cql, f"WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }} AND TABLETS = {{ 'enabled': {tablets_enabled} }}") as keyspace:
@@ -925,40 +952,52 @@ def test_drop_quarantined_sstables(cql, this_dc, rest_api):
                 resp = rest_api.send("POST", f"storage_service/keyspace_flush/{keyspace}")
                 resp.raise_for_status()
 
-                # Drop quarantined sstables from all keyspaces (no parameters)
+                # Rejected when data resurrection risk acceptance is omitted.
                 resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables")
+                assert resp.status_code == requests.codes.bad_request
+                assert 'To accept the risk and carry out the operation, provide the "accept_data_resurrection_risk" parameter.' in resp.json()["message"]
+
+                # Rejected when data resurrection risk is not accepted.
+                resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
+                                   params={"accept_data_resurrection_risk": "false"})
+                assert resp.status_code == requests.codes.bad_request
+                assert 'To accept the risk and carry out the operation, provide the "accept_data_resurrection_risk" parameter.' in resp.json()["message"]
+
+                # Drop quarantined sstables from all keyspaces
+                resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
+                                   params={"accept_data_resurrection_risk": "true"})
                 resp.raise_for_status()
 
                 # Drop quarantined sstables from specific keyspace
                 resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
-                                   params={"keyspace": keyspace})
+                                   params={"accept_data_resurrection_risk": "true", "keyspace": keyspace})
                 resp.raise_for_status()
 
                 # Drop quarantined sstables from specific table
                 resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
-                                   params={"keyspace": keyspace, "tables": test_tables[0]})
+                                   params={"accept_data_resurrection_risk": "true", "keyspace": keyspace, "tables": test_tables[0]})
                 resp.raise_for_status()
 
                 # Drop quarantined sstables from multiple tables
                 resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
-                                   params={"keyspace": keyspace, "tables": f"{test_tables[0]},{test_tables[1]}"})
+                                   params={"accept_data_resurrection_risk": "true", "keyspace": keyspace, "tables": f"{test_tables[0]},{test_tables[1]}"})
                 resp.raise_for_status()
 
                 # # Non-existing keyspace
                 resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
-                                   params={"keyspace": "non_existent_keyspace"})
+                                   params={"accept_data_resurrection_risk": "true", "keyspace": "non_existent_keyspace"})
                 assert resp.status_code == requests.codes.bad_request
                 assert resp.json()["message"] == "Can't find a keyspace non_existent_keyspace"
 
                 # Non-existing table
                 resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
-                                   params={"keyspace": keyspace, "tables": "non_existent_table"})
+                                   params={"accept_data_resurrection_risk": "true", "keyspace": keyspace, "tables": "non_existent_table"})
                 assert resp.status_code == requests.codes.bad_request
                 assert "Can't find a column family non_existent_table in keyspace" in resp.json()["message"]
 
                 # Mix of existing and non-existing tables
                 resp = rest_api.send("POST", "storage_service/drop_quarantined_sstables",
-                                   params={"keyspace": keyspace, "tables": f"{test_tables[0]},non_existent_table"})
+                                   params={"accept_data_resurrection_risk": "true", "keyspace": keyspace, "tables": f"{test_tables[0]},non_existent_table"})
                 assert resp.status_code == requests.codes.bad_request
                 assert "Can't find a column family non_existent_table in keyspace" in resp.json()["message"]
 

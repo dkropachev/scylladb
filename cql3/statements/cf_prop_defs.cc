@@ -11,6 +11,8 @@
 #include "cql3/statements/cf_prop_defs.hh"
 #include "cql3/statements/property_definitions.hh"
 #include "cql3/statements/request_validations.hh"
+#include "cql3/statements/strong_consistency/statement_helpers.hh"
+#include "compaction/compaction_strategy_impl.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "db/extensions.hh"
 #include "db/tags/extension.hh"
@@ -26,12 +28,20 @@
 #include "utils/bloom_calculations.hh"
 #include "utils/overloaded_functor.hh"
 #include "db/config.hh"
+#include "db/cluster_config_registry.hh"
+#include "cql3/statements/cluster_config_props.hh"
 
 #include <boost/algorithm/string/predicate.hpp>
 
 namespace cql3 {
 
 namespace statements {
+
+namespace {
+
+constexpr auto table_scope = db::cluster_config_registry::scope::table;
+
+}
 
 const sstring cf_prop_defs::KW_COMMENT = "comment";
 const sstring cf_prop_defs::KW_GCGRACESECONDS = "gc_grace_seconds";
@@ -94,13 +104,9 @@ data_dictionary::keyspace cf_prop_defs::find_keyspace(const data_dictionary::dat
 }
 
 void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name, const schema::extensions_map& schema_extensions) const {
-    // Skip validation if the comapction strategy class is already set as it means we've already
-    // prepared (and redoing it would set strategyClass back to null, which we don't want)
-    if (_compaction_strategy_class) {
-        return;
-    }
-
     const auto& ks = find_keyspace(db, ks_name);
+
+    cluster_config_props::ensure_registry_supported(table_scope, *this, db.features());
 
     static std::set<sstring> keywords({
         KW_COMMENT,
@@ -121,7 +127,12 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
     });
 
     const auto& exts = db.extensions();
-    property_definitions::validate(keywords, exts.schema_extension_keywords(), obsolete_keywords);
+    auto allowed_keywords = keywords;
+    auto config_keywords = cluster_config_props::supported_config_keywords(table_scope, db.features());
+    allowed_keywords.insert(config_keywords.begin(), config_keywords.end());
+    property_definitions::validate(allowed_keywords, exts.schema_extension_keywords(), obsolete_keywords);
+
+    cluster_config_props::validate_config_values(table_scope, *this, db.features());
 
     try {
         get_id();
@@ -130,17 +141,17 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
     }
 
     auto compaction_type_options = get_compaction_type_options();
-    if (!compaction_type_options.empty()) {
+    if (!_compaction_strategy_class && !compaction_type_options.empty()) {
         auto strategy = compaction_type_options.find(COMPACTION_STRATEGY_CLASS_KEY);
         if (strategy == compaction_type_options.end()) {
             throw exceptions::configuration_exception(sstring("Missing sub-option '") + COMPACTION_STRATEGY_CLASS_KEY + "' for the '" + KW_COMPACTION + "' option.");
         }
-        _compaction_strategy_class = compaction::compaction_strategy::type(strategy->second);
+        auto compaction_strategy_class = compaction::compaction_strategy::type(strategy->second);
+        // Validate before recording the class: the recorded class is the marker
+        // that skips this block when a prepared statement is executed again.
+        compaction::compaction_strategy_impl::validate_options_for_strategy_type(compaction_type_options, compaction_strategy_class);
+        _compaction_strategy_class = compaction_strategy_class;
         remove_from_map_if_exists(KW_COMPACTION, COMPACTION_STRATEGY_CLASS_KEY);
-
-#if 0
-       CFMetaData.validateCompactionOptions(compactionStrategyClass, compactionOptions);
-#endif
     }
 
     auto compression_options = get_compression_options();
@@ -156,6 +167,9 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
     auto per_partition_rate_limit_options = get_per_partition_rate_limit_options(schema_extensions);
     if (per_partition_rate_limit_options && !db.features().typed_errors_in_read_rpc) {
         throw exceptions::configuration_exception("Per-partition rate limit is not supported yet by the whole cluster");
+    }
+    if (per_partition_rate_limit_options && strong_consistency::is_strongly_consistent(db, ks_name)) {
+        throw exceptions::configuration_exception("Per-partition rate limit is not supported in strongly consistent keyspaces");
     }
 
     auto tombstone_gc_options = get_tombstone_gc_options(schema_extensions);
@@ -298,6 +312,26 @@ std::optional<db::tablet_options::map_type> cf_prop_defs::get_tablet_options() c
         return tablet_options.value();
     }
     return std::nullopt;
+}
+
+bool cf_prop_defs::has_table_config_properties(const gms::feature_service& feat) const {
+    return std::ranges::any_of(_properties, [&feat] (const auto& entry) {
+        return cluster_config_props::is_config_property(table_scope, entry.first, feat);
+    });
+}
+
+bool cf_prop_defs::has_non_table_config_properties(const gms::feature_service& feat) const {
+    return std::ranges::any_of(_properties, [&feat] (const auto& entry) {
+        return !cluster_config_props::is_config_property(table_scope, entry.first, feat);
+    });
+}
+
+std::map<sstring, std::optional<sstring>> cf_prop_defs::get_config_updates(const gms::feature_service& feat) const {
+    std::map<sstring, std::optional<sstring>> updates;
+    for (auto& [name, value] : cluster_config_props::config_updates(table_scope, *this, feat)) {
+        updates.emplace(std::move(name), std::move(value));
+    }
+    return updates;
 }
 
 void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions, const data_dictionary::database& db, sstring ks_name, bool supports_repair) const {

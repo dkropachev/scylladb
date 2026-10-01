@@ -77,6 +77,14 @@ distributed_loader::process_sstable_dir(sharded<sstables::sstable_directory>& di
         co_await d.prepare(flags);
     });
 
+    // The directory listing must complete on all shards before any shard starts
+    // processing what it found. process_sstable_dir() creates and removes files in
+    // the very directory being listed -- e.g. when mutating the SSTable level, which
+    // hard-links the SSTable into a new generation -- and a shard that lists another
+    // shard's in-flight SSTable takes ownership of it and schedules its components
+    // for removal.
+    co_await dir.invoke_on_all(&sstables::sstable_directory::scan_sstable_dir);
+
     co_await dir.invoke_on_all([&dir, flags] (sstables::sstable_directory& d) -> future<> {
         // Supposed to be called with the node either down or on behalf of maintenance tasks
         // like nodetool refresh
@@ -103,7 +111,7 @@ distributed_loader::lock_table(global_table_ptr& table, sharded<sstables::sstabl
 future<>
 distributed_loader::reshard(sharded<sstables::sstable_directory>& dir, sharded<replica::database>& db, sstring ks_name, sstring table_name, compaction::compaction_sstable_creator_fn creator, compaction::owned_ranges_ptr owned_ranges_ptr, bool vnodes_resharding, tasks::task_info parent_info) {
     auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-    auto task = co_await compaction_module.make_and_start_task<compaction::table_resharding_compaction_task_impl>(parent_info, std::move(ks_name), std::move(table_name), parent_info.id, dir, db, std::move(creator), std::move(owned_ranges_ptr), vnodes_resharding);
+    auto task = co_await compaction_module.start_table_resharding_compaction(dir, db, std::move(ks_name), std::move(table_name), std::move(creator), std::move(owned_ranges_ptr), vnodes_resharding, parent_info);
     co_await task->done();
 }
 
@@ -120,7 +128,7 @@ distributed_loader::reshape(sharded<sstables::sstable_directory>& dir, sharded<r
         sstring ks_name, sstring table_name, compaction::compaction_sstable_creator_fn creator,
         std::function<bool (const sstables::shared_sstable&)> filter) {
     auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
-    auto task = co_await compaction_module.make_and_start_task<compaction::table_reshaping_compaction_task_impl>({}, std::move(ks_name), std::move(table_name), dir, db, mode, std::move(creator), std::move(filter));
+    auto task = co_await compaction_module.start_table_reshaping_compaction(dir, db, std::move(ks_name), std::move(table_name), mode, std::move(creator), std::move(filter));
     co_await task->done();
 }
 
@@ -414,7 +422,7 @@ future<> table_populator::populate_subdir(sharded<sstables::sstable_directory>& 
     bool vnodes_resharding = _migration_direction == migration_direction::forward;
     dblog.debug("Populating {}/{}/{} state={} resharding_mode={}", _ks, _cf, _global_table->get_storage_options(), state, vnodes_resharding ? "vnodes-to-tablets" : "normal");
 
-    tasks::task_info parent_info;
+    auto parent_info = tasks::make_empty_task_info();
     compaction::owned_ranges_ptr owned_ranges_ptr = nullptr;
 
     if (vnodes_resharding) {
@@ -430,7 +438,7 @@ future<> table_populator::populate_subdir(sharded<sstables::sstable_directory>& 
     }
 
     if (_migration_direction != migration_direction::none) {
-        parent_info = tasks::task_info(service::vnodes_to_tablets::migration_virtual_task::make_task_id(_ks), 0);
+        parent_info = tasks::make_cluster_task_info(service::vnodes_to_tablets::migration_virtual_task::make_task_id(_ks));
     }
 
     co_await distributed_loader::reshard(directory, _db, _ks, _cf, [this, state] (shard_id shard) mutable {
@@ -505,7 +513,7 @@ future<> distributed_loader::populate_keyspace(sharded<replica::database>& db,
         } catch (...) {
             std::exception_ptr eptr = std::current_exception();
             std::string msg =
-                format("Exception while populating keyspace '{}' with column family '{}' from '{}': {}",
+                format("Exception while populating keyspace '{}' with column family '{}' from '{}': {:t}",
                         ks_name, cfname, cf.get_storage_options(), eptr);
             dblog.error("{}", msg);
             try {

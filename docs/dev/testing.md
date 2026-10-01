@@ -10,13 +10,39 @@ This is a manual for `test.py`.
 
 ## Installation
 
-To run `test.py`, Python 3.11 or higher is required.
+To run `test.py`, Python 3.14 or higher is required.
 `./install-dependencies.sh` should install all the required Python
 modules. If `install-dependencies.sh` does not support your distribution,
 please manually install all Python modules it lists with `pip`.
 
 Additionally, `toolchain/dbuild` could be used to run `test.py`. In this
 case you don't need to run `./install-dependencies.sh`
+
+`test.py`'s own Python dependencies (scylla-driver and everything else it
+or pytest need to run) are declared in `test/pyproject.toml` and pinned
+in `test/uv.lock`, independent of the frozen toolchain image. On
+startup, `test.py` re-execs itself under `uv run --locked` against
+`test/pyproject.toml`, so the whole process runs inside a venv synced
+from that lockfile, reused across runs (keyed by the interpreter ABI)
+under `build/test-dependencies`. Bumping a version in
+`test/pyproject.toml` (and regenerating `test/uv.lock` with `uv lock
+--project test`) takes effect immediately without having to rebuild the
+toolchain. `--locked` makes `uv run` fail instead of silently
+re-resolving if the two files have drifted apart, so a forgotten `uv
+lock` is caught right away. Since the venv lives under `build/`,
+different checkouts never share packages, and `rm -rf build` removes it.
+Running `test.py` this way requires `uv` to be on `PATH` (it is included
+in the frozen toolchain image; `./install-dependencies.sh` installs it
+otherwise). Anything invoking pytest directly on `test/` rather than
+through `test.py` should likewise run it via
+`uv run --project test --locked -- pytest ...`, so it gets the same
+dependencies.
+
+Set `DISABLE_VENV=1` to skip the re-exec and run `test.py` directly under
+whatever Python/environment invoked it -- useful for running under a
+specific interpreter, a manually-managed venv, or a debugger, or when `uv`
+isn't available. Dependencies are then whatever's already importable;
+nothing installs or syncs them in that mode.
 
 By default `test.py` has `--gather-metrics` parameter, that is used to gather
 CPU/RAM usage during tests from the cgroup.
@@ -72,7 +98,8 @@ Some tests utilize (nested) docker images to provide mock/test services against 
 run scylla features. In general, these images will be pulled on first usage by the test.
 Some images used:
     
-    * docker.io/fsouza/fake-gcs-server:1.52.3
+    * docker.io/fsouza/fake-gcs-server:1.54.0
+    * docker.io/adobe/s3mock:5.2.0
     * (add as needed)
 
 ## Usage
@@ -331,26 +358,48 @@ manager, an in-process Python object running on its own event
 loop; calls are bridged to that loop. This guarantees that the
 test framework is fully aware of all topology operations and can
 clean up resources, including added servers, when tests end.
-`test.py` automatically detects if a cluster can not be shared with a
-subsequent test because it was manipulated with. Today the check
-is quite simple: any cluster that has nodes added or removed,
-started or stopped, even if it ended up in the same state
-as it was at the beginning of the test, is considered "dirty".
-Such clusters are not reused by the next test case: they are destroyed
-and a new cluster is created instead.
+Every test gets its own cluster, created when the test starts and
+destroyed when it ends, so tests never share or reuse a cluster.
 
 ## Test metrics
 
-The parameter `--gather-metrics` is used to gather CPU/RAM usage during tests from the cgroup and system overall CPU/RAM
-usage.
+The parameter `--gather-metrics` is used to gather CPU/RAM usage during tests from the cgroup and the amount of IO the
+tested Scylla servers issued.
 For that, SQLite database is used to store the metrics in `testlog/sqlite_{HOST_ID}.db`.
+`HOST_ID` is taken from `$SCYLLA_TEST_HOST_ID`, or derived from the hostname and the current time when that is unset, so
+every `test.py` invocation writes its own database file.
 The database is created in the `testlog` directory and contains the following tables:
 
+- `host_info` - one row describing the machine: CPU model, physical core count and total RAM. Referenced through
+  `host_id` by the tables that are not tied to a single test; for the others the host is reached through `tests`
 - `tests` - contains the list of tests that were executed with information about the test name, directory, architecture,
   and mode
-- `test_metrics` - contains the metrics for each test, such as memory peak usage, CPU usage, and duration
-- `system_resource_metrics` - contains system CPU and memory utilization in percents during the whole run
-- `cgroup_memory_metrics` - contains cgroup memory usage during the test run
+- `test_metrics` - contains the metrics for each test: memory peak usage, CPU usage, duration, outcome, and the IO the
+  test's Scylla servers issued (`seastar_read_bytes`, `seastar_read_ops`, `seastar_write_bytes`, `seastar_write_ops`)
+- `system_resource_metrics` - contains system CPU utilization in percent and memory figures in bytes, sampled during the
+  whole run
+- `cgroup_memory_metrics` - contains cgroup memory usage in bytes during the test run
+- `resource_utilization` - contains one final record per run with the average, the median, the p95, the p99 and the
+  score of the system CPU and memory utilization, for the run's architecture and mode. The score is the percentage of
+  the run spent between 80% and 90% utilization, the band a test run should hold the machine at. Only what was sampled
+  between the start of the first test and the end of the last one is summarized, so the preparation and the cleanup
+  around the tests do not drag the figures down; a run too short for a sample to fall in that interval is summarized
+  from everything it sampled instead, and a session that ran no test at all gets no record
+
+`host_info`, `tests` and the timing/outcome columns of `test_metrics` are written even with `--no-gather-metrics`, so
+every test is recorded; the flag only controls the cgroup and Scylla IO measurements. `system_resource_metrics`, and the
+`resource_utilization` summary derived from it, are written either way as well: they come from `psutil` and need no
+cgroup access.
+
+The `seastar_*` columns are the reactor's AIO counters (`scylla_reactor_aio_{reads,writes}` and
+`scylla_reactor_aio_bytes_{read,write}`), summed over every shard of every server still running at the end of the test.
+They count the IO Scylla submitted to its IO queue, which is what has to be measured here: tests run with
+`--kernel-page-cache 1 --unsafe-bypass-fsync 1`, so most of that IO never reaches a disk and does not show up in the
+kernel's own counters. Only tests using the `manager` fixture (`test/cluster`) have them; elsewhere they are NULL.
+
+`test.py` itself reports nowhere: the summary stays in the database, which is part of the test artifacts a build keeps.
+CI collects the row from there, together with the test results it already publishes, and stores it with the identity of
+the build that produced it, so that the utilization of a build can be compared with the builds before it.
 
 ## Automation, CI, and Jenkins
 

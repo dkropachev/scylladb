@@ -29,6 +29,7 @@
 
 #include "kms_host.hh"
 #include "encryption.hh"
+#include "key_cache.hh"
 #include "encryption_exceptions.hh"
 #include "symmetric_key.hh"
 #include "utils.hh"
@@ -239,10 +240,8 @@ private:
     encryption_context& _ctxt;
     std::string _name;
     host_options _options;
-    utils::loading_cache<attr_cache_key, key_and_id_type, 2, utils::loading_cache_reload_enabled::yes,
-        utils::simple_entry_size<key_and_id_type>, attr_cache_key_hash> _attr_cache;
-    utils::loading_cache<id_cache_key, bytes, 2, utils::loading_cache_reload_enabled::yes, 
-        utils::simple_entry_size<bytes>, id_cache_key_hash> _id_cache;
+    attr_cache<attr_cache_key, key_and_id_type, attr_cache_key_hash> _attr_cache;
+    id_cache<id_cache_key, bytes, id_cache_key_hash> _id_cache;
     shared_ptr<seastar::tls::certificate_credentials> _creds;
     std::unordered_map<bytes, shared_ptr<symmetric_key>> _cache;
     bool _initialized = false;
@@ -296,7 +295,7 @@ future<std::tuple<shared_ptr<encryption::symmetric_key>, encryption::kms_host::i
     } catch (rjson::malformed_value& e) {
         std::throw_with_nested(malformed_response_error(e.what()));
     } catch (...) {
-        std::throw_with_nested(service_error(fmt::format("get_key_by_id: {}", std::current_exception())));
+        std::throw_with_nested(service_error(fmt::format("get_key_by_id: {:t}", std::current_exception())));
     }
 }
 
@@ -322,7 +321,7 @@ future<shared_ptr<encryption::symmetric_key>> encryption::kms_host::impl::get_ke
     } catch (rjson::malformed_value& e) {
         std::throw_with_nested(malformed_response_error(e.what()));
     } catch (...) {
-        std::throw_with_nested(service_error(fmt::format("get_key_by_id: {}", std::current_exception())));
+        std::throw_with_nested(service_error(fmt::format("get_key_by_id: {:t}", std::current_exception())));
     }
 }
 
@@ -558,7 +557,7 @@ future<rjson::value> encryption::kms_host::impl::do_post(std::string_view target
                         , _options.aws_session_token.empty() ? "" : seastar::format(":{}[REDACTED]", _options.aws_session_token.substr(0, 2))
                     );
                 } catch (...) {
-                    kms_log.debug("Could not read credentials: {}", std::current_exception());
+                    kms_log.debug("Could not read credentials: {:t}", std::current_exception());
                 }
             }
         }
@@ -602,9 +601,8 @@ future<rjson::value> encryption::kms_host::impl::do_post(std::string_view target
             .host = sts_host,
             .service = "sts",
             .content_type = "application/x-www-form-urlencoded; charset=utf-8",
-            .content = "Action=AssumeRole&Version=2011-06-15&RoleArn=" 
-                + seastar::http::internal::url_encode(aws_assume_role_arn)
-                + "&RoleSessionName=" + role_session,
+            .content = seastar::format("Action=AssumeRole&Version=2011-06-15&RoleArn={}&RoleSessionName={}",
+                seastar::http::internal::url_encode(aws_assume_role_arn), role_session),
             .aws_access_key_id = aws_access_key_id,
             .aws_secret_access_key = aws_secret_access_key,
             .security_token = session,
@@ -970,6 +968,16 @@ future<encryption::kms_host::impl::key_and_id_type> encryption::kms_host::impl::
         auto i = std::copy(kid.begin(), kid.end(), id.begin());
         *i++ = ':';
         std::copy(enc.begin(), enc.end(), i);
+
+        id_cache_key key2 {
+            .id = id,
+            .aws_assume_role_arn = k.aws_assume_role_arn
+        };
+        co_await _id_cache.insert(key2, [&](const id_cache_key& kin) -> future<bytes>{
+            assert(kin.id == key2.id);
+            assert(kin.aws_assume_role_arn == key2.aws_assume_role_arn);
+            co_return key->key();
+        });
 
         co_return key_and_id_type{ key, id };
     } catch (std::invalid_argument& e) {

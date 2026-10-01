@@ -960,7 +960,7 @@ std::unique_ptr<cql_server::response> cql_server::handle_exception(int16_t strea
         try {
             std::rethrow_if_nested(*exp);
         } catch (...) {
-            msg = seastar::format("{}: {}", msg, std::current_exception());
+            msg = seastar::format("{}: {:t}", msg, std::current_exception());
         }
         return make_error(stream, exceptions::exception_code::SERVER_ERROR, msg, trace_state);
     } else {
@@ -1123,10 +1123,6 @@ cql_server::connection::connection(cql_server& server, socket_address server_add
     , _client_state(service::client_state::external_tag{}, server._auth_service, &server._sl_controller, server.timeout_config(), addr, bool(server._used_by_maintenance_socket), &server._abort_source)
     , _current_scheduling_group(server.get_scheduling_group_for_new_connection())
 {
-    _shedding_timer.set_callback([this] {
-        clogger.debug("Shedding all incoming requests due to overload");
-        _shed_incoming_requests = true;
-    });
     ++_server._stats.connects;
     ++_server._stats.connections;
     if (clogger.is_enabled(logging::log_level::trace)) {
@@ -1214,7 +1210,7 @@ future<> cql_server::connection::process_request() {
         auto request_start_timestamp = lowres_server_timestamp();
 
         const bool allow_shedding = _client_state.get_workload_type() == service::client_state::workload_type::interactive;
-        if (allow_shedding && _shed_incoming_requests) {
+        if (allow_shedding && lowres_clock::now() >= _shed_after) {
             ++_server._stats.requests_shed;
             return _read_buf.skip(f.length).then([this, stream = f.stream] {
                 const char* message = "request shed due to coordinator overload";
@@ -1274,7 +1270,7 @@ future<> cql_server::connection::process_request() {
                     } catch (semaphore_timed_out& sto) {
                         // Cancel shedding in case no more requests are going to do that on completion
                         if (_pending_requests_gate.get_count() == 0) {
-                            _shed_incoming_requests = false;
+                            _shed_after = lowres_clock::time_point::max();
                         }
                         return _read_buf.skip(length).then([sto = std::move(sto)] () mutable {
                             return make_exception_future<semaphore_units<>>(std::move(sto));
@@ -1283,8 +1279,8 @@ future<> cql_server::connection::process_request() {
                 })
                 : get_units(_server._memory_available, mem_estimate);
         if (_server._memory_available.waiters()) {
-            if (allow_shedding && !_shedding_timer.armed()) {
-                _shedding_timer.arm(shedding_timeout);
+            if (allow_shedding && _shed_after == lowres_clock::time_point::max()) {
+                _shed_after = lowres_clock::now() + shedding_timeout;
             }
             ++_server._stats.requests_blocked_memory;
         }
@@ -1307,8 +1303,7 @@ future<> cql_server::connection::process_request() {
             auto leave = defer([this, &sg_stats] noexcept {
                 --_server._stats.requests_serving;
                 --sg_stats._requests_serving;
-                _shedding_timer.cancel();
-                _shed_incoming_requests = false;
+                _shed_after = lowres_clock::time_point::max();
                 _pending_requests_gate.leave();
             });
             auto istream = buf.get_istream();
@@ -1499,10 +1494,22 @@ future<std::unique_ptr<cql_server::response>> cql_server::connection::process_st
                 co_return std::nullopt;
             };
         }
-        auto opt_user = co_await a.authenticate(std::move(dn_func));
-        if (opt_user) {
-            client_state.set_login(std::move(*opt_user));
-            co_await client_state.check_user_can_login();
+        auto auth_fut = co_await coroutine::as_future(a.authenticate(std::move(dn_func)));
+        if (auth_fut.failed()) {
+            auto ex = auth_fut.get_exception();
+            co_await audit::inspect_login(sstring(), client_state.get_client_address().addr(), true);
+            co_return coroutine::exception(std::move(ex));
+        }
+        auto role_name = auth_fut.get();
+        if (role_name) {
+            client_state.set_login(auth::authenticated_user(*role_name));
+            auto login_fut = co_await coroutine::as_future(client_state.check_user_can_login());
+            if (login_fut.failed()) {
+                auto login_ex = login_fut.get_exception();
+                co_await audit::inspect_login(*role_name, client_state.get_client_address().addr(), true);
+                co_return coroutine::exception(std::move(login_ex));
+            }
+            co_await audit::inspect_login(*role_name, client_state.get_client_address().addr(), false);
             client_state.maybe_update_per_service_level_params();
             update_scheduling_group();
             _authenticating = false;
@@ -1558,28 +1565,35 @@ future<std::unique_ptr<cql_server::response>> cql_server::connection::process_au
     auto sasl_challenge = client_state.get_auth_service()->underlying_authenticator().new_sasl_challenge();
     utils::result_with_exception_ptr<bytes_view> buf = in.read_raw_bytes_view(in.bytes_left());
     if (!buf) {
-        return make_exception_future<std::unique_ptr<cql_server::response>>(std::move(buf).assume_error());
+        co_return coroutine::exception(std::move(buf).assume_error());
     }
     auto challenge = sasl_challenge->evaluate_response(buf.assume_value());
-    if (sasl_challenge->is_complete()) {
-        return sasl_challenge->get_authenticated_user().then_wrapped([this, sasl_challenge, stream, &client_state, challenge = std::move(challenge), trace_state](future<auth::authenticated_user> f) mutable {
-            bool failed = f.failed();
-            return audit::inspect_login(sasl_challenge->get_username(), client_state.get_client_address().addr(), failed).then(
-                    [this, stream, challenge = std::move(challenge), &client_state, sasl_challenge, ff = std::move(f), trace_state = std::move(trace_state)] () mutable {
-                client_state.set_login(ff.get());
-                update_scheduling_group();
-                auto f = client_state.check_user_can_login();
-                return f.then([this, &client_state, stream, challenge = std::move(challenge), trace_state]() mutable {
-                    client_state.maybe_update_per_service_level_params();
-                    _authenticating = false;
-                    _ready = true;
-                    on_connection_ready();
-                    return make_ready_future<std::unique_ptr<cql_server::response>>(make_auth_success(stream, std::move(challenge), trace_state));
-                });
-            });
-        });
+    if (!sasl_challenge->is_complete()) {
+        co_return make_auth_challenge(stream, std::move(challenge), trace_state);
     }
-    return make_ready_future<std::unique_ptr<cql_server::response>>(make_auth_challenge(stream, std::move(challenge), trace_state));
+
+    // The authenticator does not consult the LOGIN flag, so both checks have to
+    // run before the audit record can state the outcome of the login.
+    std::exception_ptr ex;
+    try {
+        client_state.set_login(co_await sasl_challenge->get_authenticated_user());
+        update_scheduling_group();
+        co_await client_state.check_user_can_login();
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await audit::inspect_login(sasl_challenge->get_username(), client_state.get_client_address().addr(), bool(ex));
+
+    if (ex) {
+        co_return coroutine::exception(std::move(ex));
+    }
+
+    client_state.maybe_update_per_service_level_params();
+    _authenticating = false;
+    _ready = true;
+    on_connection_ready();
+    co_return make_auth_success(stream, std::move(challenge), trace_state);
 }
 
 future<std::unique_ptr<cql_server::response>> cql_server::connection::process_options(uint16_t stream, request_reader in, service::client_state& client_state,

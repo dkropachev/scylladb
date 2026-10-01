@@ -27,6 +27,7 @@
 #include "reader_concurrency_semaphore.hh"
 #include "utils/s3/creds.hh"
 #include <boost/intrusive/list.hpp>
+#include <boost/intrusive/set.hpp>
 #include "sstable_compressor_factory.hh"
 #include "sstables/sstables_manager_subscription.hh"
 
@@ -130,7 +131,7 @@ class sstables_manager {
     using list_type = boost::intrusive::list<sstable,
             boost::intrusive::member_hook<sstable, sstable::manager_list_link_type, &sstable::_manager_list_link>,
             boost::intrusive::constant_time_size<false>>;
-    using set_type = boost::intrusive::set<sstable,
+    using set_type = boost::intrusive::multiset<sstable,
             boost::intrusive::member_hook<sstable, sstable::manager_set_link_type, &sstable::_manager_set_link>,
             boost::intrusive::constant_time_size<false>,
             boost::intrusive::compare<sstable::lesser_reclaimed_memory>>;
@@ -153,10 +154,6 @@ public:
     };
 
 private:
-    enum class notification_event_type {
-        // Note: other event types like "added" may be needed in the future
-        deleted
-    };
     using signal_type = boost::signals2::signal_type<void (sstables::generation_type, notification_event_type), boost::signals2::keywords::mutex_type<boost::signals2::dummy_mutex>>::type;
 
     storage_manager* _storage;
@@ -358,6 +355,9 @@ private:
     // The method is idempotent and for an sstable that is deleted, it is called both
     // during unlink and during deactivation.
     void reclaim_memory_and_stop_tracking_sstable(sstable* sst);
+    // Unlink the sstable from _reclaimed, if it is linked. Erasing by key would
+    // remove an arbitrary sstable with the same total_memory_reclaimed().
+    void erase_from_reclaimed(sstable* sst) noexcept;
 private:
     db::large_data_handler& get_large_data_handler() const {
         return _large_data_handler;

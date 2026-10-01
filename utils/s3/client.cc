@@ -8,6 +8,8 @@
 
 #include <fmt/format.h>
 #include <exception>
+#include <algorithm>
+#include <cctype>
 #include <initializer_list>
 #include <memory>
 #include <numeric>
@@ -35,6 +37,8 @@
 #include <seastar/http/request.hh>
 #include <seastar/http/exception.hh>
 #include "default_aws_retry_strategy.hh"
+#include "utils/s3/aws_throttling_controller.hh"
+#include "utils/s3/noop_throttling_controller.hh"
 #include "db/config.hh"
 #include "utils/assert.hh"
 #include "utils/s3/aws_error.hh"
@@ -83,7 +87,8 @@ future<> ignore_reply(const http::reply& rep, input_stream<char>&& in_) {
     co_await util::skip_entire_stream(in);
 }
 
-client::client(std::string host, endpoint_config_ptr cfg, global_factory gf, private_tag, std::unique_ptr<http::retry_strategy> rs)
+client::client(std::string host, endpoint_config_ptr cfg, global_factory gf, private_tag, std::unique_ptr<http::retry_strategy> rs,
+               std::unique_ptr<throttling_controller> tc)
         : _host(std::move(host))
         , _cfg(std::move(cfg))
         , _creds_sem(1)
@@ -106,6 +111,7 @@ client::client(std::string host, endpoint_config_ptr cfg, global_factory gf, pri
                 }
             }();
         })
+        , _request_limiter(std::move(tc))
         , _gf(std::move(gf))
         , _retry_strategy(std::move(rs)) {
     _creds_provider_chain
@@ -114,9 +120,7 @@ client::client(std::string host, endpoint_config_ptr cfg, global_factory gf, pri
         .add_credentials_provider(std::make_unique<aws::sts_assume_role_credentials_provider>(_cfg->region, _cfg->role_arn));
 
     _creds_update_timer.arm(lowres_clock::now());
-    if (!_retry_strategy) {
-        _retry_strategy = std::make_unique<aws::default_aws_retry_strategy>();
-    }
+    register_client_metrics();
 }
 
 void client::update_config_sync(std::string region, std::string ira) {
@@ -143,7 +147,7 @@ void client::update_config_sync(std::string region, std::string ira) {
             _credentials = {};
             _creds_update_timer.rearm(lowres_clock::now());
         } catch (...) {
-            s3l.error("Failed to refresh credentials during config update: {}", std::current_exception());
+            s3l.error("Failed to refresh credentials during config update: {:t}", std::current_exception());
         }
     });
 }
@@ -162,12 +166,48 @@ void client::update_connections_per_shard(unsigned connections_per_shard) {
     });
 }
 
+utils::object_storage_bytes client::bytes() const {
+    utils::object_storage_bytes total;
+    for (auto& [sg, gc] : _https) {
+        total.read += gc.read_bytes;
+        total.written += gc.write_bytes;
+    }
+    return total;
+}
+
+void client::report_object_storage_metrics(utils::object_storage_metrics_labels labels) {
+    _object_storage_metrics_labels = std::move(labels);
+    for (auto& [sg, gc] : _https) {
+        auto group_labels = *_object_storage_metrics_labels;
+        group_labels.class_name = sg.name();
+        gc.object_storage_metrics.emplace(gc.http, std::move(group_labels));
+    }
+}
+
+static std::unique_ptr<throttling_controller> make_default_throttling_controller() {
+    return std::make_unique<aws_throttling_controller>();
+}
+
 shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, global_factory gf) {
-    return seastar::make_shared<client>(std::move(endpoint), std::move(cfg), std::move(gf), private_tag{});
+    return make(std::move(endpoint), std::move(cfg), nullptr, nullptr, std::move(gf));
 }
 
 shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, std::unique_ptr<http::retry_strategy> rs, global_factory gf) {
-    return seastar::make_shared<client>(std::move(endpoint), std::move(cfg), std::move(gf), private_tag{}, std::move(rs));
+    return make(std::move(endpoint), std::move(cfg), std::move(rs), nullptr, std::move(gf));
+}
+
+shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, std::unique_ptr<http::retry_strategy> rs,
+                                std::unique_ptr<throttling_controller> tc, global_factory gf) {
+    if (!tc) {
+        tc = make_default_throttling_controller();
+    }
+    // After the controller, which the default strategy takes a reference to. The client
+    // owns both and destroys the strategy first, since _retry_strategy is declared after
+    // _request_limiter.
+    if (!rs) {
+        rs = std::make_unique<aws::default_aws_retry_strategy>(aws::default_aws_retry_strategy::default_max_retries, *tc);
+    }
+    return seastar::make_shared<client>(std::move(endpoint), std::move(cfg), std::move(gf), private_tag{}, std::move(rs), std::move(tc));
 }
 
 shared_ptr<client> client::make(std::string ep, std::string region, std::string iam_role_arn, global_factory gf, unsigned connections_per_shard) {
@@ -308,7 +348,44 @@ void client::group_client::register_metrics(std::string class_name, std::string 
                 (sm::skip_when_empty::yes));
     }
 
-    metrics.add_group("s3", defs);
+    // TODO: every metric here except total_read_prefetch_bytes and
+    // downloads_starving_on_max_concurrency now has a counterpart in the
+    // object_storage group. Once the dashboards read that group, shrink this one
+    // to those two, which describe the S3 client alone. Note that the bytes lose
+    // the class label on the way, being reported above the scheduling groups.
+    try {
+        metrics.add_group("s3", defs);
+    } catch (const seastar::metrics::double_registration& e) {
+        // Reached when a second client serves one endpoint on this shard, which
+        // happens while an endpoint dropped from the configuration is still
+        // referenced. This runs on the request path, so it must not throw.
+        s3l.warn("Not reporting s3 metrics for {}: {}", host, e.what());
+    }
+}
+
+// Per-client metrics, as opposed to the per-scheduling-group ones in
+// group_client::register_metrics. The send brake is shared by every scheduling
+// group on the shard, so registering its numbers per group would produce one
+// series per group all reporting the same thing.
+void client::register_client_metrics() {
+    namespace sm = seastar::metrics;
+    auto ep_label = sm::label("endpoint")(_host);
+    auto op_label = sm::label("operation");
+    auto request_op = op_label("request");
+
+    std::vector<sm::metric_definition> defs;
+    defs.emplace_back(sm::make_counter("throttles", [this] { return _request_limiter->throttles(); },
+            sm::description("Total number of throttling responses (503 SlowDown etc.) from S3"), {ep_label, request_op})
+            (sm::skip_when_empty::yes));
+    defs.emplace_back(sm::make_counter("send_freezes", [this] { return _request_limiter->freezes(); },
+            sm::description("Times sending was held back after a throttling response"), {ep_label, request_op})
+            (sm::skip_when_empty::yes));
+    // The input the brake decides on, so that the threshold it is compared against can
+    // be checked against a real workload.
+    defs.emplace_back(sm::make_gauge("refused_request_ratio", [this] { return _request_limiter->refused_ratio(); },
+            sm::description("Smoothed share of S3 requests the endpoint is refusing"), {ep_label, request_op}));
+
+    _client_metrics.add_group("s3", defs);
 }
 
 future<client::group_client&> client::find_or_create_client() {
@@ -336,6 +413,11 @@ future<client::group_client&> client::find_or_create_client_slow() {
         std::forward_as_tuple(std::move(factory), max_connections)
     ).first;
     it->second.register_metrics(sg.name(), _host);
+    if (_object_storage_metrics_labels) {
+        auto labels = *_object_storage_metrics_labels;
+        labels.class_name = sg.name();
+        it->second.object_storage_metrics.emplace(it->second.http, std::move(labels));
+    }
     if (!_cfg->max_connections) {
         co_await rebalance_connections();
     }
@@ -411,7 +493,7 @@ future<> client::rebalance_connections() {
         throw storage_io_error {EIO, format("S3 request failed with ({})", status)};
     } catch (...) {
         auto e = std::current_exception();
-        throw storage_io_error {EIO, format("S3 error ({})", e)};
+        throw storage_io_error {EIO, format("S3 error ({:t})", e)};
     }
 }
 
@@ -474,13 +556,18 @@ http::client::reply_handler client::wrap_handler(http::request& request,
                 throw aws::aws_exception(
                     aws::aws_error{aws::aws_error_type::HTTP_UNAUTHORIZED, "EACCESS fault injected to simulate authorization failure", utils::http::retryable::no});
             }
-            co_return co_await handler(rep, std::move(_in));
+            co_await handler(rep, std::move(_in));
         } catch (...) {
             eptr = std::current_exception();
         }
         if (eptr) {
             co_await coroutine::return_exception_ptr(std::make_exception_ptr(aws::aws_exception(aws_error::from_exception_ptr(eptr))));
         }
+
+        // The only exit from this handler that is not an exception, so the only place a
+        // successful attempt can be reported. Every failure above leaves through the
+        // retry strategy, which reports it there instead.
+        _request_limiter->on_not_throttled();
     };
 }
 
@@ -505,8 +592,15 @@ future<> client::make_request(http::request req,
     auto holder = _requests_gate.hold();
     auto request = std::move(req);
     auto handler = wrap_handler(request, std::move(handle), expected);
-    co_await authorize(request);
     auto& gc = co_await find_or_create_client();
+
+    co_await _request_limiter->acquire(as);
+
+    // Signed after the brake releases the request, not before it: a freeze holds the
+    // request for seconds, and the signature carries a timestamp. Retries re-send an
+    // already signed request from inside http::client, so this only keeps the first
+    // dispatch fresh; a stale one there is caught by the REQUEST_TIME_TOO_SKEWED path.
+    co_await authorize(request);
 
     co_await gc.http.make_request(request, handler, rs, std::nullopt, as).handle_exception([err_handler = std::move(err_handler)](auto ex) {
         err_handler(std::move(ex));
@@ -574,6 +668,36 @@ future<stats> client::get_object_stats(sstring object_name, seastar::abort_sourc
     co_return st;
 }
 
+static constexpr std::string_view object_metadata_header_prefix = "x-amz-meta-";
+
+static void add_object_metadata_headers(http::request& req, const object_metadata& metadata) {
+    for (const auto& [key, value] : metadata) {
+        req._headers[fmt::format("{}{}", object_metadata_header_prefix, key)] = value;
+    }
+}
+
+static bool has_object_metadata_header_prefix(std::string_view name) {
+    return name.size() >= object_metadata_header_prefix.size()
+            && std::equal(object_metadata_header_prefix.begin(), object_metadata_header_prefix.end(), name.begin(), [] (char lhs, char rhs) {
+                return std::tolower(lhs) == std::tolower(rhs);
+            });
+}
+
+future<object_info> client::get_object_info(sstring object_name, seastar::abort_source* as) {
+    object_info info;
+    co_await get_object_header(std::move(object_name), [&info] (const http::reply& rep, input_stream<char>&& in_) mutable -> future<> {
+        for (const auto& [name, value] : rep._headers) {
+            if (has_object_metadata_header_prefix(name)) {
+                auto key = name.substr(object_metadata_header_prefix.size());
+                std::ranges::transform(key, key.begin(), ::tolower);
+                info.metadata.emplace(std::move(key), value);
+            }
+        }
+        return make_ready_future<>();
+    }, as);
+    co_return info;
+}
+
 future<bool> client::object_exists(sstring object_name, seastar::abort_source* as) {
     try {
         co_await get_object_header(object_name, ignore_reply, as);
@@ -586,20 +710,18 @@ future<bool> client::object_exists(sstring object_name, seastar::abort_source* a
     co_return true;
 }
 
-static rapidxml::xml_node<>* first_node_of(rapidxml::xml_node<>* root,
-                                           std::initializer_list<std::string_view> names) {
-    SCYLLA_ASSERT(root);
-    auto* node = root;
-    for (auto name : names) {
-        node = node->first_node(name.data(), name.size());
-        if (!node) {
-            throw std::runtime_error(fmt::format("'{}' is not found", name));
-        }
-    }
-    return node;
-}
-
 static tag_set parse_tagging(sstring& body) {
+    tag_set tags;
+    // S3 always answers with a <Tagging> document, carrying an empty <TagSet>
+    // when the object has no tags, but Adobe S3Mock - which the tests run
+    // against - sends back an empty body instead, see
+    // https://github.com/adobe/S3Mock/issues/3149, so an untagged object would
+    // fail here rather than report no tags. An empty body says just what an
+    // empty <TagSet> does, so take it - but only an empty one, so that a reply
+    // mangled on its way here cannot pass for an untagged object.
+    if (std::ranges::all_of(body, [] (char c) { return std::isspace(static_cast<unsigned char>(c)); })) {
+        return tags;
+    }
     auto doc = std::make_unique<rapidxml::xml_document<>>();
     try {
         doc->parse<0>(body.data());
@@ -607,9 +729,15 @@ static tag_set parse_tagging(sstring& body) {
         s3l.warn("cannot parse tagging response: {}", e.what());
         throw std::runtime_error("cannot parse tagging response");
     }
-    tag_set tags;
-    auto tagset_node = first_node_of(doc.get(), {"Tagging", "TagSet"});
-    for (auto tag_node = tagset_node->first_node("Tag"); tag_node; tag_node = tag_node->next_sibling()) {
+    auto tagging_node = doc->first_node("Tagging");
+    if (!tagging_node) {
+        throw std::runtime_error("'Tagging' missing in tagging response");
+    }
+    auto tagset_node = tagging_node->first_node("TagSet");
+    if (!tagset_node) {
+        throw std::runtime_error("'TagSet' missing in 'Tagging'");
+    }
+    for (auto tag_node = tagset_node->first_node("Tag"); tag_node; tag_node = tag_node->next_sibling("Tag")) {
         // See https://docs.aws.amazon.com/AmazonS3/latest/API/API_Tag.html,
         // both "Key" and "Value" are required, but we still need to check them.
         auto key = tag_node->first_node("Key");
@@ -721,9 +849,10 @@ future<temporary_buffer<char>> client::get_object_contiguous(sstring object_name
     co_return std::move(*ret);
 }
 
-future<> client::put_object(sstring object_name, temporary_buffer<char> buf, seastar::abort_source* as) {
+future<> client::put_object(sstring object_name, temporary_buffer<char> buf, object_metadata metadata, seastar::abort_source* as) {
     s3l.trace("PUT {}", object_name);
     auto req = http::request::make("PUT", _host, object_name);
+    add_object_metadata_headers(req, metadata);
     auto len = buf.size();
     req.write_body("bin", len, [buf = std::move(buf)] (output_stream<char>&& out_) -> future<> {
         auto out = std::move(out_);
@@ -745,9 +874,10 @@ future<> client::put_object(sstring object_name, temporary_buffer<char> buf, sea
     }, http::reply::status_type::ok, as);
 }
 
-future<> client::put_object(sstring object_name, ::memory_data_sink_buffers bufs, seastar::abort_source* as) {
+future<> client::put_object(sstring object_name, ::memory_data_sink_buffers bufs, object_metadata metadata, seastar::abort_source* as) {
     s3l.trace("PUT {} (buffers)", object_name);
     auto req = http::request::make("PUT", _host, object_name);
+    add_object_metadata_headers(req, metadata);
     auto len = bufs.size();
     req.write_body("bin", len, [bufs = std::move(bufs)] (output_stream<char>&& out_) -> future<> {
         auto out = std::move(out_);
@@ -866,6 +996,7 @@ protected:
     utils::chunked_vector<sstring> _part_etags;
     named_gate _bg_flushes;
     std::optional<tag> _tag;
+    object_metadata _metadata;
     seastar::abort_source* _as;
     // Set once this sink has produced its object, either with a plain PUT or with
     // a completed multipart upload. finalize_upload() clears _upload_id and
@@ -889,14 +1020,15 @@ protected:
     future<> put_empty_object() {
         s3l.trace("PUT empty object {}", _object_name);
         _object_produced = true;
-        return _client->put_object(_object_name, temporary_buffer<char>());
+        return _client->put_object(_object_name, temporary_buffer<char>(), _metadata);
     }
 
-    multipart_upload(shared_ptr<client> cln, sstring object_name, std::optional<tag> tag, seastar::abort_source* as)
+    multipart_upload(shared_ptr<client> cln, sstring object_name, object_metadata metadata, std::optional<tag> tag, seastar::abort_source* as)
         : _client(std::move(cln))
         , _object_name(std::move(object_name))
         , _bg_flushes("s3::client::multipart_upload::bg_flushes")
         , _tag(std::move(tag))
+        , _metadata(std::move(metadata))
         , _as(as)
     {
     }
@@ -907,15 +1039,15 @@ public:
 
 class client::copy_s3_object final : multipart_upload {
 public:
-    copy_s3_object(shared_ptr<client> cln, sstring source_object, sstring target_object, size_t part_size, std::optional<tag> tag, abort_source* as)
-        : multipart_upload(std::move(cln), std::move(target_object), std::move(tag), as)
+    copy_s3_object(shared_ptr<client> cln, sstring source_object, sstring target_object, object_metadata metadata, size_t part_size, std::optional<tag> tag, abort_source* as)
+        : multipart_upload(std::move(cln), std::move(target_object), std::move(metadata), std::move(tag), as)
         , _max_copy_part_size(part_size)
         , _source_object(std::move(source_object)) {
         assert(_max_copy_part_size > 0 && _max_copy_part_size <= _default_copy_part_size);
     }
 
-    copy_s3_object(shared_ptr<client> cln, sstring source_object, sstring target_object, std::optional<tag> tag, abort_source* as)
-        : copy_s3_object(std::move(cln), std::move(source_object), std::move(target_object), _default_copy_part_size, std::move(tag), as) {}
+    copy_s3_object(shared_ptr<client> cln, sstring source_object, sstring target_object, object_metadata metadata, std::optional<tag> tag, abort_source* as)
+        : copy_s3_object(std::move(cln), std::move(source_object), std::move(target_object), std::move(metadata), _default_copy_part_size, std::move(tag), as) {}
 
     future<> copy() {
         auto source_size = co_await _client->get_object_size(_source_object);
@@ -933,6 +1065,10 @@ private:
             req._headers["x-amz-tagging"] = seastar::format("{}={}", _tag->key, _tag->value);
         }
         req._headers["x-amz-copy-source"] = _source_object;
+        if (!_metadata.empty()) {
+            req._headers["x-amz-metadata-directive"] = "REPLACE";
+            add_object_metadata_headers(req, _metadata);
+        }
 
         co_await _client->make_request(std::move(req), ignore_reply, http::reply::status_type::ok, _as);
     }
@@ -1000,16 +1136,16 @@ private:
     sstring _source_object;
 };
 
-future<> client::copy_object(sstring source_object, sstring target_object, std::optional<size_t> part_size, std::optional<tag> tag, seastar::abort_source* as) {
+future<> client::copy_object(sstring source_object, sstring target_object, object_metadata metadata, std::optional<size_t> part_size, std::optional<tag> tag, seastar::abort_source* as) {
     if (!part_size)
-        co_return co_await copy_s3_object(shared_from_this(), std::move(source_object), std::move(target_object), tag, as).copy();
-    co_return co_await copy_s3_object(shared_from_this(), std::move(source_object), std::move(target_object), part_size.value(), tag, as).copy();
+        co_return co_await copy_s3_object(shared_from_this(), std::move(source_object), std::move(target_object), std::move(metadata), tag, as).copy();
+    co_return co_await copy_s3_object(shared_from_this(), std::move(source_object), std::move(target_object), std::move(metadata), part_size.value(), tag, as).copy();
 }
 
 class client::upload_sink_base : public multipart_upload, public data_sink_impl {
 public:
-    upload_sink_base(shared_ptr<client> cln, sstring object_name, std::optional<tag> tag, seastar::abort_source* as)
-        : multipart_upload(std::move(cln), std::move(object_name), std::move(tag), as)
+    upload_sink_base(shared_ptr<client> cln, sstring object_name, object_metadata metadata, std::optional<tag> tag, seastar::abort_source* as)
+        : multipart_upload(std::move(cln), std::move(object_name), std::move(metadata), std::move(tag), as)
     {
     }
 
@@ -1093,6 +1229,7 @@ future<> client::multipart_upload::start_upload() {
     if (_tag) {
         rep._headers["x-amz-tagging"] = seastar::format("{}={}", _tag->key, _tag->value);
     }
+    add_object_metadata_headers(rep, _metadata);
     co_await _client->make_request(std::move(rep), [this] (const http::reply& rep, input_stream<char>&& in_) -> future<> {
         auto in = std::move(in_);
         auto body = co_await util::read_entire_stream_contiguous(in);
@@ -1242,8 +1379,8 @@ class client::upload_sink final : public client::upload_sink_base {
     }
 
 public:
-    upload_sink(shared_ptr<client> cln, sstring object_name, std::optional<tag> tag = {}, seastar::abort_source* as = nullptr)
-        : upload_sink_base(std::move(cln), std::move(object_name), std::move(tag), as)
+    upload_sink(shared_ptr<client> cln, sstring object_name, object_metadata metadata = {}, std::optional<tag> tag = {}, seastar::abort_source* as = nullptr)
+        : upload_sink_base(std::move(cln), std::move(object_name), std::move(metadata), std::move(tag), as)
     {}
 
     // True while nothing has been written into the sink, so it has no object to
@@ -1265,7 +1402,7 @@ public:
             if (!upload_started()) {
                 s3l.trace("Sink fallback to plain PUT for {}", _object_name);
                 _object_produced = true;
-                co_return co_await _client->put_object(_object_name, std::move(_bufs));
+                co_return co_await _client->put_object(_object_name, std::move(_bufs), std::move(_metadata));
             }
 
             if (_bufs.size() != 0) {
@@ -1345,17 +1482,17 @@ class client::upload_jumbo_sink final : public upload_sink_base {
 
     future<> maybe_flush() {
         if (_current->parts_count() >= _maximum_parts_in_piece) {
-            auto next = std::make_unique<upload_sink>(_client, format("{}_{}", _object_name, parts_count() + 1), piece_tag);
+            auto next = std::make_unique<upload_sink>(_client, format("{}_{}", _object_name, parts_count() + 1), object_metadata{}, piece_tag);
             co_await upload_part(std::exchange(_current, std::move(next)));
             s3l.trace("Initiated {} piece (upload_id {})", parts_count(), _upload_id);
         }
     }
 
 public:
-    upload_jumbo_sink(shared_ptr<client> cln, sstring object_name, std::optional<unsigned> max_parts_per_piece, seastar::abort_source* as)
-        : upload_sink_base(std::move(cln), std::move(object_name), std::nullopt, as)
+    upload_jumbo_sink(shared_ptr<client> cln, sstring object_name, object_metadata metadata, std::optional<unsigned> max_parts_per_piece, seastar::abort_source* as)
+        : upload_sink_base(std::move(cln), std::move(object_name), std::move(metadata), std::nullopt, as)
         , _maximum_parts_in_piece(max_parts_per_piece.value_or(maximum_parts_in_piece))
-        , _current(std::make_unique<upload_sink>(_client, format("{}_{}", _object_name, parts_count()), piece_tag))
+        , _current(std::make_unique<upload_sink>(_client, format("{}_{}", _object_name, parts_count()), object_metadata{}, piece_tag))
     {}
 
     virtual future<> put(std::span<temporary_buffer<char>> data) override {
@@ -1400,12 +1537,12 @@ public:
     }
 };
 
-data_sink client::make_upload_sink(sstring object_name, seastar::abort_source* as) {
-    return data_sink(std::make_unique<upload_sink>(shared_from_this(), std::move(object_name), std::nullopt, as));
+data_sink client::make_upload_sink(sstring object_name, object_metadata metadata, seastar::abort_source* as) {
+    return data_sink(std::make_unique<upload_sink>(shared_from_this(), std::move(object_name), std::move(metadata), std::nullopt, as));
 }
 
-data_sink client::make_upload_jumbo_sink(sstring object_name, std::optional<unsigned> max_parts_per_piece, seastar::abort_source* as) {
-    return data_sink(std::make_unique<upload_jumbo_sink>(shared_from_this(), std::move(object_name), max_parts_per_piece, as));
+data_sink client::make_upload_jumbo_sink(sstring object_name, object_metadata metadata, std::optional<unsigned> max_parts_per_piece, seastar::abort_source* as) {
+    return data_sink(std::make_unique<upload_jumbo_sink>(shared_from_this(), std::move(object_name), std::move(metadata), max_parts_per_piece, as));
 }
 
 class client::chunked_download_source final : public seastar::data_source_impl {
@@ -1426,10 +1563,20 @@ class client::chunked_download_source final : public seastar::data_source_impl {
     future<> _filling_fiber = make_ready_future<>();
 
     future<> make_filling_fiber() {
+        // The reply handler consumes the body as it arrives, so the transport cannot
+        // replay a request for this fiber. It re-issues from the loop below instead and
+        // drives the strategy itself: should_retry() reports the outcome to the send
+        // brake, backs off, waits on it, and answers whether to dispatch again.
         seastar::http::no_retry_strategy no_retry;
+        aws::default_aws_retry_strategy retry_strategy{aws::default_aws_retry_strategy::default_max_retries, *_client->_request_limiter};
         s3l.trace("Fiber starts cycle for object '{}'", _object_name);
         auto units = try_get_units(_client->_buffered_dl_sem, 1);
+        // Retries already made for the request in flight, reset by one that completes.
+        // The strategy keeps no count of its own -- seastar passes it the attempt number
+        // for a request it replays, and here this loop is what re-issues.
+        unsigned retries = 0;
         while (!_is_finished) {
+            std::exception_ptr failure;
             try {
                 if (!_is_finished && _buffers_size >= _max_buffers_size * _buffers_low_watermark) {
                     co_await _bg_fiber_cv.when([this] { return _is_finished || (_buffers_size < _max_buffers_size * _buffers_low_watermark); });
@@ -1552,13 +1699,22 @@ class client::chunked_download_source final : public seastar::data_source_impl {
                     _as);
                 _is_contiguous_mode = _buffers_size < _max_buffers_size * _buffers_high_watermark;
             } catch (...) {
-                auto ex = std::current_exception();
-                auto aws_ex = aws::aws_error::from_exception_ptr(ex);
-                if (!aws_ex.is_retryable()) {
-                    s3l.info("Fiber for object '{}' failed: {}, exiting", _object_name, ex);
-                    _get_cv.broken(ex);
-                    co_return;
-                }
+                failure = std::current_exception();
+            }
+            if (!failure) {
+                retries = 0;
+                continue;
+            }
+            // Out here because a catch block cannot co_await. should_retry() answers
+            // false both for an error worth no second attempt and for a budget that is
+            // spent, and reports either to the brake on the way.
+            if (!co_await retry_strategy.should_retry(failure, retries++)) {
+                s3l.info("Fiber for object '{}' gives up after {} failed requests, last error: {}", _object_name, retries, failure);
+                // Leaving through _get_cv.broken() rather than through the loop
+                // condition: a fiber that just stops parks its reader in _get_cv.wait()
+                // with nothing left to signal it.
+                _get_cv.broken(failure);
+                co_return;
             }
         }
         s3l.trace("Fiber for object '{}' completed", _object_name);
@@ -1835,7 +1991,7 @@ public:
                    size_t part_size,
                    upload_progress& up,
                    seastar::abort_source* as)
-        : multipart_upload(std::move(cln), std::move(object_name), std::move(tag), as)
+        : multipart_upload(std::move(cln), std::move(object_name), object_metadata{}, std::move(tag), as)
         , _path{std::move(path)}
         , _part_size(part_size)
         , _progress(up)
@@ -2062,8 +2218,17 @@ static std::pair<std::vector<sstring>, sstring> parse_list_of_objects(sstring bo
 
     std::vector<sstring> names;
     auto root_node = doc->first_node("ListBucketResult");
-    for (auto contents = root_node->first_node("Contents"); contents; contents = contents->next_sibling()) {
+    if (!root_node) {
+        throw std::runtime_error("'ListBucketResult' node is missing in list-objects-v2 response");
+    }
+    // Walk the "Contents" siblings by name: the order of the elements below
+    // "ListBucketResult" is not specified, and servers do put other elements
+    // (e.g. "IsTruncated", "KeyCount", "Name") after the last "Contents".
+    for (auto contents = root_node->first_node("Contents"); contents; contents = contents->next_sibling("Contents")) {
         auto key = contents->first_node("Key");
+        if (!key) {
+            throw std::runtime_error("'Key' node is missing in 'Contents' of list-objects-v2 response");
+        }
         names.push_back(key->value());
     }
 

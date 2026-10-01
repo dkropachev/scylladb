@@ -330,7 +330,8 @@ bool_or_null limits(const expression& lhs, oper_t op, null_handling_style null_h
             case oper_t::CONTAINS:
             case oper_t::CONTAINS_KEY:
             case oper_t::LIKE:
-            case oper_t::IS_NOT: // IS_NOT doesn't really belong here, luckily this is never reached.
+            case oper_t::IS:
+            case oper_t::IS_NOT: // IS and IS_NOT operators are handled separately in their dedicated evaluation functions
                 throw exceptions::invalid_request_exception(fmt::format("Invalid comparison with null for operator \"{}\"", op));
             case oper_t::EQ:
                 return !sides_bytes.first == !sides_bytes.second;
@@ -563,6 +564,15 @@ bool is_not_null(const expression& lhs, const expression& rhs, const evaluation_
         throw exceptions::invalid_request_exception("IS NOT operator accepts only NULL as its right side");
     }
     return !lhs_val.is_null();
+}
+
+bool is_null(const expression& lhs, const expression& rhs, const evaluation_inputs& inputs) {
+    cql3::raw_value lhs_val = evaluate(lhs, inputs);
+    cql3::raw_value rhs_val = evaluate(rhs, inputs);
+    if (!rhs_val.is_null()) {
+        throw exceptions::invalid_request_exception("IS operator accepts only NULL as its right side");
+    }
+    return lhs_val.is_null();
 }
 
 } // anonymous namespace
@@ -1264,6 +1274,9 @@ cql3::raw_value do_evaluate(const binary_operator& binop, const evaluation_input
         case oper_t::NOT_IN:
             binop_result = is_none_of(binop.lhs, binop.rhs, inputs, binop.null_handling);
             break;
+        case oper_t::IS:
+            binop_result = is_null(binop.lhs, binop.rhs, inputs);
+            break;
         case oper_t::IS_NOT:
             binop_result = is_not_null(binop.lhs, binop.rhs, inputs);
             break;
@@ -1885,13 +1898,13 @@ static cql3::raw_value do_evaluate(const function_call& fun_call, const evaluati
         throw std::runtime_error("Only scalar functions can be evaluated using evaluate()");
     }
 
-    std::vector<bytes_opt> arguments;
+    std::vector<managed_bytes_opt> arguments;
     arguments.reserve(fun_call.args.size());
 
     for (const expression& arg : fun_call.args) {
         cql3::raw_value arg_val = evaluate(arg, inputs);
 
-        arguments.emplace_back(to_bytes_opt(std::move(arg_val)));
+        arguments.emplace_back(std::move(arg_val).to_managed_bytes_opt());
     }
 
     bool has_cache_id = fun_call.lwt_cache_id.get() != nullptr && fun_call.lwt_cache_id->has_value();
@@ -1903,10 +1916,10 @@ static cql3::raw_value do_evaluate(const function_call& fun_call, const evaluati
         }
     }
 
-    bytes_opt result = scalar_fun->execute(arguments);
+    managed_bytes_opt result = scalar_fun->execute(arguments);
 
     if (has_cache_id) {
-        inputs.options->cache_pk_function_call(**fun_call.lwt_cache_id, result);
+        inputs.options->cache_pk_function_call(**fun_call.lwt_cache_id, to_bytes_opt(result));
     }
 
     if (!result.has_value()) {
@@ -1914,10 +1927,10 @@ static cql3::raw_value do_evaluate(const function_call& fun_call, const evaluati
     }
 
     try {
-        scalar_fun->return_type()->validate(*result);
+        scalar_fun->return_type()->validate(managed_bytes_view(*result));
     } catch (marshal_exception&) {
         throw runtime_exception(fmt::format("Return of function {} ({}) is not a valid value for its declared return type {}",
-                                       *scalar_fun, to_hex(result),
+                                       *scalar_fun, to_hex(to_bytes_opt(result)),
                                        scalar_fun->return_type()->as_cql3_type()
                                        ));
     }
@@ -2326,13 +2339,13 @@ convert_map_back_to_listlike(expression e) {
             return "NONE";
         }
 
-        virtual bytes_opt execute(std::span<const bytes_opt> parameters) override {
+        virtual managed_bytes_opt execute(std::span<const managed_bytes_opt> parameters) override {
             auto& p = parameters[0];
             if (!p) {
                 return std::nullopt;
             }
-            auto v = _map_type->deserialize_value(*p);
-            return _listlike_type->serialize_map(*_map_type, v);
+            auto v = _map_type->deserialize_value(managed_bytes_view(*p));
+            return managed_bytes(_listlike_type->serialize_map(*_map_type, v));
         }
     };
 
@@ -2375,6 +2388,11 @@ bool is_token_function(const function_call& fun_call) {
 
 bool is_native_function_call(const function_call& fc, const functions::function_name& name) {
     return is_function_call_name_equal(fc, name);
+}
+
+bool is_external_function_call(const function_call& fc) {
+    const shared_ptr<functions::function>* fun = std::get_if<shared_ptr<functions::function>>(&fc.func);
+    return fun != nullptr && (*fun)->is_external();
 }
 
 bool is_token_function(const expression& e) {
@@ -2786,6 +2804,8 @@ std::string_view fmt::formatter<cql3::expr::oper_t>::to_string(const cql3::expr:
         return "CONTAINS";
     case oper_t::CONTAINS_KEY:
         return "CONTAINS KEY";
+    case oper_t::IS:
+        return "IS";
     case oper_t::IS_NOT:
         return "IS NOT";
     case oper_t::LIKE:

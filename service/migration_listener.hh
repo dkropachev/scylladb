@@ -90,6 +90,12 @@ public:
 
     virtual void on_before_allocate_tablet_map(const locator::tablet_map&, const schema& s, utils::chunked_vector<mutation>&, api::timestamp_type) {}
 
+    // Fired after a schema merge that touched any cluster-config table. The node-oriented
+    // config tables are keyed by cluster/datacenter/rack/host_id rather than by keyspace or
+    // table, so none of the on_*_keyspace / on_*_column_family notifications above cover
+    // them. Defaults to a no-op: only cluster_config_manager cares.
+    virtual void on_cluster_config_change() {}
+
     class only_view_notifications;
     class empty_listener;
 };
@@ -149,6 +155,8 @@ public:
     future<> drop_function(const db::functions::function_name& fun_name, const std::vector<data_type>& arg_types);
     future<> drop_aggregate(const db::functions::function_name& fun_name, const std::vector<data_type>& arg_types);
 
+    future<> cluster_config_change();
+
     // This notification allows the subscriber to modify the cfms vector before
     // we create the tables mutations and notify about them. For example, we
     // can add a new table here (e.g. CDC).
@@ -158,9 +166,15 @@ public:
     void pre_create_column_families(const keyspace_metadata& ksm, std::vector<schema_ptr>&, api::timestamp_type);
 
     void before_create_column_family(const keyspace_metadata& ksm, const schema&, utils::chunked_vector<mutation>&, api::timestamp_type);
+    // When in the context of a notification callback, call `before_create_column_family_in_notification`,
+    // and otherwise call 'before_create_column_family'.
+    void before_create_column_family_in_notification(const keyspace_metadata& ksm, const schema&, utils::chunked_vector<mutation>&, api::timestamp_type);
     void before_create_column_families(const keyspace_metadata& ksm, const std::vector<schema_ptr>&, utils::chunked_vector<mutation>&, api::timestamp_type);
     void before_update_column_family(const schema& new_schema, const schema& old_schema, utils::chunked_vector<mutation>&, api::timestamp_type);
     void before_drop_column_family(const schema&, utils::chunked_vector<mutation>&, api::timestamp_type);
+    // When in the context of a notification callback, call `before_drop_column_family_in_notification`,
+    // and otherwise call 'before_drop_column_family'.
+    void before_drop_column_family_in_notification(const schema&, utils::chunked_vector<mutation>&, api::timestamp_type);
     void before_drop_keyspace(const sstring& keyspace_name, utils::chunked_vector<mutation>&, api::timestamp_type);
 
     // Called when creating a tablet map for a new table.
