@@ -35,6 +35,7 @@
 #include "types/types.hh"
 #include "db/consistency_level_type.hh"
 #include "db/config.hh"
+#include "db/system_table_response_cache.hh"
 #include "utils/enum_option.hh"
 #include "service/storage_proxy_fwd.hh"
 #include "service/pager/query_plan.hh"
@@ -294,7 +295,8 @@ public:
                 const query_options& options,
                 statements::prepared_statement::checked_weak_ptr prepared,
                 cql3::prepared_cache_key_type cache_key,
-                bool needs_authorization);
+                bool needs_authorization,
+                std::optional<db::system_table_response_cache::snapshot> cached_response = std::nullopt);
 
     future<::shared_ptr<cql_transport::messages::result_message>>
     do_execute_prepared(
@@ -304,7 +306,8 @@ public:
                 std::optional<service::group0_guard> guard,
                 statements::prepared_statement::checked_weak_ptr prepared,
                 cql3::prepared_cache_key_type cache_key,
-                bool needs_authorization);
+                bool needs_authorization,
+                std::optional<db::system_table_response_cache::snapshot> cached_response);
 
     /// Execute a client statement that was not prepared.
     inline

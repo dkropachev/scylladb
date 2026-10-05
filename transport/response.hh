@@ -104,6 +104,11 @@ public:
         return std::move(_body);
     }
 
+    /// Return a copy of the serialized body, linearizing its fragments if needed.
+    bytes copy_body() {
+        return bytes(_body.linearize());
+    }
+
 private:
     void compress(cql_compression compression);
     void compress_lz4();

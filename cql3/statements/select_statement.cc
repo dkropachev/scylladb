@@ -37,6 +37,7 @@
 #include "cql3/selection/selection.hh"
 #include "cql3/util.hh"
 #include "cql3/restrictions/statement_restrictions.hh"
+#include "cql3/expr/expr-utils.hh"
 #include "index/secondary_index.hh"
 #include "validation.hh"
 #include "db/system_keyspace.hh"
@@ -308,6 +309,30 @@ bool select_statement::should_reclassify_control_connection() const {
 
 const sstring& select_statement::column_family() const {
     return _schema->cf_name();
+}
+
+bool select_statement::cacheable_system_table_response() const {
+    if (keyspace() != db::system_keyspace::NAME
+            || (column_family() != db::system_keyspace::LOCAL && column_family() != db::system_keyspace::PEERS)
+            || !_selection->is_trivial() || _selection->is_aggregate()
+            || _limit || _per_partition_limit || has_group_by()
+            || _parameters->is_distinct() || _parameters->is_json() || _parameters->bypass_cache()
+            || _parameters->is_mutation_fragments() || _parameters->is_prune_materialized_view()
+            || _parameters->allow_filtering()) {
+        return false;
+    }
+    return !expr::contains_nonpure_function(_restrictions->get_partition_key_restrictions())
+            && !expr::contains_nonpure_function(_restrictions->get_clustering_columns_restrictions())
+            && !expr::contains_nonpure_function(_restrictions->get_nonprimary_key_restrictions());
+}
+
+void select_statement::record_cached_system_table_response(const service::query_state& state, const query_options& options) const {
+    const source_selector src_sel = state.get_client_state().is_internal()
+            ? source_selector::INTERNAL : source_selector::USER;
+    ++_stats.query_cnt(src_sel, _ks_sel, cond_selector::NO_CONDITIONS, statement_type::SELECT);
+    _stats.select_partition_range_scan += _range_scan;
+    _stats.select_partition_range_scan_no_bypass_cache += _range_scan_no_bypass_cache;
+    _stats.unpaged_select_queries(_ks_sel) += options.get_page_size() <= 0;
 }
 
 query::partition_slice
