@@ -607,6 +607,7 @@ usingClause[std::unique_ptr<cql3::attributes::raw>& attrs]
 
 usingClauseObjective[std::unique_ptr<cql3::attributes::raw>& attrs]
     : K_TIMESTAMP ts=intValue { attrs->timestamp = std::move(ts); }
+    | K_SCORE score=intValue { attrs->score = std::move(score); }
     | K_TTL t=intValue { attrs->time_to_live = std::move(t); }
     | K_TIMEOUT to=term { attrs->timeout = std::move(to); }
     ;
@@ -617,6 +618,7 @@ usingTimestampTimeoutClause[std::unique_ptr<cql3::attributes::raw>& attrs]
 
 usingTimestampTimeoutClauseObjective[std::unique_ptr<cql3::attributes::raw>& attrs]
     : K_TIMESTAMP ts=intValue { attrs->timestamp = std::move(ts); }
+    | K_SCORE score=intValue { attrs->score = std::move(score); }
     | K_TIMEOUT to=term { attrs->timeout = std::move(to); }
     ;
 
@@ -2298,6 +2300,7 @@ basic_unreserved_keyword returns [sstring str]
         | K_SHARES
         | K_GROUP
         | K_TIMEOUT
+        | K_SCORE
         | K_SERVICE
         | K_LEVEL
         | K_LEVELS
@@ -2384,6 +2387,7 @@ K_PRIMARY:     P R I M A R Y;
 K_INTO:        I N T O;
 K_VALUES:      V A L U E S;
 K_TIMESTAMP:   T I M E S T A M P;
+K_SCORE:       S C O R E;
 K_TTL:         T T L;
 K_ALTER:       A L T E R;
 K_RENAME:      R E N A M E;

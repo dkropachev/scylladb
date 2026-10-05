@@ -425,6 +425,9 @@ std::pair<schema_ptr, std::vector<view_ptr>> alter_table_statement::prepare_sche
         {
             auto schema_extensions = _properties->make_schema_extensions(db.extensions());
             _properties->validate(db, keyspace(), schema_extensions);
+            if (_properties->has_property(cf_prop_defs::KW_RECONCILIATION_MODE)) {
+                throw exceptions::invalid_request_exception("reconciliation_mode cannot be changed after table creation");
+            }
 
             if (!cf.views().empty() && _properties->get_gc_grace_seconds() == 0) {
                 throw exceptions::invalid_request_exception(

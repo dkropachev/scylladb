@@ -112,6 +112,13 @@ public:
     gc_clock::duration default_time_to_live() const {
         return _raw._props.default_time_to_live;
     }
+    schema_builder& set_reconciliation_mode(reconciliation_mode mode) {
+        _raw._props.reconciliation = mode;
+        return *this;
+    }
+    reconciliation_mode get_reconciliation_mode() const {
+        return _raw._props.reconciliation;
+    }
 
     schema_builder& set_gc_grace_seconds(int32_t gc_grace_seconds) {
         _raw._props.gc_grace_seconds = gc_grace_seconds;

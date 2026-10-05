@@ -32,6 +32,8 @@ class attributes final {
 private:
     expr::unset_bind_variable_guard _timestamp_unset_guard;
     std::optional<cql3::expr::expression> _timestamp;
+    expr::unset_bind_variable_guard _score_unset_guard;
+    std::optional<cql3::expr::expression> _score;
     expr::unset_bind_variable_guard _time_to_live_unset_guard;
     std::optional<cql3::expr::expression> _time_to_live;
     std::optional<cql3::expr::expression> _timeout;
@@ -42,6 +44,7 @@ public:
     static std::unique_ptr<attributes> none();
 private:
     attributes(std::optional<cql3::expr::expression>&& timestamp,
+               std::optional<cql3::expr::expression>&& score,
                std::optional<cql3::expr::expression>&& time_to_live,
                std::optional<cql3::expr::expression>&& timeout,
                std::optional<sstring> service_level,
@@ -49,6 +52,7 @@ private:
                bool bypass_large_data_guardrails);
 public:
     bool is_timestamp_set() const;
+    bool is_score_set() const;
 
     bool is_time_to_live_set() const;
 
@@ -61,6 +65,7 @@ public:
     bool is_bypass_large_data_guardrails() const;
 
     int64_t get_timestamp(int64_t now, const query_options& options);
+    int64_t get_score(const query_options& options);
 
     std::optional<int32_t> get_time_to_live(const query_options& options);
 
@@ -75,6 +80,7 @@ public:
     class raw final {
     public:
         std::optional<cql3::expr::expression> timestamp;
+        std::optional<cql3::expr::expression> score;
         std::optional<cql3::expr::expression> time_to_live;
         std::optional<cql3::expr::expression> timeout;
         std::optional<sstring> service_level;

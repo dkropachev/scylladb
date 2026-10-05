@@ -33,6 +33,11 @@ parameters:
   on the same node). However, timestamps assigned at different nodes are not guaranteed to be globally unique.
   Note that with a steadily high write rate, timestamp collision is not unlikely. If it happens, e.g. two INSERTS
   have the same timestamp, a conflict resolution algorithm determines which of the inserted cells prevails (see :ref:`update ordering <update-ordering>` for more information):
+- ``SCORE``: required on a table created with ``reconciliation_mode = 'score_ascending'`` or
+  ``'score_descending'``. Supply one signed 64-bit integer for each ``INSERT``, ``UPDATE``, or
+  ``DELETE`` statement, including statements within a batch. Lower scores win in ascending mode;
+  higher scores win in descending mode. ``USING TIMESTAMP`` is disallowed on these tables.
+  A batch-level score is not supported.
 - ``TTL``: specifies an optional Time To Live (in seconds) for the inserted values. If set, the inserted values are
   automatically removed from the database after the specified time. Note that the TTL concerns the inserted values, not
   the columns themselves. This means that any subsequent update of the column will also reset the TTL (to whatever TTL
@@ -56,6 +61,22 @@ and the cell value.
 
 The fundamental rule for ordering cells that insert, update, or delete data in a given row and column
 is that the cell with the highest timestamp wins.
+
+For a new score-ordered table, set ``reconciliation_mode`` at creation. For example::
+
+    CREATE TABLE records (id int PRIMARY KEY, value text)
+        WITH reconciliation_mode = 'score_ascending';
+    INSERT INTO records (id, value) VALUES (1, 'first') USING SCORE 10;
+    UPDATE records USING SCORE 20 SET value = 'second' WHERE id = 1;
+
+Here ``first`` remains visible. The policy cannot be changed after creation. Scoring occurs
+independently for each cell; equal scores use normal cell tie-breaking rules and may produce a
+row assembled from different writes. The score is encoded in the stored timestamp field so
+``writetime()`` returns the encoded score, not wall-clock time. For ascending mode it returns the
+bitwise complement of the supplied score. TTL expiry still follows coordinator wall-clock time.
+Conditional writes and counters are unsupported on score-ordered tables.
+The score mapping reserves one endpoint: ascending mode rejects ``9223372036854775807``;
+descending mode rejects ``-9223372036854775808``.
 
 However, it is possible that multiple such cells will carry the same ``TIMESTAMP``.
 There could be several reasons for ``TIMESTAMP`` collision:

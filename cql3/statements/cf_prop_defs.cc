@@ -50,6 +50,7 @@ const sstring cf_prop_defs::KW_MINCOMPACTIONTHRESHOLD = "min_threshold";
 const sstring cf_prop_defs::KW_MAXCOMPACTIONTHRESHOLD = "max_threshold";
 const sstring cf_prop_defs::KW_CACHING = "caching";
 const sstring cf_prop_defs::KW_DEFAULT_TIME_TO_LIVE = "default_time_to_live";
+const sstring cf_prop_defs::KW_RECONCILIATION_MODE = "reconciliation_mode";
 const sstring cf_prop_defs::KW_MIN_INDEX_INTERVAL = "min_index_interval";
 const sstring cf_prop_defs::KW_MAX_INDEX_INTERVAL = "max_index_interval";
 const sstring cf_prop_defs::KW_SPECULATIVE_RETRY = "speculative_retry";
@@ -110,7 +111,7 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
 
     static std::set<sstring> keywords({
         KW_COMMENT,
-        KW_GCGRACESECONDS, KW_CACHING, KW_DEFAULT_TIME_TO_LIVE,
+        KW_GCGRACESECONDS, KW_CACHING, KW_DEFAULT_TIME_TO_LIVE, KW_RECONCILIATION_MODE,
         KW_MIN_INDEX_INTERVAL, KW_MAX_INDEX_INTERVAL, KW_SPECULATIVE_RETRY,
         KW_BF_FP_CHANCE, KW_MEMTABLE_FLUSH_PERIOD, KW_COMPACTION,
         KW_COMPRESSION, KW_CRC_CHECK_CHANCE,  KW_ID, KW_PAXOSGRACESECONDS,
@@ -176,6 +177,18 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
     validate_tombstone_gc_options(tombstone_gc_options, db, ks_name);
 
     validate_minimum_int(KW_DEFAULT_TIME_TO_LIVE, 0, DEFAULT_DEFAULT_TIME_TO_LIVE);
+    if (has_property(KW_RECONCILIATION_MODE)) {
+        auto mode = get_string(KW_RECONCILIATION_MODE, "");
+        if (mode != "timestamp" && mode != "score_ascending" && mode != "score_descending") {
+            throw exceptions::configuration_exception("reconciliation_mode must be timestamp, score_ascending, or score_descending");
+        }
+        if (mode != "timestamp" && !db.features().score_ordered_tables) {
+            throw exceptions::configuration_exception("Score-ordered tables require all nodes to support SCORE_ORDERED_TABLES");
+        }
+        if (mode != "timestamp" && strong_consistency::is_strongly_consistent(db, ks_name)) {
+            throw exceptions::configuration_exception("Score-ordered tables are not supported in strongly consistent keyspaces");
+        }
+    }
     validate_minimum_int(KW_PAXOSGRACESECONDS, 0, DEFAULT_GC_GRACE_SECONDS);
 
     auto min_index_interval = get_int(KW_MIN_INDEX_INTERVAL, DEFAULT_MIN_INDEX_INTERVAL);
@@ -377,6 +390,12 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
 
     if (has_property(KW_DEFAULT_TIME_TO_LIVE)) {
         builder.set_default_time_to_live(gc_clock::duration(get_int(KW_DEFAULT_TIME_TO_LIVE, DEFAULT_DEFAULT_TIME_TO_LIVE)));
+    }
+    if (has_property(KW_RECONCILIATION_MODE)) {
+        auto mode = get_string(KW_RECONCILIATION_MODE, "timestamp");
+        builder.set_reconciliation_mode(mode == "score_ascending" ? reconciliation_mode::score_ascending
+                : mode == "score_descending" ? reconciliation_mode::score_descending
+                : reconciliation_mode::timestamp);
     }
 
     if (has_property(KW_SPECULATIVE_RETRY)) {

@@ -96,6 +96,9 @@ future<> batch_statement::check_access(query_processor& qp, const service::clien
 
 void batch_statement::validate()
 {
+    if (_attrs->is_score_set()) {
+        throw exceptions::invalid_request_exception("Specify USING SCORE on each statement in a batch");
+    }
     if (_attrs->is_time_to_live_set()) {
         throw exceptions::invalid_request_exception("Global TTL on the BATCH statement is not supported.");
     }
@@ -117,6 +120,9 @@ void batch_statement::validate()
     }
     if (timestamp_set && std::ranges::any_of(_statements, [] (auto&& s) { return s.statement->is_timestamp_set(); })) {
         throw exceptions::invalid_request_exception("Timestamp must be set either on BATCH or individual statements");
+    }
+    if (timestamp_set && std::ranges::any_of(_statements, [] (auto&& s) { return s.statement->is_score_set(); })) {
+        throw exceptions::invalid_request_exception("A batch-level timestamp cannot be combined with USING SCORE");
     }
     if (_type == type::COUNTER && has_non_counters) {
         throw exceptions::invalid_request_exception("Cannot include non-counter statement in a counter batch");
@@ -535,5 +541,3 @@ audit::statement_category batch_statement::category() const {
 }
 
 }
-
-

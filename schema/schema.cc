@@ -596,6 +596,7 @@ schema::has_multi_cell_collections() const {
 bool operator==(const schema::user_properties& lhs, const schema::user_properties& rhs) {
     return lhs.comment == rhs.comment
         && lhs.default_time_to_live == rhs.default_time_to_live
+        && lhs.reconciliation == rhs.reconciliation
         && lhs.bloom_filter_fp_chance == rhs.bloom_filter_fp_chance
         && lhs.compressor_params == rhs.compressor_params
         && lhs.gc_grace_seconds == rhs.gc_grace_seconds
@@ -693,6 +694,10 @@ table_schema_version schema::calculate_digest(const schema::raw_schema& r) {
     feed_hash(h, r._columns);
     feed_hash(h, r._props.comment);
     feed_hash(h, r._props.default_time_to_live.count());
+    // Preserve the digest of pre-existing tables during rolling upgrades.
+    if (r._props.reconciliation != reconciliation_mode::timestamp) {
+        feed_hash(h, r._props.reconciliation);
+    }
     feed_hash(h, r._regular_column_name_type);
     feed_hash(h, r._props.bloom_filter_fp_chance);
     feed_hash(h, r._props.compressor_params.get_options());
@@ -1248,6 +1253,10 @@ fragmented_ostringstream& schema::schema_properties(const schema_describe_helper
 
     os << "\n    AND crc_check_chance = " << fmt::to_string(crc_check_chance());
     os << "\n    AND default_time_to_live = " << fmt::to_string(default_time_to_live().count());
+    if (get_reconciliation_mode() != reconciliation_mode::timestamp) {
+        os << "\n    AND reconciliation_mode = '"
+           << (get_reconciliation_mode() == reconciliation_mode::score_ascending ? "score_ascending" : "score_descending") << "'";
+    }
     os << "\n    AND gc_grace_seconds = " << fmt::to_string(gc_grace_seconds().count());
     os << "\n    AND max_index_interval = " << fmt::to_string(max_index_interval());
     os << "\n    AND memtable_flush_period_in_ms = " << fmt::to_string(memtable_flush_period());

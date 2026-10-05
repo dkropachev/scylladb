@@ -120,6 +120,7 @@ public:
     int64_t get_timestamp(int64_t now, const query_options& options) const;
 
     bool is_timestamp_set() const;
+    bool is_score_set() const;
 
     std::optional<gc_clock::duration> get_time_to_live(const query_options& options) const;
 
