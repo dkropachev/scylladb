@@ -98,11 +98,24 @@ bool modification_statement::is_view() const {
 }
 
 int64_t modification_statement::get_timestamp(int64_t now, const query_options& options) const {
+    const auto mode = s->get_reconciliation_mode();
+    if (mode != reconciliation_mode::timestamp) {
+        const auto score = attrs->get_score(options);
+        const auto encoded = mode == reconciliation_mode::score_ascending ? ~score : score;
+        if (encoded == api::missing_timestamp) {
+            throw exceptions::invalid_request_exception("Score maps to the reserved missing timestamp");
+        }
+        return encoded;
+    }
     return attrs->get_timestamp(now, options);
 }
 
 bool modification_statement::is_timestamp_set() const {
     return attrs->is_timestamp_set();
+}
+
+bool modification_statement::is_score_set() const {
+    return attrs->is_score_set();
 }
 
 std::optional<gc_clock::duration> modification_statement::get_time_to_live(const query_options& options) const {
@@ -695,6 +708,16 @@ audit::statement_category modification_statement::category() const {
 
 void
 modification_statement::validate(query_processor&, const service::client_state& state) const {
+    if (s->get_reconciliation_mode() != reconciliation_mode::timestamp) {
+        if (!attrs->is_score_set() || attrs->is_timestamp_set()) {
+            throw exceptions::invalid_request_exception("Score-ordered tables require USING SCORE and disallow USING TIMESTAMP");
+        }
+        if (has_conditions()) {
+            throw exceptions::invalid_request_exception("Conditional writes are not supported on score-ordered tables");
+        }
+    } else if (attrs->is_score_set()) {
+        throw exceptions::invalid_request_exception("USING SCORE requires a score-ordered table");
+    }
     if (has_conditions() && attrs->is_timestamp_set()) {
         throw exceptions::invalid_request_exception("Cannot provide custom timestamp for conditional updates");
     }

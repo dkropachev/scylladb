@@ -20,10 +20,11 @@
 namespace cql3 {
 
 std::unique_ptr<attributes> attributes::none() {
-    return std::unique_ptr<attributes>{new attributes{{}, {}, {}, {}, {}, false}};
+    return std::unique_ptr<attributes>{new attributes{{}, {}, {}, {}, {}, {}, false}};
 }
 
 attributes::attributes(std::optional<cql3::expr::expression>&& timestamp,
+                       std::optional<cql3::expr::expression>&& score,
                        std::optional<cql3::expr::expression>&& time_to_live,
                        std::optional<cql3::expr::expression>&& timeout,
                        std::optional<sstring> service_level,
@@ -31,6 +32,8 @@ attributes::attributes(std::optional<cql3::expr::expression>&& timestamp,
                        bool bypass_large_data_guardrails)
     : _timestamp_unset_guard(timestamp)
     , _timestamp{std::move(timestamp)}
+    , _score_unset_guard(score)
+    , _score{std::move(score)}
     , _time_to_live_unset_guard(time_to_live)
     , _time_to_live{std::move(time_to_live)}
     , _timeout{std::move(timeout)}
@@ -41,6 +44,10 @@ attributes::attributes(std::optional<cql3::expr::expression>&& timestamp,
 
 bool attributes::is_timestamp_set() const {
     return bool(_timestamp);
+}
+
+bool attributes::is_score_set() const {
+    return bool(_score);
 }
 
 bool attributes::is_time_to_live_set() const {
@@ -76,6 +83,21 @@ int64_t attributes::get_timestamp(int64_t now, const query_options& options) {
         return tval.view().validate_and_deserialize<int64_t>(*long_type);
     } catch (marshal_exception& e) {
         throw exceptions::invalid_request_exception("Invalid timestamp value");
+    }
+}
+
+int64_t attributes::get_score(const query_options& options) {
+    if (!_score || _score_unset_guard.is_unset(options)) {
+        throw exceptions::invalid_request_exception("USING SCORE is required for this table");
+    }
+    auto value = expr::evaluate(*_score, options);
+    if (value.is_null()) {
+        throw exceptions::invalid_request_exception("Invalid null score");
+    }
+    try {
+        return value.view().validate_and_deserialize<int64_t>(*long_type);
+    } catch (marshal_exception&) {
+        throw exceptions::invalid_request_exception("Invalid score value");
     }
 }
 
@@ -160,6 +182,9 @@ void attributes::fill_prepare_context(prepare_context& ctx) {
     if (_timestamp.has_value()) {
         expr::fill_prepare_context(*_timestamp, ctx);
     }
+    if (_score.has_value()) {
+        expr::fill_prepare_context(*_score, ctx);
+    }
     if (_time_to_live.has_value()) {
         expr::fill_prepare_context(*_time_to_live, ctx);
     }
@@ -172,11 +197,15 @@ void attributes::fill_prepare_context(prepare_context& ctx) {
 }
 
 std::unique_ptr<attributes> attributes::raw::prepare(data_dictionary::database db, const sstring& ks_name, const sstring& cf_name) const {
-    std::optional<expr::expression> ts, ttl, to, conc;
+    std::optional<expr::expression> ts, score, ttl, to, conc;
 
     if (timestamp.has_value()) {
         ts = prepare_expression(*timestamp, db, ks_name, nullptr, timestamp_receiver(ks_name, cf_name));
         verify_no_aggregate_functions(*ts, "USING clause");
+    }
+    if (this->score.has_value()) {
+        score = prepare_expression(*this->score, db, ks_name, nullptr, timestamp_receiver(ks_name, cf_name));
+        verify_no_aggregate_functions(*score, "USING clause");
     }
 
     if (time_to_live.has_value()) {
@@ -194,7 +223,7 @@ std::unique_ptr<attributes> attributes::raw::prepare(data_dictionary::database d
         verify_no_aggregate_functions(*concurrency, "USING clause");
     }
 
-    return std::unique_ptr<attributes>{new attributes{std::move(ts), std::move(ttl), std::move(to), std::move(service_level), std::move(conc), bypass_large_data_guardrails}};
+    return std::unique_ptr<attributes>{new attributes{std::move(ts), std::move(score), std::move(ttl), std::move(to), std::move(service_level), std::move(conc), bypass_large_data_guardrails}};
 }
 
 lw_shared_ptr<column_specification> attributes::raw::timestamp_receiver(const sstring& ks_name, const sstring& cf_name) const {

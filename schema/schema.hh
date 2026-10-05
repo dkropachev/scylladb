@@ -181,6 +181,15 @@ enum class storage_engine_type {
     logstor,
 };
 
+// The score modes use the cell timestamp slot for a client supplied priority.
+// This keeps every existing merge, deletion, repair, and compaction path on the
+// same total ordering. The original wall-clock write time is not retained.
+enum class reconciliation_mode : uint8_t {
+    timestamp,
+    score_ascending,
+    score_descending,
+};
+
 inline sstring storage_engine_type_to_sstring(storage_engine_type t) {
     switch (t) {
     case storage_engine_type::normal:
@@ -532,6 +541,7 @@ public:
     struct user_properties {
         sstring comment;
         gc_clock::duration default_time_to_live = gc_clock::duration::zero();
+        reconciliation_mode reconciliation = reconciliation_mode::timestamp;
         double bloom_filter_fp_chance = 0.01;
         compression_parameters compressor_params;
         extensions_map extensions;
@@ -703,6 +713,9 @@ public:
     }
     const sstring& comment() const {
         return _raw._props.comment;
+    }
+    reconciliation_mode get_reconciliation_mode() const {
+        return _raw._props.reconciliation;
     }
     bool is_counter() const {
         return _raw._is_counter;

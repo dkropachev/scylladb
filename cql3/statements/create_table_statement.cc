@@ -138,7 +138,11 @@ create_table_statement::prepare_schema_mutations(query_processor& qp, const quer
 schema_ptr create_table_statement::get_cf_meta_data(const data_dictionary::database db) const {
     schema_builder builder{this_smp_shard_count(), keyspace(), column_family(), _id};
     apply_properties_to(builder, db);
-    return builder.build(_use_compact_storage ? schema_builder::compact_storage::yes : schema_builder::compact_storage::no);
+    auto result = builder.build(_use_compact_storage ? schema_builder::compact_storage::yes : schema_builder::compact_storage::no);
+    if (result->get_reconciliation_mode() != reconciliation_mode::timestamp && result->is_counter()) {
+        throw exceptions::invalid_request_exception("Score-ordered tables do not support counters");
+    }
+    return result;
 }
 
 void create_table_statement::apply_properties_to(schema_builder& builder, const data_dictionary::database db) const {

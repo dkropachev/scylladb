@@ -365,6 +365,7 @@ schema_ptr tables() {
          // read_repair_chance has been deprecated, preserved to be backward
          // compatible
          {"read_repair_chance", double_type},
+         {"reconciliation_mode", utf8_type},
          {"speculative_retry", utf8_type},
         },
         // static columns
@@ -600,6 +601,7 @@ schema_ptr views() {
          // read_repair_chance has been deprecated, preserved to be backward
          // compatible
          {"read_repair_chance", double_type},
+         {"reconciliation_mode", utf8_type},
          {"speculative_retry", utf8_type},
         },
         // static columns
@@ -1708,6 +1710,10 @@ static void add_table_params_to_mutations(mutation& m, const clustering_key& cke
     m.set_clustered_cell(ckey, "max_index_interval", table->max_index_interval(), timestamp);
     m.set_clustered_cell(ckey, "memtable_flush_period_in_ms", table->memtable_flush_period(), timestamp);
     m.set_clustered_cell(ckey, "min_index_interval", table->min_index_interval(), timestamp);
+    auto reconciliation = table->get_reconciliation_mode();
+    m.set_clustered_cell(ckey, "reconciliation_mode", sstring(
+            reconciliation == reconciliation_mode::score_ascending ? "score_ascending" :
+            reconciliation == reconciliation_mode::score_descending ? "score_descending" : "timestamp"), timestamp);
     m.set_clustered_cell(ckey, "speculative_retry", table->speculative_retry().to_sstring(), timestamp);
     m.set_clustered_cell(ckey, "crc_check_chance", table->crc_check_chance(), timestamp);
 
@@ -2308,6 +2314,13 @@ static void prepare_builder_from_table_row(const schema_ctxt& ctxt, schema_build
 
     if (auto val = table_row.get<int32_t>("default_time_to_live")) {
         builder.set_default_time_to_live(gc_clock::duration(*val));
+    }
+    if (auto val = table_row.get<sstring>("reconciliation_mode")) {
+        if (*val == "score_ascending") {
+            builder.set_reconciliation_mode(reconciliation_mode::score_ascending);
+        } else if (*val == "score_descending") {
+            builder.set_reconciliation_mode(reconciliation_mode::score_descending);
+        }
     }
 
     if (auto val = get_map<sstring, bytes>(table_row, "extensions")) {

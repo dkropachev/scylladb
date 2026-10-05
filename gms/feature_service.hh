@@ -185,6 +185,7 @@ public:
     gms::feature arbitrary_tablet_boundaries { *this, "ARBITRARY_TABLET_BOUNDARIES"sv };
     gms::feature large_data_virtual_tables { *this, "LARGE_DATA_VIRTUAL_TABLES"sv };
     gms::feature large_data_guardrails { *this, "LARGE_DATA_GUARDRAILS"sv };
+    gms::feature score_ordered_tables { *this, "SCORE_ORDERED_TABLES"sv };
     gms::feature keyspace_multi_rf_change { *this, "KEYSPACE_MULTI_RF_CHANGE"sv };
     gms::feature view_building_tasks_min_task_id { *this, "VIEW_BUILDING_TASKS_MIN_TASK_ID"sv };
     gms::feature quiesce_topology_enhanced { *this, "QUIESCE_TOPOLOGY_ENHANCED"sv };

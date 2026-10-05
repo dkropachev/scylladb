@@ -47,6 +47,7 @@ public:
     static const sstring KW_MAXCOMPACTIONTHRESHOLD;
     static const sstring KW_CACHING;
     static const sstring KW_DEFAULT_TIME_TO_LIVE;
+    static const sstring KW_RECONCILIATION_MODE;
     static const sstring KW_MIN_INDEX_INTERVAL;
     static const sstring KW_MAX_INDEX_INTERVAL;
     static const sstring KW_SPECULATIVE_RETRY;
