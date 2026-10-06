@@ -711,8 +711,10 @@ query_processor::execute_prepared_without_checking_exception_message(
         const query_options& options,
         statements::prepared_statement::checked_weak_ptr prepared,
         cql3::prepared_cache_key_type cache_key,
-        bool needs_authorization) {
-    return execute_maybe_with_guard(query_state, std::move(statement), options, &query_processor::do_execute_prepared, std::move(prepared), std::move(cache_key), needs_authorization);
+        bool needs_authorization,
+        std::optional<db::system_table_response_cache::snapshot> cached_response) {
+    return execute_maybe_with_guard(query_state, std::move(statement), options, &query_processor::do_execute_prepared,
+            std::move(prepared), std::move(cache_key), needs_authorization, cached_response);
 }
 
 future<::shared_ptr<result_message>>
@@ -723,7 +725,8 @@ query_processor::do_execute_prepared(
         std::optional<service::group0_guard> guard,
         statements::prepared_statement::checked_weak_ptr prepared,
         cql3::prepared_cache_key_type cache_key,
-        bool needs_authorization) {
+        bool needs_authorization,
+        std::optional<db::system_table_response_cache::snapshot> cached_response) {
     if (needs_authorization) {
         co_await statement->check_access(*this, query_state.get_client_state());
         try {
@@ -734,6 +737,17 @@ query_processor::do_execute_prepared(
     }
 
     co_await audit::inspect(statement, query_state, options, false);
+    if (cached_response) {
+        co_await utils::get_local_injector().inject("cached_system_table_response_before_validation",
+                utils::wait_for_message(std::chrono::seconds(60)));
+    }
+    if (cached_response && cached_response->valid()) {
+        ++_stats.queries_by_cl[size_t(options.get_consistency())];
+        statement->validate(*this, query_state.get_client_state());
+        co_await utils::get_local_injector().inject("cached_system_table_response_after_validation",
+                utils::wait_for_message(std::chrono::seconds(60)));
+        co_return ::make_shared<result_message::void_message>();
+    }
     co_return co_await process_authorized_statement(std::move(statement), query_state, options, std::move(guard));
 }
 

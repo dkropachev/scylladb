@@ -168,6 +168,11 @@ public:
 
     const sstring& column_family() const;
 
+    bool cacheable_system_table_response() const;
+
+    /// Account for a prepared SELECT served from serialized result bytes.
+    void record_cached_system_table_response(const service::query_state& state, const query_options& options) const;
+
     query::partition_slice make_partition_slice(const query_options& options) const;
 
     const ::shared_ptr<const restrictions::select_restrictions> get_restrictions() const;

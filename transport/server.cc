@@ -10,6 +10,7 @@
 
 #include "cql3/statements/batch_statement.hh"
 #include "cql3/statements/modification_statement.hh"
+#include "cql3/statements/select_statement.hh"
 #include "cql3/statements/strong_consistency/batch_statement.hh"
 #include "cql3/statements/strong_consistency/modification_statement.hh"
 #include "cql3/statements/strong_consistency/statement_helpers.hh"
@@ -31,6 +32,8 @@
 #include "service/qos/service_level_controller.hh"
 #include "db/consistency_level_type.hh"
 #include "db/write_type.hh"
+#include "db/system_table_response_cache.hh"
+#include "gc_clock.hh"
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/seastar.hh>
@@ -63,6 +66,7 @@
 
 #include <cassert>
 #include <string>
+#include <unordered_map>
 
 #include <snappy-c.h>
 #include <lz4.h>
@@ -1830,6 +1834,111 @@ execute_prepared_with_paging_state(service::client_state& client_state, sharded<
     });
 }
 
+namespace {
+
+class system_table_response_cache {
+    struct entry {
+        ::shared_ptr<cql3::cql_statement> statement;
+        lw_shared_ptr<const bytes> body;
+    };
+
+    std::unordered_map<std::string, entry> _entries;
+    uint64_t _generation = 0;
+    gc_clock::time_point _second;
+    uint64_t _hits = 0;
+    uint64_t _misses = 0;
+    seastar::metrics::metric_groups _metrics;
+
+    void refresh(uint64_t generation, gc_clock::time_point second) {
+        // TTL expiry is measured in gc_clock seconds and does not issue a write.
+        if (_generation != generation || _second != second) {
+            _entries.clear();
+            _generation = generation;
+            _second = second;
+        }
+    }
+
+public:
+    system_table_response_cache() {
+        namespace sm = seastar::metrics;
+        _metrics.add_group("transport", {
+            sm::make_counter("system_table_response_cache_hits", _hits),
+            sm::make_counter("system_table_response_cache_misses", _misses),
+        });
+    }
+
+    lw_shared_ptr<const bytes> find(const std::string& key, uint64_t generation, gc_clock::time_point second) {
+        refresh(generation, second);
+        auto it = _entries.find(key);
+        if (it == _entries.end()) {
+            ++_misses;
+        } else {
+            ++_hits;
+        }
+        return it == _entries.end() ? nullptr : it->second.body;
+    }
+
+    void put(std::string key, ::shared_ptr<cql3::cql_statement> statement, bytes body,
+            uint64_t generation, gc_clock::time_point second) {
+        if (body.size() > 64 * 1024 || gc_clock::now() != second
+                || db::system_table_response_cache::stable_generation() != generation) {
+            return;
+        }
+        refresh(generation, second);
+        if (_entries.size() >= 64) {
+            _entries.clear();
+        }
+        _entries.insert_or_assign(std::move(key), entry{std::move(statement), make_lw_shared<const bytes>(std::move(body))});
+    }
+};
+
+system_table_response_cache& response_cache() {
+    static thread_local system_table_response_cache cache;
+    return cache;
+}
+
+template<typename T>
+void append_to_key(std::string& key, const T& value) {
+    key.append(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+std::optional<std::string> response_cache_key(const cql3::cql_statement& statement, const cql3::query_options& options,
+        cql_protocol_version_type version, bool skip_metadata) {
+    auto* select = dynamic_cast<const cql3::statements::select_statement*>(&statement);
+    if (!select || !select->cacheable_system_table_response()
+            || (options.get_consistency() != db::consistency_level::ONE && options.get_consistency() != db::consistency_level::LOCAL_ONE)) {
+        return std::nullopt;
+    }
+    std::string key;
+    append_to_key(key, select);
+    append_to_key(key, version);
+    append_to_key(key, skip_metadata);
+    const auto page_size = options.get_page_size();
+    append_to_key(key, page_size);
+    const auto consistency = options.get_consistency();
+    append_to_key(key, consistency);
+    for (size_t i = 0; i < options.get_values_count(); ++i) {
+        if (options.is_unset(i)) {
+            return std::nullopt;
+        }
+        auto value = to_bytes_opt(options.get_value_at(i));
+        if (value && value->size() > 256) {
+            return std::nullopt;
+        }
+        const int32_t size = value ? value->size() : -1;
+        append_to_key(key, size);
+        if (value) {
+            key.append(reinterpret_cast<const char*>(value->data()), value->size());
+        }
+        if (key.size() > 1024) {
+            return std::nullopt;
+        }
+    }
+    return key;
+}
+
+}
+
 static future<cql_server::process_fn_return_type>
 process_execute_internal(service::client_state& client_state, sharded<cql3::query_processor>& qp, request_reader in,
         uint16_t stream, cql_protocol_version_type version,
@@ -1924,23 +2033,70 @@ process_execute_internal(service::client_state& client_state, sharded<cql3::quer
         tracing::add_prepared_query_options(trace_state, options);
     }
 
+    auto response_key = !trace_state && !metadata_id.has_request_metadata_id() && !metadata_id.has_response_metadata_id()
+            ? response_cache_key(*stmt, options, version, skip_metadata) : std::nullopt;
+    auto generation = response_key ? db::system_table_response_cache::stable_generation() : std::nullopt;
+    auto second = gc_clock::now();
+    auto cached_body = generation ? response_cache().find(*response_key, *generation, second) : nullptr;
+    std::optional<db::system_table_response_cache::snapshot> cached_response;
+    if (cached_body) {
+        cached_response = db::system_table_response_cache::snapshot{*generation, second};
+    }
+    auto statement_for_cache = stmt;
+
     tracing::trace(trace_state, "Processing a statement");
     auto& statement = *stmt;
     auto execute_fut = reclassifying_control_connection_needs_user_service_level(statement, query_state)
             ? query_state.get_service_level_controller().with_user_service_level(query_state.get_client_state().user(),
-                    [&qp, &query_state, &options, stmt = std::move(stmt), prepared = std::move(prepared), cache_key = std::move(cache_key), needs_authorization] () mutable {
-                return qp.local().execute_prepared_without_checking_exception_message(query_state, std::move(stmt), options, std::move(prepared), std::move(cache_key), needs_authorization);
+                    [&qp, &query_state, &options, stmt = std::move(stmt), prepared = std::move(prepared),
+                            cache_key = std::move(cache_key), needs_authorization, cached_response] () mutable {
+                return qp.local().execute_prepared_without_checking_exception_message(query_state, std::move(stmt),
+                        options, std::move(prepared), std::move(cache_key), needs_authorization, cached_response);
             })
-            : qp.local().execute_prepared_without_checking_exception_message(query_state, std::move(stmt), options, std::move(prepared), std::move(cache_key), needs_authorization);
-    return std::move(execute_fut).then([skip_metadata, q_state = std::move(q_state), stream, version, metadata_id = std::move(metadata_id)] (auto msg) mutable {
-        if (msg->as_bounce()) {
-            return cql_server::process_fn_return_type(make_foreign(static_pointer_cast<messages::result_message::bounce>(msg)));
-        } else if (msg->is_exception()) {
-            return cql_server::process_fn_return_type(convert_error_message_to_coordinator_result(msg.get()));
-        } else {
-            tracing::trace(q_state->query_state.get_trace_state(), "Done processing - preparing a result");
-            return cql_server::process_fn_return_type(make_foreign(make_result(stream, *msg, q_state->query_state.get_trace_state(), version, std::move(metadata_id), skip_metadata)));
+            : qp.local().execute_prepared_without_checking_exception_message(query_state, std::move(stmt),
+                    options, std::move(prepared), std::move(cache_key), needs_authorization, cached_response);
+    return std::move(execute_fut).then([&qp, skip_metadata, q_state = std::move(q_state), stream, version, metadata_id = std::move(metadata_id),
+            response_key = std::move(response_key), generation, second, cached_response, cached_body = std::move(cached_body),
+            statement_for_cache = std::move(statement_for_cache)] (auto msg) mutable {
+        // Authorization and audit can suspend after the lookup. If either the
+        // table or the TTL second changed, execute the SELECT with the already
+        // authorized query state instead of returning the saved body.
+        if (cached_body && dynamic_cast<messages::result_message::void_message*>(msg.get())) {
+            if (cached_response && cached_response->valid()) {
+                static_cast<const cql3::statements::select_statement&>(*statement_for_cache)
+                        .record_cached_system_table_response(q_state->query_state, *q_state->options);
+                bytes_ostream body;
+                body.write(bytes_view(*cached_body));
+                return make_ready_future<cql_server::process_fn_return_type>(cql_server::process_fn_return_type(make_foreign(
+                        std::make_unique<cql_server::response>(stream, cql_binary_opcode::RESULT, 0, std::move(body)))));
+            }
         }
+        auto execute_fallback = [&] {
+            return statement_for_cache->execute_without_checking_exception_message(qp.local(), q_state->query_state,
+                    *q_state->options, std::nullopt);
+        };
+        auto result_fut = cached_body && dynamic_cast<messages::result_message::void_message*>(msg.get())
+                ? (reclassifying_control_connection_needs_user_service_level(*statement_for_cache, q_state->query_state)
+                        ? q_state->query_state.get_service_level_controller().with_user_service_level(
+                                q_state->query_state.get_client_state().user(), execute_fallback)
+                        : execute_fallback())
+                : make_ready_future<::shared_ptr<messages::result_message>>(std::move(msg));
+        return std::move(result_fut).then([skip_metadata, q_state = std::move(q_state), stream, version, metadata_id = std::move(metadata_id),
+                response_key = std::move(response_key), generation, second, statement_for_cache = std::move(statement_for_cache)] (auto msg) mutable {
+            if (msg->as_bounce()) {
+                return cql_server::process_fn_return_type(make_foreign(static_pointer_cast<messages::result_message::bounce>(msg)));
+            } else if (msg->is_exception()) {
+                return cql_server::process_fn_return_type(convert_error_message_to_coordinator_result(msg.get()));
+            }
+            tracing::trace(q_state->query_state.get_trace_state(), "Done processing - preparing a result");
+            auto response = make_result(stream, *msg, q_state->query_state.get_trace_state(), version, std::move(metadata_id), skip_metadata);
+            auto* rows = dynamic_cast<messages::result_message::rows*>(msg.get());
+            if (response_key && generation && rows && !rows->rs().get_metadata().paging_state()
+                    && msg->warnings().empty() && !msg->custom_payload() && response->flags() == 0) {
+                response_cache().put(std::move(*response_key), std::move(statement_for_cache), response->copy_body(), *generation, second);
+            }
+            return cql_server::process_fn_return_type(make_foreign(std::move(response)));
+        });
     });
 }
 

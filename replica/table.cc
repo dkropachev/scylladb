@@ -46,6 +46,7 @@
 #include "compaction/compaction_group_view.hh"
 #include "sstables/sstable_directory.hh"
 #include "db/system_keyspace.hh"
+#include "db/system_table_response_cache.hh"
 #include "db/snapshot_types.hh"
 #include "db/extensions.hh"
 #include "query/query-result-writer.hh"
@@ -1759,6 +1760,7 @@ future<>
 table::do_add_sstable_and_update_cache(compaction_group& cg, sstables::shared_sstable& sst, sstables::offstrategy offstrategy,
                                        bool trigger_compaction) {
     auto permit = co_await seastar::get_units(_sstable_set_mutation_sem, 1);
+    db::system_table_response_cache::write_guard response_cache_guard(*_schema);
     co_return co_await get_row_cache().invalidate(row_cache::external_updater([&] () mutable noexcept {
         // FIXME: this is not really noexcept, but we need to provide strong exception guarantees.
         // atomically load all opened sstables into column family.
@@ -4636,6 +4638,7 @@ future<> compaction_group::clear_memtables() {
 }
 
 future<> table::clear() {
+    db::system_table_response_cache::write_guard response_cache_guard(*_schema);
     auto permits = co_await _config.dirty_memory_manager->get_all_flush_permits();
 
     co_await parallel_foreach_compaction_group(std::mem_fn(&compaction_group::clear_memtables));
@@ -4657,6 +4660,7 @@ bool storage_group::compaction_disabled() const {
 // NOTE: does not need to be futurized, but might eventually, depending on
 // if we implement notifications, whatnot.
 future<db::replay_position> table::discard_sstables(db_clock::time_point truncated_at) {
+    db::system_table_response_cache::write_guard response_cache_guard(*_schema);
     // truncate_table_on_all_shards() disables compaction for the truncated
     // tables and views, so we normally expect compaction to be disabled on
     // this table. But as shown in issue #17543, it is possible that a new
@@ -5027,6 +5031,7 @@ void table::do_apply(compaction_group& cg, db::rp_handle&& h, Args&&... args) {
     _stats.writes.set_latency(lc);
     db::replay_position rp = h;
     check_valid_rp(rp);
+    db::system_table_response_cache::write_guard response_cache_guard(*_schema);
     try {
         cg.memtables()->active_memtable().apply(std::forward<Args>(args)..., std::move(h));
         // keep track of lowest written RP in compaction group. This is the new
